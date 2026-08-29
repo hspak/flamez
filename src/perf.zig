@@ -70,17 +70,24 @@ var slice_count: usize = 0;
 var coalesced_slices: u64 = 0;
 var new_slices: u64 = 0;
 var current_phase: ?Phase = null;
-var phase_started: ?std.time.Instant = null;
-var frame_started: ?std.time.Instant = null;
-var session_started: ?std.time.Instant = null;
+var clock_io: ?std.Io = null;
+var phase_started: ?std.Io.Timestamp = null;
+var frame_started: ?std.Io.Timestamp = null;
+var session_started: ?std.Io.Timestamp = null;
 
 fn phaseIndex(phase: Phase) usize {
     return @intFromEnum(phase);
 }
 
-pub fn beginSession() void {
+fn now() ?std.Io.Timestamp {
+    const io = clock_io orelse return null;
+    return std.Io.Clock.awake.now(io);
+}
+
+pub fn beginSession(io: std.Io) void {
     if (comptime !enabled) return;
-    session_started = std.time.Instant.now() catch null;
+    clock_io = io;
+    session_started = now();
     last_log_ns = 0;
     frames = 0;
     rebuilds = 0;
@@ -88,7 +95,7 @@ pub fn beginSession() void {
 
 pub fn beginFrame() void {
     if (comptime !enabled) return;
-    frame_started = std.time.Instant.now() catch null;
+    frame_started = now();
     current_phase = null;
     phase_started = null;
     @memset(&phase_ns, 0);
@@ -98,17 +105,18 @@ pub fn enter(phase: Phase) void {
     if (comptime !enabled) return;
     leave();
     current_phase = phase;
-    phase_started = std.time.Instant.now() catch null;
+    phase_started = now();
 }
 
 pub fn leave() void {
     if (comptime !enabled) return;
     const phase = current_phase orelse return;
     const started = phase_started orelse return;
-    const now = std.time.Instant.now() catch return;
-    phase_ns[phaseIndex(phase)] +|= now.since(started);
     current_phase = null;
     phase_started = null;
+    const current = now() orelse return;
+    const elapsed = started.durationTo(current).nanoseconds;
+    if (elapsed > 0) phase_ns[phaseIndex(phase)] +|= @intCast(elapsed);
 }
 
 pub fn noteRebuild(jobs: usize) void {
@@ -145,8 +153,10 @@ pub fn endFrame() void {
     if (comptime !enabled) return;
     leave();
     const started = frame_started orelse return;
-    const now = std.time.Instant.now() catch return;
-    const ns = now.since(started);
+    const current = now() orelse return;
+    const elapsed = started.durationTo(current).nanoseconds;
+    if (elapsed <= 0) return;
+    const ns: u64 = @intCast(elapsed);
     frame_hist.add(ns);
     second_hist.add(ns);
     frames += 1;

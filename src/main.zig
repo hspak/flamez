@@ -60,8 +60,6 @@ const window_width = 1180;
 const window_height = 760;
 /// Software cap used when vsync is off (screenshot clock). `0` means no CPU wait.
 const screenshot_fps = 60;
-/// Completed, idle captures: vsync would still redraw at the display rate.
-const idle_fps = 8;
 const ui_font_id: u16 = 0;
 const footer_font_id: u16 = 1;
 
@@ -91,8 +89,31 @@ const FrameInput = struct {
     row_font: rl.Font,
     mouse: rl.Vector2,
     wheel: f32,
+    pinch_zoom: f32,
     clicked: bool,
     host_cpu_count: usize,
+};
+
+const TrackpadGestures = struct {
+    pinch_distance: ?f32 = null,
+
+    fn samplePinch(self: *TrackpadGestures) f32 {
+        const pinching = rl.isGestureDetected(.{ .pinch_in = true }) or
+            rl.isGestureDetected(.{ .pinch_out = true });
+        if (!pinching) {
+            self.pinch_distance = null;
+            return 0;
+        }
+
+        const vector = rl.getGesturePinchVector();
+        const distance = @sqrt(vector.x * vector.x + vector.y * vector.y);
+        const previous = self.pinch_distance orelse {
+            self.pinch_distance = distance;
+            return 0;
+        };
+        self.pinch_distance = distance;
+        return (distance - previous) * 24;
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -161,7 +182,7 @@ pub fn main(init: std.process.Init) !void {
         null;
     rl.setConfigFlags(.{
         .window_resizable = true,
-        .msaa_4x_hint = true,
+        .msaa_4x_hint = build_options.msaa,
         .vsync_hint = screenshot_path == null,
         .window_highdpi = screenshot_path == null,
     });
@@ -171,6 +192,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     defer rl.closeWindow();
+    rl.setGesturesEnabled(.{
+        .tap = true,
+        .doubletap = true,
+        .pinch_in = true,
+        .pinch_out = true,
+    });
     rl.setWindowMinSize(760, 520);
     // Screenshots disable vsync and need a fixed clock. Interactive frames
     // use `setTargetFPS(0)` so the swap interval is the cap.
@@ -189,22 +216,20 @@ pub fn main(init: std.process.Init) !void {
     clay.setMeasureTextFunction(*const FontBook, &fonts, measureText);
 
     var frame_number: usize = 0;
-    var last_mouse = rl.Vector2{ .x = -1, .y = -1 };
-    var last_width: i32 = 0;
-    var last_height: i32 = 0;
-    perf.beginSession();
+    var trackpad_gestures: TrackpadGestures = .{};
+    perf.beginSession(init.io);
 
     while (!rl.windowShouldClose()) {
         perf.beginFrame();
         const frame_time = rl.getFrameTime();
         const mouse = rl.getMousePosition();
         const wheel = rl.getMouseWheelMoveV();
-        const clicked = rl.isMouseButtonPressed(.left);
+        const tapped = rl.isGestureDetected(.{ .tap = true }) or
+            rl.isGestureDetected(.{ .doubletap = true });
+        const clicked = rl.isMouseButtonPressed(.left) or tapped;
+        const pinch_zoom = trackpad_gestures.samplePinch();
         const width = rl.getScreenWidth();
         const height = rl.getScreenHeight();
-        last_mouse = mouse;
-        last_width = width;
-        last_height = height;
         const wanted_fps: i32 = if (screenshot_path != null)
             screenshot_fps
         else
@@ -241,11 +266,22 @@ pub fn main(init: std.process.Init) !void {
             ebpf.deinit();
             ebpf_attached = false;
         }
-        perf.noteSessionShape(
-            session.processes.items.len,
-            session.metadata.items.len,
-            countSlices(&session),
-        );
+        const frame_input = FrameInput{
+            .font = font,
+            .row_font = fonts.row,
+            .mouse = mouse,
+            .wheel = wheel.y,
+            .pinch_zoom = pinch_zoom,
+            .clicked = clicked,
+            .host_cpu_count = host_cpu_count,
+        };
+        if (comptime perf.enabled) {
+            perf.noteSessionShape(
+                session.processes.items.len,
+                session.metadata.items.len,
+                countSlices(&session),
+            );
+        }
         const view_text = makeViewText(&session);
         perf.enter(.clay_layout);
         const commands = createLayout(&app, &session, &view_text);
@@ -257,14 +293,6 @@ pub fn main(init: std.process.Init) !void {
         perf.enter(.clay_playback);
         renderClay(commands, &fonts);
         perf.leave();
-        const frame_input = FrameInput{
-            .font = font,
-            .row_font = fonts.row,
-            .mouse = mouse,
-            .wheel = wheel.y,
-            .clicked = clicked,
-            .host_cpu_count = host_cpu_count,
-        };
         perf.enter(.timeline);
         const hovered = try renderTimeline(&app, &session, frame_input);
         perf.leave();
@@ -619,6 +647,15 @@ fn rebuildProcessTree(
     try app.slot_next.ensureTotalCapacity(app.gpa, n);
     try app.lane_height_off.ensureTotalCapacity(app.gpa, n);
     try app.last_child_scratch.ensureTotalCapacity(app.gpa, n);
+    try app.bar_name_widths.ensureTotalCapacity(app.gpa, n);
+    try app.bar_name_hashes.ensureTotalCapacity(app.gpa, n);
+    if (app.bar_name_widths.items.len < n) {
+        const old_len = app.bar_name_widths.items.len;
+        try app.bar_name_widths.resize(app.gpa, n);
+        @memset(app.bar_name_widths.items[old_len..], -1);
+        try app.bar_name_hashes.resize(app.gpa, n);
+        @memset(app.bar_name_hashes.items[old_len..], 0);
+    }
     if (app.collapsed.items.len < n) {
         try app.collapsed.ensureTotalCapacity(app.gpa, n);
     }
@@ -1236,11 +1273,14 @@ fn paintCpuSlices(
     host_cpu_count: usize,
 ) Allocator.Error!void {
     const slices = process.cpu_slices.items;
+    if (slices.len == 0) return;
+
     const view_end_ns = layout.window.start_ns + layout.view_span;
     const first = tracer.Process.firstVisibleSlice(slices, layout.window.start_ns, view_end_ns);
+    if (first == slices.len or slices[first].start_ns >= view_end_ns) return;
+
     const width = @max(1, @as(usize, @intFromFloat(@floor(layout.timeline_width))));
-    try app.cpu_columns.resize(app.gpa, width);
-    @memset(app.cpu_columns.items, .{});
+    var columns_ready = false;
     var scanned: usize = 0;
     var drawn: usize = 0;
     for (slices[first..]) |slice| {
@@ -1252,23 +1292,36 @@ fn paintCpuSlices(
             drawn += 1;
             continue;
         }
+        if (!columns_ready) {
+            for (app.cpu_touched_columns.items) |px| app.cpu_columns.items[px] = .{};
+            app.cpu_touched_columns.clearRetainingCapacity();
+            const old_width = app.cpu_columns.items.len;
+            try app.cpu_columns.resize(app.gpa, width);
+            if (width > old_width) @memset(app.cpu_columns.items[old_width..], .{});
+            columns_ready = true;
+        }
         const px_f = @floor(rect.x - layout.timeline_x);
         if (px_f < 0) continue;
         const px: usize = @intFromFloat(px_f);
         if (px >= width) continue;
+        if (!app.cpu_columns.items[px].occupied) {
+            try app.cpu_touched_columns.append(app.gpa, px);
+        }
         mergeCpuColumn(&app.cpu_columns.items[px], slice);
     }
-    for (app.cpu_columns.items) |column| {
-        if (!column.occupied) continue;
-        const synthetic = tracer.Process.CpuSlice{
-            .start_ns = column.start_ns,
-            .end_ns = column.end_ns,
-            .cpu_ns = column.cpu_ns,
-            .band = column.band,
-        };
-        const rect = cpuSliceRect(synthetic, layout, host_cpu_count) orelse continue;
-        paintCpuSlice(synthetic, rect);
-        drawn += 1;
+    if (columns_ready) {
+        for (app.cpu_touched_columns.items) |px| {
+            const column = app.cpu_columns.items[px];
+            const synthetic = tracer.Process.CpuSlice{
+                .start_ns = column.start_ns,
+                .end_ns = column.end_ns,
+                .cpu_ns = column.cpu_ns,
+                .band = column.band,
+            };
+            const rect = cpuSliceRect(synthetic, layout, host_cpu_count) orelse continue;
+            paintCpuSlice(synthetic, rect);
+            drawn += 1;
+        }
     }
     perf.noteSlices(scanned, drawn);
 }
@@ -1300,7 +1353,9 @@ const TimelineClick = union(enum) {
     select: usize,
 };
 
-const bar_label_inset: f32 = 7;
+const bar_label_inset: f32 = 5;
+const bar_label_right_padding: f32 = 5;
+const bar_label_size: u16 = 12;
 const collapse_button_size: f32 = 20;
 const collapse_button_hit_width: f32 = 28;
 const collapse_button_padding: f32 = 8;
@@ -1438,13 +1493,22 @@ fn paintLifetimeBar(
 }
 
 fn paintBarLabel(
+    app: *App,
     process: *const tracer.Process,
+    process_index: usize,
     metadata: []const u8,
     bar: rl.Rectangle,
     look: BarLook,
 ) void {
     const name = process.nameSlice();
-    const name_width = measureTextSlice(look.font, name, 13).x;
+    const name_hash = std.hash.Wyhash.hash(name.len, name);
+    if (app.bar_name_widths.items[process_index] < 0 or
+        app.bar_name_hashes.items[process_index] != name_hash)
+    {
+        app.bar_name_widths.items[process_index] = measureTextSlice(look.font, name, 13).x;
+        app.bar_name_hashes.items[process_index] = name_hash;
+    }
+    const name_width = app.bar_name_widths.items[process_index];
     if (bar.width < name_width + bar_label_inset * 2) return;
     var summary_buf: [64]u8 = undefined;
     const summary = process.argSummary(metadata, &summary_buf);
@@ -1454,12 +1518,36 @@ fn paintBarLabel(
         "{s}  {s}",
         .{ name, summary },
     ) catch name;
+    const label_height = measureTextSlice(look.font, bar_label, bar_label_size).y;
+    const label_position = rl.Vector2{
+        .x = bar.x + bar_label_inset,
+        .y = bar.y + (bar.height - label_height) / 2,
+    };
+    const max_width = bar.width - bar_label_inset - bar_label_right_padding;
+    const outline_offsets = [_]rl.Vector2{
+        .{ .x = -1, .y = 0 },
+        .{ .x = 1, .y = 0 },
+        .{ .x = 0, .y = -1 },
+        .{ .x = 0, .y = 1 },
+    };
+    for (outline_offsets) |offset| {
+        drawTextSliceClipped(bar_label, .{
+            .font = look.font,
+            .position = .{
+                .x = label_position.x + offset.x,
+                .y = label_position.y + offset.y,
+            },
+            .size = bar_label_size,
+            .color = rl.Color.init(5, 10, 18, 235),
+            .max_width = max_width,
+        });
+    }
     drawTextSliceClipped(bar_label, .{
         .font = look.font,
-        .position = .{ .x = bar.x + bar_label_inset, .y = bar.y + 8 },
-        .size = 12,
+        .position = label_position,
+        .size = bar_label_size,
         .color = barNameInk(process.name_kind),
-        .max_width = bar.width - bar_label_inset - 5,
+        .max_width = max_width,
     });
 }
 
@@ -1472,6 +1560,7 @@ fn renderTimeline(
     const row_font = input.row_font;
     const mouse = input.mouse;
     const wheel = input.wheel;
+    const pinch_zoom = input.pinch_zoom;
     const clicked = input.clicked;
     const element = clay.getElementData(.ID("TimelineViewport"));
     if (!element.found) return null;
@@ -1603,6 +1692,12 @@ fn renderTimeline(
             0
         else
             @intFromFloat(@round(jumped / thumb_travel * @as(f32, @floatFromInt(max_scroll))));
+    } else if (inside and pinch_zoom != 0) {
+        const frac: f32 = if (timeline_width > 0)
+            (mouse.x - timeline_x) / timeline_width
+        else
+            0.5;
+        zoomTimeView(app, total_ns, frac, pinch_zoom);
     } else if (inside and wheel != 0) {
         if (ctrlHeld()) {
             const frac: f32 = if (timeline_width > 0)
@@ -1782,7 +1877,7 @@ fn renderTimeline(
                     const look = BarLook{
                         .color = color,
                         .font = row_font,
-                        .rounded = true,
+                        .rounded = b.width >= 8,
                     };
                     paintLifetimeBar(app, process, index, b, look);
                     try paintCpuSlices(app, process, .{
@@ -1793,7 +1888,7 @@ fn renderTimeline(
                         .y = y,
                         .row_height = row_height,
                     }, input.host_cpu_count);
-                    paintBarLabel(process, session.metadataBytes(), b, look);
+                    paintBarLabel(app, process, index, session.metadataBytes(), b, look);
                 }
                 if (button) |control| {
                     paintCollapseButton(
@@ -1822,6 +1917,19 @@ fn renderTimeline(
                     toRaylibColor(if (over_slot) .{ 30, 42, 66, 255 } else slot_bg),
                 );
                 var hit_index: ?usize = null;
+                for (app.packed_touched_columns.items) |px| {
+                    app.packed_columns.items[px] = null;
+                }
+                app.packed_touched_columns.clearRetainingCapacity();
+                const packed_width = @max(
+                    1,
+                    @as(usize, @intFromFloat(@floor(timeline_width))),
+                );
+                const old_packed_width = app.packed_columns.items.len;
+                try app.packed_columns.resize(app.gpa, packed_width);
+                if (packed_width > old_packed_width) {
+                    @memset(app.packed_columns.items[old_packed_width..], null);
+                }
                 const members = slotMembers(app, slot);
                 const first_visible = firstPackedVisible(
                     members,
@@ -1845,10 +1953,24 @@ fn renderTimeline(
                         .row_height = row_height,
                     });
                     if (bar) |b| {
+                        if (b.width <= 2) {
+                            const px_f = @floor(b.x - timeline_x);
+                            if (px_f >= 0) {
+                                const px: usize = @intFromFloat(px_f);
+                                if (px < packed_width) {
+                                    if (app.packed_columns.items[px] == null) {
+                                        try app.packed_touched_columns.append(app.gpa, px);
+                                    }
+                                    app.packed_columns.items[px] = index;
+                                }
+                            }
+                            if (over_slot and pointInRect(mouse, b)) hit_index = index;
+                            continue;
+                        }
                         const look = BarLook{
                             .color = processColor(has_kids),
                             .font = row_font,
-                            .rounded = !multi,
+                            .rounded = !multi and b.width >= 8,
                         };
                         paintLifetimeBar(app, process, index, b, look);
                         try paintCpuSlices(app, process, .{
@@ -1859,11 +1981,23 @@ fn renderTimeline(
                             .y = y,
                             .row_height = row_height,
                         }, input.host_cpu_count);
-                        paintBarLabel(process, session.metadataBytes(), b, look);
+                        paintBarLabel(app, process, index, session.metadataBytes(), b, look);
                         if (over_slot and pointInRect(mouse, b)) {
                             hit_index = index;
                         }
                     }
+                }
+                for (app.packed_touched_columns.items) |px| {
+                    const index = app.packed_columns.items[px] orelse continue;
+                    rl.drawRectangleRec(
+                        .init(
+                            timeline_x + @as(f32, @floatFromInt(px)),
+                            y,
+                            1,
+                            row_height - process_row_gap,
+                        ),
+                        processColor(hasChildren(app, index)),
+                    );
                 }
 
                 const collapse_target: ?RowCollapseTarget = target: {
@@ -2038,6 +2172,7 @@ fn detailCpuGraphY(cores: f64, core_scale: f64, plot: rl.Rectangle) f32 {
 fn drawDetailCpuGraph(
     app: *App,
     process: *const tracer.Process,
+    process_index: usize,
     now_ns: u64,
     host_cpu_count: usize,
     font: rl.Font,
@@ -2127,30 +2262,46 @@ fn drawDetailCpuGraph(
     const fill_color = toRaylibColor(cpu_hot);
     const area_color = rl.Color.init(fill_color.r, fill_color.g, fill_color.b, 58);
     const width = @max(1, @as(usize, @intFromFloat(@floor(plot.width))));
-    try app.graph_columns.resize(app.gpa, width);
-    @memset(app.graph_columns.items, -1);
-    const first = tracer.Process.firstVisibleSlice(
-        process.cpu_slices.items,
-        range.start_ns,
-        range.end_ns,
-    );
-    for (process.cpu_slices.items[first..]) |slice| {
-        if (slice.start_ns >= range.end_ns) break;
-        if (slice.end_ns <= range.start_ns) continue;
-        const start_ns = @max(slice.start_ns, range.start_ns);
-        const end_ns = @min(slice.end_ns, range.end_ns);
-        if (end_ns <= start_ns) continue;
-        const start_x = detailCpuGraphX(range, start_ns, plot);
-        const end_x = detailCpuGraphX(range, end_ns, plot);
-        var px0: usize = 0;
-        if (start_x > plot.x) px0 = @min(width, @as(usize, @intFromFloat(@floor(start_x - plot.x))));
-        var px1: usize = width;
-        if (end_x > plot.x) px1 = @min(width, @as(usize, @intFromFloat(@ceil(end_x - plot.x))));
-        if (px1 <= px0) px1 = @min(width, px0 + 1);
-        const cores: f32 = @floatCast(slice.averageCores());
-        for (px0..px1) |px| {
-            app.graph_columns.items[px] = @max(app.graph_columns.items[px], cores);
+    const rebuild_columns = app.graph_cache_process != process_index or
+        app.graph_cache_process_revision != process.revision or
+        app.graph_cache_start_ns != range.start_ns or
+        app.graph_cache_end_ns != range.end_ns or
+        app.graph_cache_width != width;
+    if (rebuild_columns) {
+        try app.graph_columns.resize(app.gpa, width);
+        @memset(app.graph_columns.items, -1);
+        const first = tracer.Process.firstVisibleSlice(
+            process.cpu_slices.items,
+            range.start_ns,
+            range.end_ns,
+        );
+        for (process.cpu_slices.items[first..]) |slice| {
+            if (slice.start_ns >= range.end_ns) break;
+            if (slice.end_ns <= range.start_ns) continue;
+            const start_ns = @max(slice.start_ns, range.start_ns);
+            const end_ns = @min(slice.end_ns, range.end_ns);
+            if (end_ns <= start_ns) continue;
+            const start_x = detailCpuGraphX(range, start_ns, plot);
+            const end_x = detailCpuGraphX(range, end_ns, plot);
+            var px0: usize = 0;
+            if (start_x > plot.x) {
+                px0 = @min(width, @as(usize, @intFromFloat(@floor(start_x - plot.x))));
+            }
+            var px1: usize = width;
+            if (end_x > plot.x) {
+                px1 = @min(width, @as(usize, @intFromFloat(@ceil(end_x - plot.x))));
+            }
+            if (px1 <= px0) px1 = @min(width, px0 + 1);
+            const cores: f32 = @floatCast(slice.averageCores());
+            for (px0..px1) |px| {
+                app.graph_columns.items[px] = @max(app.graph_columns.items[px], cores);
+            }
         }
+        app.graph_cache_process = process_index;
+        app.graph_cache_process_revision = process.revision;
+        app.graph_cache_start_ns = range.start_ns;
+        app.graph_cache_end_ns = range.end_ns;
+        app.graph_cache_width = width;
     }
     var drew_slice = false;
     var col: usize = 0;
@@ -2778,6 +2929,7 @@ fn renderDetailPane(
         try drawDetailCpuGraph(
             app,
             process,
+            index,
             session.timelineNs(),
             input.host_cpu_count,
             font,
@@ -2855,9 +3007,9 @@ fn processColor(has_children: bool) rl.Color {
 
 fn barNameInk(kind: tracer.NameKind) rl.Color {
     return if (kind == .process)
-        rl.Color.init(7, 16, 28, 255)
+        toRaylibColor(ink)
     else
-        rl.Color.init(7, 16, 28, 150);
+        rl.Color.init(235, 241, 251, 205);
 }
 
 fn pointInBox(point: rl.Vector2, box: clay.BoundingBox) bool {

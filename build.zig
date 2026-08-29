@@ -40,10 +40,16 @@ pub fn build(b: *std.Build) void {
         "perf-telemetry",
         "Log one performance summary line per second and a session total",
     ) orelse false;
+    const enable_msaa = b.option(
+        bool,
+        "msaa",
+        "Enable 4x multisample anti-aliasing",
+    ) orelse true;
     const build_options = b.addOptions();
     build_options.addOption(bool, "ebpf", enable_ebpf);
     build_options.addOption(bool, "fps_counter", enable_fps_counter);
     build_options.addOption(bool, "perf_telemetry", enable_perf_telemetry);
+    build_options.addOption(bool, "msaa", enable_msaa);
     const footer_font_files = b.addWriteFiles();
     const footer_font_source = footer_font_files.add(
         "footer_font.zig",
@@ -130,6 +136,7 @@ pub fn build(b: *std.Build) void {
     tracer_options.addOption(bool, "ebpf", enable_ebpf);
     tracer_options.addOption(bool, "fps_counter", enable_fps_counter);
     tracer_options.addOption(bool, "perf_telemetry", enable_perf_telemetry);
+    tracer_options.addOption(bool, "msaa", enable_msaa);
     if (bpf_object) |path| {
         tracer_options.addOptionPath("bpf_object", path);
     } else {

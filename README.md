@@ -79,15 +79,19 @@ block on that row, reducing a collapsed row to one block in height. Capture
 ends when the target process exits; descendants that outlive it do not extend
 the trace. If the kernel drops lifecycle records, the session is marked
 **INCOMPLETE** and recovered rows are labeled as inferred rather than observed.
-After capture ends, Flamez redraws at a low idle rate until you interact with
-the timeline or detail pane. Live and interactive frames follow the display
-refresh (vsync) instead of a fixed 60 FPS cap.
+Completed frames continue to render at the display refresh rate. The default
+renderer keeps both high-DPI framebuffers and 4x MSAA enabled for readable text.
+Build with `-Dmsaa=false` to disable MSAA when the extra GPU cost is not
+acceptable.
 
 Timeline zoom shortcuts mirror Ctrl+mouse-wheel zoom: **Ctrl+=** zooms in,
 **Ctrl+-** zooms out, and **Ctrl+0** restores the full default view.
-When zoomed, **Shift+mouse-wheel** pans horizontally; the timeline's bottom
-and right scrollbars can also be dragged. Without Ctrl or Shift, the wheel
-scrolls rows. In the timeline, **Up/Down**, **Page Up/Page Down**, **Home**,
+Trackpad taps activate the same controls as a left click. Pinch gestures zoom
+around the pointer; compositors that expose pinch as Ctrl+trackpad-scroll use
+the same zoom path. When zoomed, **Shift+mouse-wheel** pans horizontally; the
+timeline's bottom and right scrollbars can also be dragged. Without Ctrl or
+Shift, the wheel scrolls rows. In the timeline, **Up/Down**, **Page Up/Page
+Down**, **Home**,
 and **End** provide keyboard row navigation; **Left/Right** collapse or expand
 the selected process when it has children.
 

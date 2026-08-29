@@ -61,7 +61,17 @@ occupied_scratch: std.ArrayList(LaneOcc) = .empty,
 free_lanes_scratch: std.ArrayList(u16) = .empty,
 lane_offsets_scratch: std.ArrayList(usize) = .empty,
 cpu_columns: std.ArrayList(CpuColumn) = .empty,
+cpu_touched_columns: std.ArrayList(usize) = .empty,
+packed_columns: std.ArrayList(?usize) = .empty,
+packed_touched_columns: std.ArrayList(usize) = .empty,
+bar_name_widths: std.ArrayList(f32) = .empty,
+bar_name_hashes: std.ArrayList(u64) = .empty,
 graph_columns: std.ArrayList(f32) = .empty,
+graph_cache_process: ?usize = null,
+graph_cache_process_revision: u64 = std.math.maxInt(u64),
+graph_cache_start_ns: u64 = 0,
+graph_cache_end_ns: u64 = 0,
+graph_cache_width: usize = 0,
 /// Hover tooltip cache: rebuilt only when process, revision, or width change.
 tooltip_cache_process: ?usize = null,
 tooltip_cache_revision: u64 = std.math.maxInt(u64),
@@ -178,6 +188,11 @@ pub fn deinit(self: *App) void {
     self.free_lanes_scratch.deinit(self.gpa);
     self.lane_offsets_scratch.deinit(self.gpa);
     self.cpu_columns.deinit(self.gpa);
+    self.cpu_touched_columns.deinit(self.gpa);
+    self.packed_columns.deinit(self.gpa);
+    self.packed_touched_columns.deinit(self.gpa);
+    self.bar_name_widths.deinit(self.gpa);
+    self.bar_name_hashes.deinit(self.gpa);
     self.graph_columns.deinit(self.gpa);
     self.collapsed.deinit(self.gpa);
     if (self.detail_store.len > 0) self.gpa.free(self.detail_store);

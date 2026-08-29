@@ -322,7 +322,14 @@ void ProcessGestureEvent(GestureEvent event)
                 GESTURES.Drag.intensity = 0.0f;
                 GESTURES.Drag.angle = 0.0f;
 
-                GESTURES.current = GESTURE_NONE;
+                // Preserve taps until UpdateGestures() on the next frame. A
+                // touchpad can deliver DOWN and UP during one desktop event
+                // poll, so clearing here makes the tap unobservable to users.
+                if ((GESTURES.current != GESTURE_TAP) &&
+                    (GESTURES.current != GESTURE_DOUBLETAP))
+                {
+                    GESTURES.current = GESTURE_NONE;
+                }
             }
 
             GESTURES.Touch.downDragPosition = (Vector2){ 0.0f, 0.0f };
