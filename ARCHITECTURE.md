@@ -11,6 +11,8 @@ raylib.
 
 This document describes how the pieces fit together. For usage, see README.md.
 For the eBPF load/attach path and the Linux 7.x `EACCES` trap, see EBPF.md.
+For session JSON export, GUI import, and headless capture (not implemented),
+see HEADLESS.md.
 
 ## High-level view
 
@@ -45,42 +47,50 @@ For the eBPF load/attach path and the Linux 7.x `EACCES` trap, see EBPF.md.
 Owns everything that is *not* UI:
 
 - **`Process`** — one record per observed pid: `pid`, optional `parent_pid`,
-  fixed-capacity name (`max_name_len = 48` bytes), tree `depth`, `start_ns`,
-  nullable `end_ns`, and offsets into the session's append-only metadata store
-  for argv/executable/CWD, with provenance and path-truncation state. Argv is
-  stored at its complete captured length, including empty arguments. Forked
-  children share their parent's immutable metadata bytes instead of copying multi-KiB
-  buffers. A null `end_ns` means "still running"; bars are clipped to "now"
-  while live. Each record also owns cumulative self CPU time and a compact list
-  of CPU slices. Self CPU includes every thread in the process's TGID and
-  excludes descendant processes. Each UI-frame snapshot closes one variable-
-  length bucket. Active buckets are classified in quarter-core bands; adjacent
-  buckets in the same band coalesce so storage grows with changes in activity
-  rather than with every context switch. Idle buckets advance the snapshot
-  cursor without allocating a slice.
+  stable `parent_index`, fixed-capacity name (`max_name_len = 48` bytes), tree
+  `depth`, `start_ns`, nullable `end_ns`, lifecycle `origin` / `end_kind`, and
+  offsets into the session's append-only metadata store for argv/executable/CWD,
+  with metadata-source and path-truncation state. Argv is stored at its complete
+  captured length, including empty arguments. Forked children share their
+  parent's immutable metadata bytes instead of copying multi-KiB buffers. A null
+  `end_ns` means "still running"; bars are clipped to "now" while live. Recovered
+  parent/exec/exit stubs and capture-clipped ends are labeled so they are not
+  read as exact observations. Each record also owns cumulative self CPU time and
+  a compact list of CPU slices. Self CPU includes every thread in the process's
+  TGID and excludes descendant processes. Cumulative CPU maps are snapshotted on
+  a documented ~16 ms cadence, independent of render FPS. Active buckets are
+  classified in quarter-core bands; adjacent buckets in the same band coalesce
+  so storage grows with changes in activity rather than with every context
+  switch. Idle buckets advance the snapshot cursor without allocating a slice.
+  Canonical slices are retained for the whole capture; pixel aggregation and the
+  detail graph are derived views over that source data.
 - **`Session`** — the heart of the tracker:
   - `start(collector, argv)` temporarily marks Flamez as a BPF seed parent,
     directly spawns the target in its own process group, inserts it as the first
     `Process`, and removes the seed. The fork hook installs the target pid in
     `tracked_pids` before it can run, closing the launch-to-exec race without a
     shell wrapper or procfs discovery.
-  - `update(ebpf)` runs once per frame: advances `elapsed_ns` (monotonic awake
-    clock), drains the eBPF ring buffer into the process tree, snapshots
-    cumulative CPU accounting into process slices, and non-blockingly
-    `waitpid`s the root to detect exit code/signal.
+  - `update(ebpf)` runs once per live frame: advances `elapsed_ns` (monotonic
+    awake clock), drains the eBPF ring buffer into the process tree, snapshots
+    cumulative CPU accounting on `cpu_sample_period_ns` (~16 ms) rather than
+    the render rate, and non-blockingly `waitpid`s the root to detect exit
+    code/signal. Lost ring/map events mark the session incomplete.
   - `consumeEbpfEvent` folds kernel events into records: `fork` appends a
     child below its parent and inherits its metadata, `exec` renames an
     existing record, applies the kernel's filename/argv snapshot, and tries to
     refresh CWD, while the final `group_dead` exit records final self CPU and
-    closes its lifetime. A
-    finished tgid that is reused becomes a new record. A
-    fork whose parent is missing, an exec whose pid is missing, or an exit
-    whose pid was never seen, is recovered under the session root rather than
-    dropped, so a lost ring-buffer record cannot hide that subtree. An
-    exit-only recovery is a zero-width bar at the death timestamp: the fork
-    time is unknown. `/proc` only enriches fields
-    absent from the event path. Kernel timestamps are rebased against session
-    start so all
+    closes its lifetime. A finished tgid that is reused becomes a new record.
+    `by_pid` is live-only; finished generations are found with `latestIndex`
+    when duplicate-exit recovery needs them. A fork whose parent is missing,
+    an exec whose pid is missing, or an exit whose pid was never seen, is
+    recovered under the session root rather than dropped, so a lost ring-buffer
+    record cannot hide that subtree. Recovered rows carry `origin` and are
+    shown as inferred. An exit-only recovery is a zero-width bar at the death
+    timestamp: the fork time is unknown. Root exit and forced Stop close
+    remaining open descendants with `end_kind = capture_clipped`. `/proc` only
+    enriches fields absent from the event path. Identical CWD/exe refreshes
+    reuse the stored offset; reachable metadata is compacted when capture ends.
+    Kernel timestamps are rebased against session start so all
     lifetimes share the session's timeline domain. The BPF fork handler admits
     a child only when its parent is tracked and adds that child synchronously,
     so unrelated system-wide fork/exec/exit traffic never reaches the ring
@@ -97,21 +107,22 @@ Owns everything that is *not* UI:
     tracked-pid state is cleared, and the eBPF collector is detached. While the
     target is live, teardown can still kill every remembered tgid, not only
     `-pgid`. Natural process exits carry one final CPU snapshot in the exit
-    record. A user-forced Stop closes bars at the last frame snapshot because
-    it tears down without waiting for another collector poll.
+    record. A user-forced Stop closes bars at the last sampled total because
+    it tears down without waiting for another collector poll; that total is
+    labeled partial (`CPU~`) rather than presented as an exact kernel final.
 - **`EbpfCollector`** — owns the loaded BPF object via the C shim. `init()`
   attempts load + attach; on any failure it stores a human-readable reason
   (missing capabilities, missing BPF object, failed load/attach) retrievable
   through `diagnosticSlice()`, and `available()` returns false. Because there
   is no fallback backend, callers abort startup when that happens. After the
   programs attach, `dropCapabilities()` clears the process capability sets
-  before target spawn and GUI initialization. `poll()` drains the ring buffer with timeout 0
-  so rendering is never blocked; since
-  collection and rendering share the main thread, it targets the session via
-  a file-scope `active_session` slot, keeping C ignorant of Zig layouts. The C
-  shim batch-reads the completed-CPU and running-thread maps, merges them, and
-  calls a second narrow callback with
-  `(tgid, cpu_ns, timestamp_ns)` snapshots.
+  before target spawn and GUI initialization. `pollEvents()` drains the ring
+  buffer with timeout 0 so rendering is never blocked; `snapshotCpu()` is
+  scheduled independently. Collection and rendering share the main thread and
+  target the session via a file-scope `active_session` slot, keeping C ignorant
+  of Zig layouts. The C shim batch-reads the completed-CPU and running-thread
+  maps, merges them through a reusable hash index, and returns the snapshot
+  array once for Zig to apply.
 
 Unit tests cover duration clamping, name trimming, CPU-bucket coalescing and
 parallel occupancy, CPU timing formatting, fatal-signal handler installation,
@@ -213,11 +224,11 @@ The UI is split between two rendering strategies:
    `clay.getElementData` and draws directly with raylib inside a scissor rect:
    one-row header with five duration ticks, alternating row shading, normalized
    lifetime bars, and red self-CPU slices along the bottom of each bar. Red
-   means CPU activity, not an error. Hover metadata describes both the process
-   and an activity slice (`start`, `end`, wall time, CPU time, average cores);
-   slice height is the bucket's average cores divided by the host's logical CPU
-   count. It reaches the full row at host capacity while retaining a two-pixel
-   minimum for light activity. Color intensity also rises with occupancy.
+   means CPU activity, not an error. Hover metadata describes the process;
+   slice height is the bucket's average cores divided by 75% of the host's
+   logical CPU count. It reaches the full row at three-quarters of host
+   capacity while retaining a two-pixel minimum for light activity. Color
+   intensity also rises with occupancy.
    A fixed gutter at the left of the timeline holds transparent, border-only
    disclosure buttons with full-row-height hit targets. The control belongs to
    the timeline row rather than to an individual lifetime bar and wins input
@@ -243,35 +254,51 @@ Other responsibilities:
   strings are `bufPrint`ed into stack buffers (`ViewText`) where their contracts
   are bounded; CPU-slice storage grows only when a new occupancy band or a busy
   interval after idle requires a slice;
-- revision-gated process-tree geometry, retained tree-building scratch buffers,
-  and per-row packed-member links. A stable
-  frame visits only visible rows instead of rebuilding and rescanning the
-  complete process set;
-- cached selected-process detail text and line heights. Only the timing row is
-  refreshed while the selected process remains live. Above that text, a
-  scrollable step-area graph renders the selected process's aggregate thread
-  CPU over its full lifetime, with its own session-time axis independent of the
-  timeline zoom window;
+- revision-gated process-tree geometry split into topology, interval, and
+  label revisions. Exec does not rebuild tree geometry. Finished intervals keep
+  their lane assignment while capture is live and are compacted when capture
+  ends. Packed members are stored in start-time order and range-queried against
+  the visible window. Lane assignment uses interval partitioning (`O(J log J)`
+  after sort) instead of scanning every lane per job;
+- time-culled, pixel-aggregated CPU overlays: canonical slices stay in the
+  process record, while drawing emits at most one primitive per pixel column.
+  Bar labels are omitted when the name cannot fit. A stable frame visits only
+  visible rows and visible time;
+- cached selected-process detail text and line heights. Display storage grows
+  from wrapping overflow rather than a worst-case line estimate; clipboard
+  staging is allocated only on Ctrl+C. Above that text, a width-decimated
+  step-area graph renders the selected process's aggregate thread CPU over its
+  full lifetime, with its own session-time axis independent of the timeline
+  zoom window. The pane has an independent scrollbar and supports
+  wheel/page/home/end navigation, mouse text selection, and Ctrl+A/Ctrl+C
+  clipboard actions;
+- after capture ends, the frame loop drops to a low idle rate unless the user
+  is interacting. Live and interactive frames are paced by vsync
+  (`setTargetFPS(0)`); screenshots keep a fixed 60 FPS clock because they
+  disable vsync;
 - an optional compile-time `-Dfps-counter=true` flag adds the measured FPS in
   a fixed-width green slot between the footer title and target command;
+- an optional compile-time `-Dperf-telemetry=true` flag logs one performance
+  summary line per second plus a final session summary;
 - screenshot automation: `FLAMEZ_SCREENSHOT=<path>` captures frame ~40 and
   exits, for CI-style visual checks.
 
 ## Frame-by-frame data flow
 
 ```
-per frame (~60 Hz, main thread):
+per live frame (vsync, main thread; completed captures drop to a low idle rate):
   1. read mouse/wheel/keys            (raylib)
   2. feed Clay pointer + scroll state
-  3. session.update(&ebpf)
+  3. session.update(&ebpf) when capturing
        ├─ advance elapsed_ns
-       ├─ ebpf.poll()  → ring_buffer__poll(0) → N × consumeEbpfEvent()
-       ├─ batch CPU snapshot → N × consumeCpuSnapshot()
+       ├─ ebpf.pollEvents() → ring_buffer__poll(0) → N × consumeEbpfEvent()
+       ├─ if cpu_sample_period_ns elapsed: one CPU snapshot array
        └─ waitpid(root, NOHANG) → exit_code/signal or still-running
   4. format counters/status into ViewText (stack)
   5. createLayout() → clay.endLayout() → render commands
   6. renderClay(commands)              (raylib)
-  7. renderTimeline(bounding box)      (raylib, direct draws)
+  7. renderTimeline(bounding box)      (raylib, direct draws; time-culled
+     slices, pixel-aggregated CPU, packed members range-queried)
 ```
 
 Lifecycle events accumulate in the kernel ring buffer and are drained at the
@@ -333,7 +360,8 @@ signal — ends with the target group terminated.
     (requires clang + libbpf headers/libs on the host);
   - exposes the platform decision to Zig as `build_options.ebpf`, which gates
     the `comptime` branches in `EbpfCollector`, plus the default-off
-    `build_options.fps_counter` renderer cut.
+    `build_options.fps_counter` renderer cut and `build_options.perf_telemetry`
+    counters.
 - **`build.sh`** is the privileged installer: copies the binary and BPF object
   under `/usr/local`, then applies exactly the capabilities the loader needs
   (`cap_bpf,cap_perfmon=ep`) to the installed binary, with a
@@ -352,8 +380,10 @@ so these layers can be added without touching capture:
   identify hot functions after symbolization;
 - wakeup/off-CPU accounting to distinguish runnable delay from sleeping or
   blocking;
-- zoom/pan and time-window filtering in `renderTimeline`;
-- export (the record list is trivially serializable);
+- additional time-window filtering or export controls around the existing
+  timeline zoom/pan implementation;
+- session JSON export, GUI import of that file, and headless `-o` capture
+  (see HEADLESS.md);
 - optional per-thread views (CPU is currently aggregated by TGID);
 - alternate frontends: `Session` has no raylib dependency and can drive any
   renderer, headless dump, or TUI.

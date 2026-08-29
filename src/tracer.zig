@@ -13,9 +13,14 @@ pub const Session = @import("tracer/Session.zig");
 pub const Process = process_mod;
 /// How a record's display name was derived (kernel comm vs. fallback label).
 pub const NameKind = process_mod.NameKind;
+/// How a process record entered the session (observed vs recovered).
+pub const Origin = process_mod.Origin;
+/// How a lifetime ended (observed exit vs capture boundary).
+pub const EndKind = process_mod.EndKind;
 
 pub const max_name_len = process_mod.max_name_len;
 pub const max_path_len = process_mod.max_path_len;
+pub const cpu_sample_period_ns = Session.cpu_sample_period_ns;
 
 /// eBPF event collector; inert when unsupported — see `available()`.
 pub const EbpfCollector = ebpf_mod.Collector;

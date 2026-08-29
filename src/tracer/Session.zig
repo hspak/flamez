@@ -13,6 +13,7 @@ const log = std.log.scoped(.tracer);
 const signals = @import("signals.zig");
 const Process = @import("Process.zig");
 const ebpf = @import("ebpf.zig");
+const perf = @import("../perf.zig");
 
 const Session = @This();
 
@@ -32,8 +33,22 @@ exit_signal: ?u8 = null,
 active_count: usize = 0,
 /// Kernel event reservations or tracked-child admissions that failed.
 lost_events: u64 = 0,
-/// Changes whenever cached process-tree geometry or labels become stale.
-tree_revision: u64 = 0,
+/// True after lifecycle loss or inferred recovery; the session is not complete.
+incomplete: bool = false,
+/// Recovered parent/exec/exit stubs created because a lifecycle record was missing.
+recovered_count: u64 = 0,
+/// Session time of the last cumulative CPU map snapshot.
+last_cpu_sample_ns: u64 = 0,
+/// Parentage and process-record count. Exec and finish do not change this.
+topology_revision: u64 = 0,
+/// Lifetime end times. Packing can ignore this while capture is live.
+interval_revision: u64 = 0,
+/// Display names and metadata. Does not rebuild tree geometry.
+label_revision: u64 = 0,
+
+/// Documented CPU-activity temporal resolution. Snapshots run on this cadence
+/// independently of render FPS. Lifecycle ring polling stays per live frame.
+pub const cpu_sample_period_ns: u64 = 16 * std.time.ns_per_ms;
 
 const NameKind = Process.NameKind;
 const Named = Process.Named;
@@ -64,6 +79,7 @@ const ProcessSpec = struct {
     start_ns: u64 = 0,
     // Forked children copy parent argv/exe/cwd offsets. Recovered stubs must not.
     inherit_metadata: bool = true,
+    origin: Process.Origin = .observed,
 };
 
 /// Initializes an empty session that will allocate through `gpa` and spawn
@@ -102,7 +118,12 @@ pub fn start(
     self.elapsed_ns = 0;
     self.active_count = 0;
     self.lost_events = 0;
-    self.tree_revision +%= 1;
+    self.incomplete = false;
+    self.recovered_count = 0;
+    self.last_cpu_sample_ns = 0;
+    self.topology_revision +%= 1;
+    self.interval_revision +%= 1;
+    self.label_revision +%= 1;
     signals.clearTrackedPids();
     try self.processes.ensureUnusedCapacity(self.gpa, 1);
     try self.by_pid.ensureUnusedCapacity(self.gpa, 1);
@@ -171,18 +192,31 @@ pub fn stop(self: *Session) void {
     self.child = null;
     self.root_pid = null;
     self.running = false;
+    self.compactMetadata() catch {};
 }
 
 /// Drains eBPF events into the process tree, advances the clock, and
 /// non-blockingly checks for target exit. Capture ends with the target;
 /// descendants still running at that point are closed at the same timestamp.
+/// Cumulative CPU maps are snapshotted on `cpu_sample_period_ns`, not the
+/// render frame rate.
 pub fn update(self: *Session, collector: *ebpf.Collector) void {
     if (!self.running) return;
 
     self.elapsed_ns = self.nowElapsedNs();
-    collector.poll(self);
+    perf.enter(.ring_poll);
+    collector.pollEvents(self);
     self.lost_events = collector.lost_events;
+    if (self.lost_events > 0) self.incomplete = true;
     self.elapsed_ns = self.nowElapsedNs();
+    const due = self.last_cpu_sample_ns == 0 or
+        self.elapsed_ns -| self.last_cpu_sample_ns >= cpu_sample_period_ns;
+    if (due) {
+        perf.enter(.cpu_snapshot);
+        collector.snapshotCpu(self);
+        self.last_cpu_sample_ns = self.elapsed_ns;
+    }
+    perf.leave();
     self.pollSession();
 }
 
@@ -213,11 +247,8 @@ fn nowElapsedNs(self: *const Session) u64 {
 }
 
 fn addProcess(self: *Session, spec: ProcessSpec) !usize {
-    if (self.by_pid.get(spec.pid)) |index| {
-        if (self.processes.items[index].end_ns == null) return index;
-    } else {
-        try self.by_pid.ensureUnusedCapacity(self.gpa, 1);
-    }
+    if (self.liveIndex(spec.pid)) |index| return index;
+    try self.by_pid.ensureUnusedCapacity(self.gpa, 1);
     try self.processes.ensureUnusedCapacity(self.gpa, 1);
 
     const index = self.processes.items.len;
@@ -226,6 +257,7 @@ fn addProcess(self: *Session, spec: ProcessSpec) !usize {
         .parent_pid = spec.parent_pid,
         .depth = spec.depth,
         .start_ns = spec.start_ns,
+        .origin = spec.origin,
     };
     process.setName(spec.named.text, spec.named.kind);
     if (spec.parent_pid) |parent_pid| {
@@ -243,7 +275,7 @@ fn addProcess(self: *Session, spec: ProcessSpec) !usize {
     self.processes.appendAssumeCapacity(process);
     self.by_pid.putAssumeCapacity(spec.pid, index);
     self.active_count += 1;
-    self.tree_revision +%= 1;
+    self.topology_revision +%= 1;
     return index;
 }
 
@@ -262,13 +294,16 @@ fn waitNowait(pid: std.posix.pid_t) WaitNowait {
     }
 }
 
-fn finishProcess(self: *Session, index: usize, at_ns: u64) void {
+fn finishProcess(self: *Session, index: usize, at_ns: u64, kind: Process.EndKind) void {
     const process = &self.processes.items[index];
-    if (!process.finish(at_ns)) return;
+    if (!process.finish(at_ns, kind)) return;
     signals.forgetPid(process.signal_slot, process.pid);
     process.signal_slot = null;
     self.active_count -|= 1;
-    self.tree_revision +%= 1;
+    if (self.by_pid.get(process.pid) == index) {
+        _ = self.by_pid.remove(process.pid);
+    }
+    self.interval_revision +%= 1;
 }
 
 fn readSmallFileZ(path: [*:0]const u8, buffer: []u8) ?[]u8 {
@@ -405,6 +440,7 @@ fn onRootExited(self: *Session, status: ?u32) void {
     self.running = false;
     signals.disarmTargetGroup();
     signals.clearTrackedPids();
+    self.compactMetadata() catch {};
 }
 
 fn pollSession(self: *Session) void {
@@ -429,8 +465,88 @@ fn pollSession(self: *Session) void {
 
 fn finishOpenProcesses(self: *Session, at_ns: u64) void {
     for (self.processes.items, 0..) |process, index| {
-        if (process.end_ns == null) self.finishProcess(index, at_ns);
+        if (process.end_ns == null) self.finishProcess(index, at_ns, .capture_clipped);
     }
+}
+
+/// Latest record for `pid`, including finished generations. `by_pid` is live-only.
+pub fn latestIndex(self: *const Session, pid: std.posix.pid_t) ?usize {
+    var i = self.processes.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (self.processes.items[i].pid == pid) return i;
+    }
+    return null;
+}
+
+fn noteRecovery(self: *Session) void {
+    self.recovered_count +%= 1;
+    self.incomplete = true;
+}
+
+/// Rebuilds the append-only metadata arena so only bytes still referenced by
+/// process records remain. Intended for capture completion, not the live path.
+fn compactMetadata(self: *Session) Allocator.Error!void {
+    var next = Process.MetadataStore.empty;
+    errdefer next.deinit(self.gpa);
+    try next.ensureTotalCapacity(self.gpa, self.metadata.items.len);
+
+    var remap: std.AutoHashMapUnmanaged(usize, usize) = .empty;
+    defer remap.deinit(self.gpa);
+
+    for (self.processes.items) |*process| {
+        try remapMetadata(
+            self.gpa,
+            &next,
+            &remap,
+            self.metadata.items,
+            &process.args_offset,
+            process.args_len,
+        );
+        try remapMetadata(
+            self.gpa,
+            &next,
+            &remap,
+            self.metadata.items,
+            &process.exe_offset,
+            process.exe_len,
+        );
+        try remapMetadata(
+            self.gpa,
+            &next,
+            &remap,
+            self.metadata.items,
+            &process.cwd_offset,
+            process.cwd_len,
+        );
+    }
+
+    self.metadata.deinit(self.gpa);
+    self.metadata = next;
+}
+
+fn remapMetadata(
+    gpa: Allocator,
+    dest: *Process.MetadataStore,
+    remap: *std.AutoHashMapUnmanaged(usize, usize),
+    src: []const u8,
+    offset: *usize,
+    len: usize,
+) Allocator.Error!void {
+    if (len == 0) return;
+    if (remap.get(offset.*)) |copied| {
+        offset.* = copied;
+        return;
+    }
+    const old = offset.*;
+    if (old >= src.len or len > src.len - old) {
+        offset.* = 0;
+        return;
+    }
+    const copied = dest.items.len;
+    try dest.appendSlice(gpa, src[old..][0..len]);
+    try remap.put(gpa, old, copied);
+    offset.* = copied;
 }
 
 fn rootIndex(self: *const Session) ?usize {
@@ -461,6 +577,7 @@ fn ensureParent(self: *Session, parent_pid: std.posix.pid_t, at_ns: u64) ?usize 
         .depth = self.processes.items[root_index].depth + 1,
         .start_ns = at_ns,
         .inherit_metadata = false,
+        .origin = .recovered_parent,
     }) catch |err| {
         @branchHint(.cold);
         if (comptime !builtin.is_test) {
@@ -474,6 +591,7 @@ fn ensureParent(self: *Session, parent_pid: std.posix.pid_t, at_ns: u64) ?usize 
     if (comptime !builtin.is_test) {
         log.warn("recovered missing parent pid {d} under the session root", .{parent_pid});
     }
+    self.noteRecovery();
     return stub;
 }
 
@@ -494,6 +612,7 @@ fn recoverFromExec(
         .depth = if (parent_index) |parent| self.processes.items[parent].depth + 1 else 0,
         .start_ns = at_ns,
         .inherit_metadata = false,
+        .origin = .recovered_exec,
     }) catch |err| {
         @branchHint(.cold);
         if (comptime !builtin.is_test) {
@@ -504,6 +623,7 @@ fn recoverFromExec(
     if (comptime !builtin.is_test) {
         log.warn("recovered pid {d} from exec without a fork event", .{pid});
     }
+    self.noteRecovery();
     return index;
 }
 
@@ -516,7 +636,7 @@ fn recoverFromExit(
     at_ns: u64,
 ) ?usize {
     if (self.liveIndex(pid) != null) return null;
-    if (self.by_pid.get(pid)) |index| {
+    if (self.latestIndex(pid)) |index| {
         if (self.processes.items[index].end_ns == at_ns) return null;
     }
     const parent_index = self.rootIndex();
@@ -528,6 +648,7 @@ fn recoverFromExit(
         .depth = if (parent_index) |parent| self.processes.items[parent].depth + 1 else 0,
         .start_ns = at_ns,
         .inherit_metadata = false,
+        .origin = .recovered_exit,
     }) catch |err| {
         @branchHint(.cold);
         if (comptime !builtin.is_test) {
@@ -538,6 +659,7 @@ fn recoverFromExit(
     if (comptime !builtin.is_test) {
         log.warn("recovered pid {d} from exit without a fork event", .{pid});
     }
+    self.noteRecovery();
     return index;
 }
 
@@ -550,7 +672,7 @@ fn applyExec(
 ) void {
     if (name.len > 0) self.processes.items[index].setName(name, .process);
     self.processes.items[index].clearExecMetadata();
-    self.tree_revision +%= 1;
+    self.label_revision +%= 1;
     if (ebpf.execMetadata(event, record_size)) |metadata| {
         if (metadata.exe) |exe| {
             self.processes.items[index].setExeFromKernel(
@@ -631,7 +753,7 @@ pub fn consumeEbpfEvent(self: *Session, event: *const ebpf.Event, record_size: u
                     @errorName(err),
                 });
             };
-            self.finishProcess(index, event_ns);
+            self.finishProcess(index, event_ns, .observed_exit);
         },
     }
 }
@@ -639,6 +761,16 @@ pub fn consumeEbpfEvent(self: *Session, event: *const ebpf.Event, record_size: u
 /// Records one cumulative process self-CPU snapshot from the kernel map.
 /// Unknown and already-finished TGIDs are ignored; a later lifecycle event can
 /// still recover them without attributing CPU to the wrong PID generation.
+pub fn consumeCpuSnapshots(
+    self: *Session,
+    samples: []const ebpf.CpuTotal,
+    timestamp_ns: u64,
+) void {
+    for (samples) |sample| {
+        self.consumeCpuSnapshot(@intCast(sample.tgid), sample.total_ns, timestamp_ns);
+    }
+}
+
 pub fn consumeCpuSnapshot(
     self: *Session,
     pid: std.posix.pid_t,
@@ -982,6 +1114,8 @@ test "fork with unknown parent recovers a stub under the root" {
     const stub = session.processes.items[stub_index];
     const child = session.processes.items[child_index];
     try std.testing.expectEqual(root_pid, stub.parent_pid.?);
+    try std.testing.expectEqual(Process.Origin.recovered_parent, stub.origin);
+    try std.testing.expect(session.incomplete);
     try std.testing.expectEqual(NameKind.other, stub.name_kind);
     try std.testing.expectEqualStrings("process", stub.nameSlice());
     try std.testing.expectEqual(@as(std.posix.pid_t, 7777), child.parent_pid.?);
@@ -1026,6 +1160,7 @@ test "exec without a fork recovers the process under the root" {
     const index = session.by_pid.get(5555).?;
     const process = session.processes.items[index];
     try std.testing.expectEqual(root_pid, process.parent_pid.?);
+    try std.testing.expectEqual(Process.Origin.recovered_exec, process.origin);
     try std.testing.expectEqualStrings("clang", process.nameSlice());
     try std.testing.expectEqualStrings(exec_exe, process.exeSlice(session.metadataBytes()));
     var arg_buf: [32]u8 = undefined;
@@ -1090,9 +1225,12 @@ test "exit without a fork recovers a zero-duration process" {
     session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
 
     try std.testing.expectEqual(@as(usize, 2), session.processes.items.len);
-    const index = session.by_pid.get(8888).?;
+    try std.testing.expect(session.by_pid.get(8888) == null);
+    const index = session.latestIndex(8888).?;
     const process = session.processes.items[index];
     try std.testing.expectEqual(root_pid, process.parent_pid.?);
+    try std.testing.expectEqual(Process.Origin.recovered_exit, process.origin);
+    try std.testing.expectEqual(Process.EndKind.observed_exit, process.end_kind);
     try std.testing.expectEqualStrings("sleep", process.nameSlice());
     try std.testing.expectEqual(@as(u64, 6 * std.time.ns_per_ms), process.start_ns);
     try std.testing.expectEqual(@as(u64, 6 * std.time.ns_per_ms), process.end_ns.?);
@@ -1106,7 +1244,8 @@ test "exit without a fork recovers a zero-duration process" {
     exit_event.timestamp_ns = base_ns + 9 * std.time.ns_per_ms;
     session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
     try std.testing.expectEqual(@as(usize, 3), session.processes.items.len);
-    const reused = session.processes.items[session.by_pid.get(8888).?];
+    try std.testing.expect(session.by_pid.get(8888) == null);
+    const reused = session.processes.items[session.latestIndex(8888).?];
     try std.testing.expectEqual(@as(u64, 9 * std.time.ns_per_ms), reused.start_ns);
     try std.testing.expectEqual(reused.start_ns, reused.end_ns.?);
 }
@@ -1140,6 +1279,90 @@ test "kernel fork events reach a live collector" {
     }
     try std.testing.expect(!session.running);
     try std.testing.expect(session.processes.items.len >= 2);
+}
+
+test "exec does not rebuild tree topology" {
+    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
+    var collector = ebpf.Collector{};
+    var session = Session.init(std.testing.allocator, std.testing.io);
+    defer session.deinit();
+    try session.start(&collector, &.{ "sleep", "30" });
+    const root_pid = session.root_pid.?;
+    const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
+    const topology = session.topology_revision;
+    const interval = session.interval_revision;
+
+    var fork_event = ebpf.Event{
+        .kind = .fork,
+        .pid = 4242,
+        .parent_pid = root_pid,
+        .metadata_flags = 0,
+        .timestamp_ns = base_ns + 10 * std.time.ns_per_ms,
+        .comm = [_]u8{0} ** 16,
+        .args_len = 0,
+        .exe_len = 0,
+        .reserved = 0,
+    };
+    session.consumeEbpfEvent(&fork_event, @sizeOf(ebpf.Event));
+    try std.testing.expect(session.topology_revision != topology);
+    const after_fork_topology = session.topology_revision;
+    const after_fork_labels = session.label_revision;
+
+    var exec_event = ebpf.Event{
+        .kind = .exec,
+        .pid = 4242,
+        .parent_pid = 0,
+        .metadata_flags = 0,
+        .timestamp_ns = base_ns + 12 * std.time.ns_per_ms,
+        .comm = [_]u8{0} ** 16,
+        .args_len = 0,
+        .exe_len = 0,
+        .reserved = 0,
+    };
+    @memcpy(exec_event.comm[0.."clang".len], "clang");
+    session.consumeEbpfEvent(&exec_event, @sizeOf(ebpf.Event));
+    try std.testing.expectEqual(after_fork_topology, session.topology_revision);
+    try std.testing.expect(session.label_revision != after_fork_labels);
+    try std.testing.expectEqual(interval, session.interval_revision);
+
+    var exit_event = ebpf.Event{
+        .kind = .exit,
+        .pid = 4242,
+        .parent_pid = 4242,
+        .metadata_flags = 0,
+        .timestamp_ns = base_ns + 15 * std.time.ns_per_ms,
+        .comm = [_]u8{0} ** 16,
+        .args_len = 0,
+        .exe_len = 0,
+        .reserved = 0,
+    };
+    session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
+    try std.testing.expectEqual(after_fork_topology, session.topology_revision);
+    try std.testing.expect(session.interval_revision != interval);
+    try std.testing.expect(session.by_pid.get(4242) == null);
+}
+
+test "metadata compaction keeps reachable argv and drops superseded bytes" {
+    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
+    var collector = ebpf.Collector{};
+    var session = Session.init(std.testing.allocator, std.testing.io);
+    defer session.deinit();
+    try session.start(&collector, &.{ "sleep", "30" });
+    const before = session.metadata.items.len;
+    try session.processes.items[0].setArgsFromArgv(
+        &session.metadata,
+        std.testing.allocator,
+        &.{ "replaced", "argv" },
+    );
+    const after_replace = session.metadata.items.len;
+    try std.testing.expect(after_replace > before);
+    try session.compactMetadata();
+    var cmd_buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "replaced argv",
+        session.processes.items[0].copyCmdline(session.metadataBytes(), &cmd_buf),
+    );
+    try std.testing.expect(session.metadata.items.len < after_replace);
 }
 
 test "root label matches the process when argv basename equals comm" {

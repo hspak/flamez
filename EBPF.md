@@ -34,8 +34,9 @@ zig build
     spawn and track the target
     remove the seed
   initialize the GUI
-  each frame: ring_buffer__poll(0), batch CPU-map snapshot,
-              update the tree, waitpid(root, WNOHANG)
+  each live frame: ring_buffer__poll(0), CPU-map snapshot on the
+                   documented ~16 ms cadence, update the tree,
+                   waitpid(root, WNOHANG)
 ```
 
 The relevant files are:
@@ -78,7 +79,24 @@ spawn. The fork hook tracks that first child but suppresses its redundant fork
 record; userspace already owns the root record. The seed is removed as soon as
 spawn returns.
 
-### Exit behavior
+## Kernel memory
+
+Map sizes are a correctness tradeoff, not leftover headroom. The collector
+preallocates:
+
+| Map | Type | Bound | Role |
+|---|---|---|---|
+| `events` | ring buffer | 16 MiB | lifecycle records |
+| `tracked_pids` | hash | 65,536 | admission + sched_switch miss path |
+| `process_cpu` | hash | 65,536 | cumulative self-CPU totals |
+| `running_threads` | hash | 65,536 | in-flight on-CPU intervals |
+
+The userspace teardown table is another 65,536 atomic PID slots. Do not shrink
+these or switch to non-preallocated hashes without measuring peak live
+processes/threads and loss behavior: an allocation failure inside a scheduler
+tracepoint is worse than a few idle MiB.
+
+## Exit behavior
 
 Linux v7's `sched_process_exit(task, group_dead)` tracepoint still fires once
 per thread. `handle_process_exit` reads raw argument 1 and emits only when

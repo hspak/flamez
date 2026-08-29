@@ -49,7 +49,14 @@ pub const ExecMetadata = struct {
 
 const Handle = opaque {};
 const EbpfCallback = *const fn (*const Event, usize, ?*anyopaque) callconv(.c) void;
-const CpuCallback = *const fn (std.posix.pid_t, u64, u64, ?*anyopaque) callconv(.c) void;
+
+/// One cumulative self-CPU sample from the C snapshot buffer. Layout matches
+/// `struct flamez_cpu_total` in `ebpf_shim.c`.
+pub const CpuTotal = extern struct {
+    tgid: u32,
+    reserved: u32 = 0,
+    total_ns: u64,
+};
 
 extern fn flamez_ebpf_open(
     callback: EbpfCallback,
@@ -62,8 +69,9 @@ extern fn flamez_ebpf_poll(handle: *Handle) c_int;
 extern fn flamez_ebpf_lost_events(handle: *Handle) u64;
 extern fn flamez_ebpf_snapshot_cpu(
     handle: *Handle,
-    callback: CpuCallback,
-    userdata: ?*anyopaque,
+    out_samples: *?[*]const CpuTotal,
+    out_count: *usize,
+    out_timestamp_ns: *u64,
 ) c_int;
 extern fn flamez_ebpf_track_pid(handle: *Handle, pid: std.posix.pid_t) c_int;
 extern fn flamez_ebpf_seed_parent(handle: *Handle, pid: std.posix.pid_t) c_int;
@@ -73,6 +81,7 @@ extern fn flamez_ebpf_close(handle: *Handle) void;
 comptime {
     std.debug.assert(@sizeOf(Event) == 56);
     std.debug.assert(@sizeOf(ExecEvent) == 568);
+    std.debug.assert(@sizeOf(CpuTotal) == 16);
 }
 
 /// Borrows the metadata attached to a successful exec event.
@@ -109,6 +118,8 @@ pub const Collector = struct {
     diagnostic_buffer: [512]u8 = [_]u8{0} ** 512,
     diagnostic_len: usize = 0,
     cpu_snapshot_error: c_int = 0,
+    last_ring_events: i32 = 0,
+    last_cpu_samples: usize = 0,
 
     // Rendering and collection share one thread, so the callback target only
     // needs to remain set during `poll`.
@@ -196,18 +207,13 @@ pub const Collector = struct {
         self.diagnostic_len = amount;
     }
 
-    /// Drains pending events without blocking and applies them to `session`.
-    pub fn poll(self: *Collector, session: *Session) void {
+    /// Drains pending lifecycle events without blocking and applies them to `session`.
+    pub fn pollEvents(self: *Collector, session: *Session) void {
         if (comptime ebpfSupported()) {
             active_session = session;
             defer active_session = null;
             if (self.handle) |handle| {
-                _ = flamez_ebpf_poll(handle);
-                const snapshot_result = flamez_ebpf_snapshot_cpu(handle, onCpu, null);
-                if (snapshot_result != 0 and snapshot_result != self.cpu_snapshot_error) {
-                    log.warn("could not snapshot process CPU accounting: {d}", .{snapshot_result});
-                }
-                self.cpu_snapshot_error = snapshot_result;
+                self.last_ring_events = flamez_ebpf_poll(handle);
                 const lost = flamez_ebpf_lost_events(handle);
                 if (lost > self.lost_events) {
                     log.warn(
@@ -220,19 +226,37 @@ pub const Collector = struct {
         }
     }
 
-    fn onEvent(event: *const Event, record_size: usize, _: ?*anyopaque) callconv(.c) void {
-        if (active_session) |session| session.consumeEbpfEvent(event, record_size);
+    /// Reads cumulative process CPU totals once and applies them in Zig.
+    pub fn snapshotCpu(self: *Collector, session: *Session) void {
+        if (comptime !ebpfSupported()) return;
+        const handle = self.handle orelse return;
+        var samples_ptr: ?[*]const CpuTotal = null;
+        var count: usize = 0;
+        var timestamp_ns: u64 = 0;
+        const snapshot_result = flamez_ebpf_snapshot_cpu(
+            handle,
+            &samples_ptr,
+            &count,
+            &timestamp_ns,
+        );
+        if (snapshot_result != 0 and snapshot_result != self.cpu_snapshot_error) {
+            log.warn("could not snapshot process CPU accounting: {d}", .{snapshot_result});
+        }
+        self.cpu_snapshot_error = snapshot_result;
+        self.last_cpu_samples = if (snapshot_result == 0) count else 0;
+        if (snapshot_result != 0) return;
+        const samples = (samples_ptr orelse return)[0..count];
+        session.consumeCpuSnapshots(samples, timestamp_ns);
     }
 
-    fn onCpu(
-        pid: std.posix.pid_t,
-        cpu_ns: u64,
-        timestamp_ns: u64,
-        _: ?*anyopaque,
-    ) callconv(.c) void {
-        if (active_session) |session| {
-            session.consumeCpuSnapshot(pid, cpu_ns, timestamp_ns);
-        }
+    /// Drains pending events without blocking and applies them to `session`.
+    pub fn poll(self: *Collector, session: *Session) void {
+        self.pollEvents(session);
+        self.snapshotCpu(session);
+    }
+
+    fn onEvent(event: *const Event, record_size: usize, _: ?*anyopaque) callconv(.c) void {
+        if (active_session) |session| session.consumeEbpfEvent(event, record_size);
     }
 
     // Test binaries live in the cache, not next to share/flamez.

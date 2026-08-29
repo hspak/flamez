@@ -38,30 +38,47 @@ detail_selection_anchor: ?DetailTextPosition = null,
 detail_selection_focus: ?DetailTextPosition = null,
 detail_text_selecting: bool = false,
 detail_text_focused: bool = false,
-/// NUL-terminated staging storage for system clipboard writes.
+/// NUL-terminated staging storage for system clipboard writes. Grown on copy.
 detail_clipboard: []u8 = &.{},
 message: [192]u8 = [_]u8{0} ** 192,
 message_len: usize = 0,
 row_order: std.ArrayList(GraphRow) = .empty,
 first_child: std.ArrayList(?usize) = .empty,
 next_sibling: std.ArrayList(?usize) = .empty,
-visual_parent: std.ArrayList(?usize) = .empty,
 visual_depth: std.ArrayList(u16) = .empty,
-pack_root: std.ArrayList(?usize) = .empty,
-pack_job: std.ArrayList(?usize) = .empty,
 pack_slot: std.ArrayList(u16) = .empty,
-/// Intrusive next links for processes assigned to the same packed row.
+/// Intrusive next links used while packing; render walks `packed_members`.
 slot_next: std.ArrayList(?usize) = .empty,
-slot_count: std.ArrayList(u16) = .empty,
+/// Process indexes on packed rows, grouped by slot and sorted by start time.
+packed_members: std.ArrayList(usize) = .empty,
 lane_height_off: std.ArrayList(u16) = .empty,
 lane_heights: std.ArrayList(u16) = .empty,
 last_child_scratch: std.ArrayList(?usize) = .empty,
 roots_scratch: std.ArrayList(usize) = .empty,
 jobs_scratch: std.ArrayList(JobSpan) = .empty,
 heights_scratch: std.ArrayList(u16) = .empty,
-free_at_scratch: std.ArrayList(u64) = .empty,
+occupied_scratch: std.ArrayList(LaneOcc) = .empty,
+free_lanes_scratch: std.ArrayList(u16) = .empty,
 lane_offsets_scratch: std.ArrayList(usize) = .empty,
-tree_revision_seen: u64 = std.math.maxInt(u64),
+cpu_columns: std.ArrayList(CpuColumn) = .empty,
+graph_columns: std.ArrayList(f32) = .empty,
+/// Hover tooltip cache: rebuilt only when process, revision, or width change.
+tooltip_cache_process: ?usize = null,
+tooltip_cache_revision: u64 = std.math.maxInt(u64),
+tooltip_cache_width: f32 = -1,
+tooltip_line_count: usize = 0,
+tooltip_overflowed: bool = false,
+tooltip_timing_line: ?usize = null,
+tooltip_shown: usize = 0,
+tooltip_truncated: bool = false,
+tooltip_content_h: f32 = 0,
+tooltip_timing: [160]u8 = [_]u8{0} ** 160,
+tooltip_timing_len: usize = 0,
+tooltip_store: [2048]u8 = [_]u8{0} ** 2048,
+tooltip_lines: [process_info.tooltip_max_rows]TooltipLine = undefined,
+tooltip_row_heights: [process_info.tooltip_max_rows]f32 = [_]f32{0} ** process_info.tooltip_max_rows,
+topology_revision_seen: u64 = std.math.maxInt(u64),
+interval_revision_seen: u64 = std.math.maxInt(u64),
 collapse_revision: u64 = 0,
 collapse_revision_seen: u64 = std.math.maxInt(u64),
 scrollbar_dragging: bool = false,
@@ -81,9 +98,25 @@ pub const GraphRow = union(enum) {
         parent: usize,
         lane: u16,
         subrow: u16,
+        members_off: u32 = 0,
+        members_len: u32 = 0,
+        /// First packed member; used while linking, then as the collapse target.
         head: ?usize = null,
         tail: ?usize = null,
     },
+};
+
+pub const LaneOcc = struct {
+    end_ns: u64,
+    lane: u16,
+};
+
+pub const CpuColumn = struct {
+    band: u8 = 0,
+    cpu_ns: u64 = 0,
+    start_ns: u64 = 0,
+    end_ns: u64 = 0,
+    occupied: bool = false,
 };
 
 pub const JobSpan = struct {
@@ -91,6 +124,7 @@ pub const JobSpan = struct {
     start_ns: u64,
     end_ns: u64,
     height: u16,
+    lane: u16 = 0,
 };
 
 pub const DetailTextPosition = struct {
@@ -103,7 +137,6 @@ pub const InitError = Allocator.Error;
 
 const detail_store_initial_capacity = 8192;
 const detail_line_initial_capacity = 1024;
-const detail_clipboard_initial_capacity = 8192;
 
 pub const min_view_span_ns: u64 = 1 * std.time.ns_per_ms;
 const zoom_step: f64 = 1.25;
@@ -123,9 +156,6 @@ pub fn init(gpa: Allocator) InitError!App {
     app.detail_line_heights = try gpa.alloc(f32, detail_line_initial_capacity);
     errdefer gpa.free(app.detail_line_heights);
 
-    app.detail_clipboard = try gpa.alloc(u8, detail_clipboard_initial_capacity);
-    errdefer gpa.free(app.detail_clipboard);
-
     return app;
 }
 
@@ -134,21 +164,21 @@ pub fn deinit(self: *App) void {
     self.row_order.deinit(self.gpa);
     self.first_child.deinit(self.gpa);
     self.next_sibling.deinit(self.gpa);
-    self.visual_parent.deinit(self.gpa);
     self.visual_depth.deinit(self.gpa);
-    self.pack_root.deinit(self.gpa);
-    self.pack_job.deinit(self.gpa);
     self.pack_slot.deinit(self.gpa);
     self.slot_next.deinit(self.gpa);
-    self.slot_count.deinit(self.gpa);
+    self.packed_members.deinit(self.gpa);
     self.lane_height_off.deinit(self.gpa);
     self.lane_heights.deinit(self.gpa);
     self.last_child_scratch.deinit(self.gpa);
     self.roots_scratch.deinit(self.gpa);
     self.jobs_scratch.deinit(self.gpa);
     self.heights_scratch.deinit(self.gpa);
-    self.free_at_scratch.deinit(self.gpa);
+    self.occupied_scratch.deinit(self.gpa);
+    self.free_lanes_scratch.deinit(self.gpa);
     self.lane_offsets_scratch.deinit(self.gpa);
+    self.cpu_columns.deinit(self.gpa);
+    self.graph_columns.deinit(self.gpa);
     self.collapsed.deinit(self.gpa);
     if (self.detail_store.len > 0) self.gpa.free(self.detail_store);
     if (self.detail_lines.len > 0) self.gpa.free(self.detail_lines);
@@ -162,7 +192,6 @@ pub fn ensureDetailCapacity(
     self: *App,
     store_capacity: usize,
     line_capacity: usize,
-    clipboard_capacity: usize,
 ) Allocator.Error!void {
     if (self.detail_store.len < store_capacity) {
         self.detail_store = try self.gpa.realloc(self.detail_store, store_capacity);
@@ -176,12 +205,16 @@ pub fn ensureDetailCapacity(
             line_capacity,
         );
     }
-    if (self.detail_clipboard.len < clipboard_capacity) {
-        self.detail_clipboard = try self.gpa.realloc(
-            self.detail_clipboard,
-            clipboard_capacity,
-        );
+}
+
+/// Grows clipboard staging only when the user copies selected detail text.
+pub fn ensureClipboardCapacity(self: *App, capacity: usize) Allocator.Error!void {
+    if (self.detail_clipboard.len >= capacity) return;
+    if (self.detail_clipboard.len == 0) {
+        self.detail_clipboard = try self.gpa.alloc(u8, capacity);
+        return;
     }
+    self.detail_clipboard = try self.gpa.realloc(self.detail_clipboard, capacity);
 }
 
 /// Replaces the transient status message, using a fixed fallback if formatting

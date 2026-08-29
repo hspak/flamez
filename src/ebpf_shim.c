@@ -21,7 +21,6 @@
 #include "flamez_event.h"
 
 typedef void (*flamez_event_callback)(const struct flamez_event *, size_t, void *);
-typedef void (*flamez_cpu_callback)(int32_t, uint64_t, uint64_t, void *);
 
 struct flamez_process_cpu_snapshot {
     uint64_t total_ns;
@@ -35,7 +34,13 @@ struct flamez_running_thread_snapshot {
 
 struct flamez_cpu_total {
     uint32_t tgid;
+    uint32_t reserved;
     uint64_t total_ns;
+};
+
+struct flamez_cpu_index_slot {
+    uint32_t tgid;
+    uint32_t pos;
 };
 
 struct flamez_ebpf {
@@ -50,6 +55,8 @@ struct flamez_ebpf {
     int tracked_pids_fd;
     struct flamez_cpu_total *cpu_totals;
     size_t cpu_total_capacity;
+    struct flamez_cpu_index_slot *cpu_index;
+    size_t cpu_index_capacity;
     flamez_event_callback callback;
     void *userdata;
 };
@@ -206,6 +213,7 @@ static void destroy_collector(struct flamez_ebpf *collector)
     bpf_object__close(collector->object);
     free(collector->object_bytes);
     free(collector->cpu_totals);
+    free(collector->cpu_index);
     free(collector);
 }
 
@@ -618,36 +626,76 @@ uint64_t flamez_ebpf_lost_events(struct flamez_ebpf *collector)
     return count;
 }
 
-static int compare_cpu_totals(const void *left_ptr, const void *right_ptr)
-{
-    const struct flamez_cpu_total *left = left_ptr;
-    const struct flamez_cpu_total *right = right_ptr;
+enum { cpu_index_empty = 0xffffffffu };
 
-    if (left->tgid < right->tgid)
-        return -1;
-    if (left->tgid > right->tgid)
-        return 1;
+static int ensure_cpu_index_capacity(struct flamez_ebpf *collector, size_t totals)
+{
+    size_t capacity = collector->cpu_index_capacity;
+    size_t required = 8;
+    struct flamez_cpu_index_slot *resized;
+
+    if (totals == 0)
+        return 0;
+    while (required < totals * 2)
+        required *= 2;
+    if (required <= capacity)
+        return 0;
+    resized = realloc(collector->cpu_index, required * sizeof(*resized));
+    if (!resized)
+        return -ENOMEM;
+    collector->cpu_index = resized;
+    collector->cpu_index_capacity = required;
     return 0;
 }
 
-static struct flamez_cpu_total *find_cpu_total(struct flamez_cpu_total *totals,
-                                                size_t count, uint32_t tgid)
+static int rebuild_cpu_index(struct flamez_ebpf *collector, size_t totals)
 {
-    size_t low = 0;
-    size_t high = count;
+    size_t index;
+    size_t capacity;
+    int result = ensure_cpu_index_capacity(collector, totals);
 
-    while (low < high) {
-        size_t middle = low + (high - low) / 2;
+    if (result != 0)
+        return result;
+    capacity = collector->cpu_index_capacity;
+    if (capacity == 0)
+        return 0;
+    for (index = 0; index < capacity; ++index) {
+        collector->cpu_index[index].tgid = 0;
+        collector->cpu_index[index].pos = cpu_index_empty;
+    }
+    for (index = 0; index < totals; ++index) {
+        uint32_t tgid = collector->cpu_totals[index].tgid;
+        size_t slot = tgid & (capacity - 1);
 
-        if (totals[middle].tgid < tgid) {
-            low = middle + 1;
-        } else if (totals[middle].tgid > tgid) {
-            high = middle;
-        } else {
-            return &totals[middle];
+        for (;;) {
+            if (collector->cpu_index[slot].pos == cpu_index_empty) {
+                collector->cpu_index[slot].tgid = tgid;
+                collector->cpu_index[slot].pos = (uint32_t)index;
+                break;
+            }
+            slot = (slot + 1) & (capacity - 1);
         }
     }
-    return NULL;
+    return 0;
+}
+
+static struct flamez_cpu_total *find_cpu_total(struct flamez_ebpf *collector,
+                                              size_t count, uint32_t tgid)
+{
+    size_t capacity = collector->cpu_index_capacity;
+    size_t slot;
+
+    (void)count;
+    if (!collector->cpu_index || capacity == 0)
+        return NULL;
+    slot = tgid & (capacity - 1);
+    for (;;) {
+        if (collector->cpu_index[slot].pos == cpu_index_empty)
+            return NULL;
+        if (collector->cpu_index[slot].tgid == tgid)
+            return &collector->cpu_totals[collector->cpu_index[slot].pos];
+        slot = (slot + 1) & (capacity - 1);
+    }
 }
 
 static int ensure_cpu_total_capacity(struct flamez_ebpf *collector, size_t required)
@@ -749,7 +797,7 @@ static int add_running_cpu(struct flamez_ebpf *collector, size_t total_count,
         *snapshot_at_ns = now_ns;
         for (index = 0; index < count; ++index) {
             struct flamez_cpu_total *total = find_cpu_total(
-                collector->cpu_totals, total_count, values[index].tgid);
+                collector, total_count, values[index].tgid);
 
             if (total && now_ns >= values[index].started_at_ns)
                 total->total_ns += now_ns - values[index].started_at_ns;
@@ -766,35 +814,36 @@ static int add_running_cpu(struct flamez_ebpf *collector, size_t total_count,
 }
 
 int flamez_ebpf_snapshot_cpu(struct flamez_ebpf *collector,
-                             flamez_cpu_callback callback, void *userdata)
+                             const struct flamez_cpu_total **out_samples,
+                             size_t *out_count, uint64_t *out_timestamp_ns)
 {
     struct timespec now;
     uint64_t snapshot_at_ns;
     size_t total_count;
-    size_t index;
     int result;
 
     if (!collector || collector->process_cpu_fd < 0 ||
-        collector->running_threads_fd < 0 || !callback)
+        collector->running_threads_fd < 0 || !out_samples || !out_count ||
+        !out_timestamp_ns)
         return -EINVAL;
+    *out_samples = NULL;
+    *out_count = 0;
+    *out_timestamp_ns = 0;
     result = read_process_cpu_totals(collector, &total_count);
     if (result != 0)
         return result;
-    if (total_count > 1) {
-        qsort(collector->cpu_totals, total_count, sizeof(*collector->cpu_totals),
-              compare_cpu_totals);
-    }
+    result = rebuild_cpu_index(collector, total_count);
+    if (result != 0)
+        return result;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return -errno;
     snapshot_at_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
     result = add_running_cpu(collector, total_count, &snapshot_at_ns);
     if (result != 0)
         return result;
-    for (index = 0; index < total_count; ++index) {
-        callback((int32_t)collector->cpu_totals[index].tgid,
-                 collector->cpu_totals[index].total_ns,
-                 snapshot_at_ns, userdata);
-    }
+    *out_samples = collector->cpu_totals;
+    *out_count = total_count;
+    *out_timestamp_ns = snapshot_at_ns;
     return 0;
 }
 

@@ -10,17 +10,27 @@ const log = std.log.scoped(.process);
 const Process = @This();
 
 pid: std.posix.pid_t,
-/// Set when the parent is itself tracked; null for roots.
+/// Kernel-reported parent TGID, or the session root for recovered stubs.
+/// Tree geometry uses `parent_index`; this field is the identity shown as PPID.
 parent_pid: ?std.posix.pid_t = null,
 /// Stable index of the tracked parent, avoiding repeated pid-map lookups in UI builds.
 parent_index: ?usize = null,
 depth: u16 = 0,
 start_ns: u64 = 0,
 end_ns: ?u64 = null,
+/// How this record entered the session. Inferred starts are not exact observations.
+origin: Origin = .observed,
+/// How an open lifetime was closed. Capture-clipped ends are not observed exits.
+end_kind: EndKind = .open,
 /// Cumulative on-CPU time for every thread in this process, excluding descendants.
 cpu_time_ns: u64 = 0,
 cpu_snapshot_at_ns: u64 = 0,
 cpu_snapshot_initialized: bool = false,
+/// Peak average-core occupancy across retained slices; maintained while recording.
+cpu_peak_cores: f64 = 0,
+/// Canonical activity history for this process. Long captures keep every
+/// coalesced slice; pixel aggregation is a derived render view, not a
+/// replacement for these samples.
 cpu_slices: std.ArrayList(CpuSlice) = .empty,
 name: [max_name_len]u8 = [_]u8{0} ** max_name_len,
 name_len: u8 = 0,
@@ -42,8 +52,6 @@ cwd_truncated: bool = false,
 signal_slot: ?u16 = null,
 /// Changes whenever cached UI-visible process data changes.
 revision: u64 = 0,
-/// Changes only when `name` changes, allowing font measurements to stay cached.
-name_revision: u64 = 0,
 
 pub const max_name_len = 48;
 pub const max_path_len = 512;
@@ -56,6 +64,23 @@ pub const MetadataSource = enum {
     launch,
     kernel,
     procfs,
+};
+
+/// How a process record was created. Recovered rows keep a visible tree, but
+/// their start time (and sometimes parentage) is inferred.
+pub const Origin = enum {
+    observed,
+    recovered_parent,
+    recovered_exec,
+    recovered_exit,
+};
+
+/// How a lifetime ended. Forced Stop and root-exit close descendants at the
+/// capture boundary without proving each one exited then.
+pub const EndKind = enum {
+    open,
+    observed_exit,
+    capture_clipped,
 };
 
 pub const MetadataStore = std.ArrayList(u8);
@@ -135,6 +160,7 @@ pub fn recordCpuSnapshot(
             self.cpu_time_ns = monotonic_total;
             self.cpu_snapshot_at_ns = end_ns;
             self.cpu_snapshot_initialized = true;
+            self.cpu_peak_cores = @max(self.cpu_peak_cores, previous.averageCores());
             return;
         }
     }
@@ -148,6 +174,27 @@ pub fn recordCpuSnapshot(
         .cpu_ns = delta_ns,
         .band = band,
     });
+    self.cpu_peak_cores = @max(
+        self.cpu_peak_cores,
+        self.cpu_slices.items[self.cpu_slices.items.len - 1].averageCores(),
+    );
+}
+
+/// First index of a time-ordered slice list that can overlap `[window_start, window_end)`.
+/// Returns `slices.len` when nothing in the list is visible.
+pub fn firstVisibleSlice(slices: []const CpuSlice, window_start_ns: u64, window_end_ns: u64) usize {
+    if (slices.len == 0 or window_end_ns <= window_start_ns) return 0;
+    var lo: usize = 0;
+    var hi: usize = slices.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (slices[mid].end_ns <= window_start_ns) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
 }
 
 /// Records the exact kernel-side total carried by a natural process exit.
@@ -180,6 +227,10 @@ pub fn recordFinalCpuSnapshot(
     self.cpu_time_ns = total_ns;
     self.cpu_snapshot_at_ns = @max(at_ns, self.start_ns);
     self.cpu_snapshot_initialized = true;
+    self.cpu_peak_cores = 0;
+    for (self.cpu_slices.items) |slice| {
+        self.cpu_peak_cores = @max(self.cpu_peak_cores, slice.averageCores());
+    }
 }
 
 fn coalesceLastCpuSlices(self: *Process) void {
@@ -387,7 +438,8 @@ pub fn setName(self: *Process, value: []const u8, kind: NameKind) void {
         @memcpy(self.name[0..fallback.len], fallback);
         self.name_len = fallback.len;
         self.name_kind = .other;
-        self.name_revision +%= 1;
+        // Font measurement caches key off `revision` and layout width;
+        // a name-only revision is intentionally not retained.
         self.revision +%= 1;
         return;
     }
@@ -395,7 +447,6 @@ pub fn setName(self: *Process, value: []const u8, kind: NameKind) void {
     @memcpy(self.name[0..length], trimmed[0..length]);
     self.name_len = @intCast(length);
     self.name_kind = kind;
-    self.name_revision +%= 1;
     self.revision +%= 1;
 }
 
@@ -481,6 +532,14 @@ fn storePath(
     return .{ .offset = offset, .len = @intCast(n), .truncated = trimmed.len >= max_path_len };
 }
 
+fn pathUnchanged(current: []const u8, value: []const u8, truncated: bool) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    const n = @min(trimmed.len, max_path_len);
+    return current.len == n and
+        truncated == (trimmed.len >= max_path_len) and
+        std.mem.eql(u8, current, trimmed[0..n]);
+}
+
 /// Stores a bounded executable path in this record.
 pub fn setExe(
     self: *Process,
@@ -488,6 +547,7 @@ pub fn setExe(
     gpa: Allocator,
     value: []const u8,
 ) Allocator.Error!void {
+    if (pathUnchanged(self.exeSlice(store.items), value, self.exe_truncated)) return;
     const stored = try storePath(store, gpa, value);
     self.exe_offset = stored.offset;
     self.exe_len = stored.len;
@@ -504,6 +564,13 @@ pub fn setExeFromKernel(
     value: []const u8,
     truncated: bool,
 ) Allocator.Error!void {
+    const will_truncate = truncated or
+        std.mem.trim(u8, value, " \t\r\n").len >= max_path_len;
+    if (pathUnchanged(self.exeSlice(store.items), value, will_truncate) and
+        self.exe_source == .kernel)
+    {
+        return;
+    }
     const stored = try storePath(store, gpa, value);
     self.exe_offset = stored.offset;
     self.exe_len = stored.len;
@@ -519,6 +586,7 @@ pub fn setCwd(
     gpa: Allocator,
     value: []const u8,
 ) Allocator.Error!void {
+    if (pathUnchanged(self.cwdSlice(store.items), value, self.cwd_truncated)) return;
     const stored = try storePath(store, gpa, value);
     self.cwd_offset = stored.offset;
     self.cwd_len = stored.len;
@@ -564,9 +632,10 @@ pub fn clearExecMetadata(self: *Process) void {
 }
 
 /// Closes an open lifetime and returns whether the record changed.
-pub fn finish(self: *Process, at_ns: u64) bool {
+pub fn finish(self: *Process, at_ns: u64, kind: EndKind) bool {
     if (self.end_ns != null) return false;
     self.end_ns = @max(at_ns, self.start_ns);
+    self.end_kind = kind;
     self.revision +%= 1;
     return true;
 }
@@ -810,6 +879,41 @@ test "argv storage preserves empty arguments" {
     try testing.expect(args.next() == null);
     var joined: [32]u8 = undefined;
     try testing.expectEqualStrings(" value ", process.copyArguments(metadata.items, &joined));
+}
+
+test "identical CWD and exe paths reuse the stored offset" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var metadata = MetadataStore.empty;
+    defer metadata.deinit(gpa);
+    var process = Process{ .pid = 1 };
+
+    try process.setCwd(&metadata, gpa, "/tmp/build");
+    const cwd_offset = process.cwd_offset;
+    const store_len = metadata.items.len;
+    try process.setCwd(&metadata, gpa, "/tmp/build");
+    try testing.expectEqual(cwd_offset, process.cwd_offset);
+    try testing.expectEqual(store_len, metadata.items.len);
+
+    try process.setExe(&metadata, gpa, "/usr/bin/clang");
+    const exe_offset = process.exe_offset;
+    const exe_store_len = metadata.items.len;
+    try process.setExe(&metadata, gpa, "/usr/bin/clang");
+    try testing.expectEqual(exe_offset, process.exe_offset);
+    try testing.expectEqual(exe_store_len, metadata.items.len);
+}
+
+test "first visible slice is the lower bound on end time" {
+    const slices = [_]CpuSlice{
+        .{ .start_ns = 0, .end_ns = 10, .cpu_ns = 1, .band = 1 },
+        .{ .start_ns = 10, .end_ns = 20, .cpu_ns = 1, .band = 1 },
+        .{ .start_ns = 20, .end_ns = 30, .cpu_ns = 1, .band = 1 },
+        .{ .start_ns = 40, .end_ns = 50, .cpu_ns = 1, .band = 1 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), firstVisibleSlice(&slices, 10, 25));
+    try std.testing.expectEqual(@as(usize, 2), firstVisibleSlice(&slices, 20, 45));
+    try std.testing.expectEqual(@as(usize, 4), firstVisibleSlice(&slices, 50, 60));
+    try std.testing.expectEqual(@as(usize, 0), firstVisibleSlice(&slices, 0, 5));
 }
 
 test "process records keep bulk metadata out of the hot array" {

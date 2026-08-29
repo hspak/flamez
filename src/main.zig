@@ -13,6 +13,7 @@ const App = @import("App.zig");
 const theme = @import("theme.zig");
 const text = @import("text.zig");
 const process_info = @import("process_info.zig");
+const perf = @import("perf.zig");
 
 const log = std.log.scoped(.flamez);
 
@@ -45,6 +46,7 @@ const TooltipBuilder = process_info.TooltipBuilder;
 const InfoSizes = process_info.InfoSizes;
 const buildProcessInfo = process_info.buildProcessInfo;
 const tooltip_more_marker = process_info.tooltip_more_marker;
+const tooltip_max_rows = process_info.tooltip_max_rows;
 
 const min_view_span_ns = App.min_view_span_ns;
 const TimeWindow = App.TimeWindow;
@@ -56,7 +58,10 @@ const panTimeView = App.panTimeView;
 
 const window_width = 1180;
 const window_height = 760;
-const target_fps = 60;
+/// Software cap used when vsync is off (screenshot clock). `0` means no CPU wait.
+const screenshot_fps = 60;
+/// Completed, idle captures: vsync would still redraw at the display rate.
+const idle_fps = 8;
 const ui_font_id: u16 = 0;
 const footer_font_id: u16 = 1;
 
@@ -167,7 +172,10 @@ pub fn main(init: std.process.Init) !void {
     }
     defer rl.closeWindow();
     rl.setWindowMinSize(760, 520);
-    rl.setTargetFPS(target_fps);
+    // Screenshots disable vsync and need a fixed clock. Interactive frames
+    // use `setTargetFPS(0)` so the swap interval is the cap.
+    var fps_cap: i32 = if (screenshot_path != null) screenshot_fps else 0;
+    rl.setTargetFPS(fps_cap);
 
     var fonts = loadFonts();
     defer fonts.deinit();
@@ -181,16 +189,35 @@ pub fn main(init: std.process.Init) !void {
     clay.setMeasureTextFunction(*const FontBook, &fonts, measureText);
 
     var frame_number: usize = 0;
+    var last_mouse = rl.Vector2{ .x = -1, .y = -1 };
+    var last_width: i32 = 0;
+    var last_height: i32 = 0;
+    perf.beginSession();
 
     while (!rl.windowShouldClose()) {
+        perf.beginFrame();
         const frame_time = rl.getFrameTime();
         const mouse = rl.getMousePosition();
         const wheel = rl.getMouseWheelMoveV();
         const clicked = rl.isMouseButtonPressed(.left);
+        const width = rl.getScreenWidth();
+        const height = rl.getScreenHeight();
+        last_mouse = mouse;
+        last_width = width;
+        last_height = height;
+        const wanted_fps: i32 = if (screenshot_path != null)
+            screenshot_fps
+        else
+            0; // 0 == vsync
+
+        if (wanted_fps != fps_cap) {
+            fps_cap = wanted_fps;
+            rl.setTargetFPS(fps_cap);
+        }
 
         clay.setLayoutDimensions(.{
-            .w = @floatFromInt(rl.getScreenWidth()),
-            .h = @floatFromInt(rl.getScreenHeight()),
+            .w = @floatFromInt(width),
+            .h = @floatFromInt(height),
         });
         clay.setPointerState(.{ .x = mouse.x, .y = mouse.y }, rl.isMouseButtonDown(.left));
         clay.updateScrollContainers(false, .{ .x = wheel.x, .y = wheel.y }, frame_time);
@@ -206,18 +233,30 @@ pub fn main(init: std.process.Init) !void {
         }
         if (rl.isKeyPressed(.f5)) clay.setDebugModeEnabled(!clay.isDebugModeEnabled());
 
-        if (session.running) session.update(&ebpf);
+        if (session.running) {
+            session.update(&ebpf);
+            perf.noteSnapshot(ebpf.last_cpu_samples, ebpf.last_ring_events);
+        }
         if (!session.running and ebpf_attached) {
             ebpf.deinit();
             ebpf_attached = false;
         }
+        perf.noteSessionShape(
+            session.processes.items.len,
+            session.metadata.items.len,
+            countSlices(&session),
+        );
         const view_text = makeViewText(&session);
+        perf.enter(.clay_layout);
         const commands = createLayout(&app, &session, &view_text);
+        perf.leave();
 
         rl.beginDrawing();
         rl.clearBackground(toRaylibColor(canvas));
         rl.setMouseCursor(.default);
+        perf.enter(.clay_playback);
         renderClay(commands, &fonts);
+        perf.leave();
         const frame_input = FrameInput{
             .font = font,
             .row_font = fonts.row,
@@ -226,11 +265,18 @@ pub fn main(init: std.process.Init) !void {
             .clicked = clicked,
             .host_cpu_count = host_cpu_count,
         };
+        perf.enter(.timeline);
         const hovered = try renderTimeline(&app, &session, frame_input);
+        perf.leave();
+        perf.enter(.detail);
         try renderDetailPane(&app, &session, frame_input);
+        perf.leave();
         // Draw last so the hover tooltip is never covered by the detail pane.
-        if (hovered) |target| renderProcessTooltip(&session, target, font, mouse);
+        if (hovered) |target| renderProcessTooltip(&app, &session, target, font, mouse);
+        perf.enter(.end_drawing);
         rl.endDrawing();
+        perf.leave();
+        perf.endFrame();
         frame_number += 1;
         if (screenshot_path) |path| {
             if (frame_number == 40) {
@@ -239,6 +285,13 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+    perf.sessionSummary();
+}
+
+fn countSlices(session: *const tracer.Session) usize {
+    var total: usize = 0;
+    for (session.processes.items) |process| total += process.cpu_slices.items.len;
+    return total;
 }
 
 const ViewText = struct {
@@ -281,9 +334,25 @@ fn makeViewText(session: *const tracer.Session) ViewText {
         const fps = std.fmt.bufPrint(&vt.fps, "{d} FPS", .{rl.getFPS()}) catch "0 FPS";
         vt.fps_len = fps.len;
     }
-    const status = if (session.running)
+    const status = if (session.incomplete and session.running)
+        "INCOMPLETE"
+    else if (session.running)
         "RUNNING"
-    else if (session.exit_code) |code|
+    else if (session.incomplete) status: {
+        if (session.exit_code) |code|
+            break :status std.fmt.bufPrint(
+                &vt.status,
+                "INCOMPLETE · EXIT {d}",
+                .{code},
+            ) catch "INCOMPLETE";
+        if (session.exit_signal) |signal|
+            break :status std.fmt.bufPrint(
+                &vt.status,
+                "INCOMPLETE · SIGNAL {d}",
+                .{signal},
+            ) catch "INCOMPLETE";
+        break :status "INCOMPLETE";
+    } else if (session.exit_code) |code|
         std.fmt.bufPrint(&vt.status, "FINISHED · EXIT {d}", .{code}) catch "FINISHED"
     else if (session.exit_signal) |signal|
         std.fmt.bufPrint(&vt.status, "STOPPED · SIGNAL {d}", .{signal}) catch "STOPPED"
@@ -494,6 +563,8 @@ fn footerLegendItem(label: []const u8, color: clay.Color) void {
 const process_row_height: f32 = 28;
 const process_row_gap: f32 = 1;
 const min_cpu_slice_height: f32 = 2;
+/// Timeline CPU bars fill the row at this fraction of host logical cores.
+const cpu_bar_full_core_fraction: f64 = 0.75;
 const scrollbar_width: f32 = 12;
 const scrollbar_min_thumb_size: f32 = 24;
 
@@ -523,10 +594,16 @@ fn ensureProcessTree(
     app: *App,
     session: *const tracer.Session,
 ) Allocator.Error!void {
-    if (app.tree_revision_seen == session.tree_revision and
-        app.collapse_revision_seen == app.collapse_revision) return;
+    const topology_stale = app.topology_revision_seen != session.topology_revision;
+    const collapse_stale = app.collapse_revision_seen != app.collapse_revision;
+    const pack_stale = topology_stale or collapse_stale or
+        (!session.running and app.interval_revision_seen != session.interval_revision);
+    if (!topology_stale and !collapse_stale and !pack_stale) return;
+    perf.enter(.tree_rebuild);
+    defer perf.leave();
     try rebuildProcessTree(app, session);
-    app.tree_revision_seen = session.tree_revision;
+    app.topology_revision_seen = session.topology_revision;
+    app.interval_revision_seen = session.interval_revision;
     app.collapse_revision_seen = app.collapse_revision;
 }
 
@@ -537,20 +614,11 @@ fn rebuildProcessTree(
     const n = session.processes.items.len;
     try app.first_child.ensureTotalCapacity(app.gpa, n);
     try app.next_sibling.ensureTotalCapacity(app.gpa, n);
-    try app.visual_parent.ensureTotalCapacity(app.gpa, n);
     try app.visual_depth.ensureTotalCapacity(app.gpa, n);
-    try app.pack_root.ensureTotalCapacity(app.gpa, n);
-    try app.pack_job.ensureTotalCapacity(app.gpa, n);
     try app.pack_slot.ensureTotalCapacity(app.gpa, n);
     try app.slot_next.ensureTotalCapacity(app.gpa, n);
-    try app.slot_count.ensureTotalCapacity(app.gpa, n);
     try app.lane_height_off.ensureTotalCapacity(app.gpa, n);
     try app.last_child_scratch.ensureTotalCapacity(app.gpa, n);
-    try app.roots_scratch.ensureTotalCapacity(app.gpa, n);
-    try app.jobs_scratch.ensureTotalCapacity(app.gpa, n);
-    try app.heights_scratch.ensureTotalCapacity(app.gpa, n);
-    try app.free_at_scratch.ensureTotalCapacity(app.gpa, n);
-    try app.lane_offsets_scratch.ensureTotalCapacity(app.gpa, n);
     if (app.collapsed.items.len < n) {
         try app.collapsed.ensureTotalCapacity(app.gpa, n);
     }
@@ -558,13 +626,10 @@ fn rebuildProcessTree(
     app.row_order.clearRetainingCapacity();
     app.first_child.clearRetainingCapacity();
     app.next_sibling.clearRetainingCapacity();
-    app.visual_parent.clearRetainingCapacity();
     app.visual_depth.clearRetainingCapacity();
-    app.pack_root.clearRetainingCapacity();
-    app.pack_job.clearRetainingCapacity();
     app.pack_slot.clearRetainingCapacity();
     app.slot_next.clearRetainingCapacity();
-    app.slot_count.clearRetainingCapacity();
+    app.packed_members.clearRetainingCapacity();
     app.lane_height_off.clearRetainingCapacity();
     app.lane_heights.clearRetainingCapacity();
     app.last_child_scratch.clearRetainingCapacity();
@@ -572,23 +637,21 @@ fn rebuildProcessTree(
     if (n == 0) return;
     app.first_child.appendNTimesAssumeCapacity(null, n);
     app.next_sibling.appendNTimesAssumeCapacity(null, n);
-    app.visual_parent.appendNTimesAssumeCapacity(null, n);
     app.visual_depth.appendNTimesAssumeCapacity(0, n);
-    app.pack_root.appendNTimesAssumeCapacity(null, n);
-    app.pack_job.appendNTimesAssumeCapacity(null, n);
     app.pack_slot.appendNTimesAssumeCapacity(0, n);
     app.slot_next.appendNTimesAssumeCapacity(null, n);
-    app.slot_count.appendNTimesAssumeCapacity(0, n);
     app.lane_height_off.appendNTimesAssumeCapacity(0, n);
     app.last_child_scratch.appendNTimesAssumeCapacity(null, n);
     if (app.collapsed.items.len < n) {
         app.collapsed.appendNTimesAssumeCapacity(false, n - app.collapsed.items.len);
     }
 
+    // Parent identity is Process.parent_index; Flamez does not retain a
+    // parallel visual-parent array. pack_root/pack_job/slot_count are derived
+    // from the packed row model and are not stored.
     for (0..n) |index| {
         const process = &session.processes.items[index];
         if (process.parent_index) |parent| {
-            app.visual_parent.items[index] = parent;
             app.visual_depth.items[index] = app.visual_depth.items[parent] + 1;
             if (app.first_child.items[parent] == null) {
                 app.first_child.items[parent] = index;
@@ -597,7 +660,7 @@ fn rebuildProcessTree(
             }
             app.last_child_scratch.items[parent] = index;
         } else {
-            app.roots_scratch.appendAssumeCapacity(index);
+            try app.roots_scratch.append(app.gpa, index);
         }
     }
 
@@ -702,8 +765,6 @@ const JobBounds = struct {
 };
 
 const JobWalk = struct {
-    coordinator: usize,
-    job_root: usize,
     base_depth: u16,
     now_ns: u64,
     bounds: *JobBounds,
@@ -735,7 +796,7 @@ fn appendSubtree(
 
     child = first;
     while (child) |job_root| {
-        app.jobs_scratch.appendAssumeCapacity(collectJob(app, session, index, job_root, now_ns));
+        app.jobs_scratch.appendAssumeCapacity(collectJob(app, session, job_root, now_ns));
         child = app.next_sibling.items[job_root];
     }
     if (app.jobs_scratch.items.len == 0) return;
@@ -753,7 +814,6 @@ fn appendSubtree(
         row_offset += height;
     }
 
-    if (index < app.slot_count.items.len) app.slot_count.items[index] = lanes;
     if (index < app.lane_height_off.items.len)
         app.lane_height_off.items[index] = @intCast(app.lane_heights.items.len);
     for (app.heights_scratch.items) |height| app.lane_heights.appendAssumeCapacity(height);
@@ -774,12 +834,12 @@ fn appendSubtree(
     for (app.jobs_scratch.items) |job| {
         linkPackedSubtree(app, job.root, visualDepth(app, job.root), row_base);
     }
+    try flattenPackedMembers(app, session, row_base, slot_rows);
 }
 
 fn collectJob(
     app: *App,
     session: *const tracer.Session,
-    coordinator: usize,
     job_root: usize,
     now_ns: u64,
 ) JobSpan {
@@ -788,8 +848,6 @@ fn collectJob(
         .end_ns = session.processes.items[job_root].end_ns orelse now_ns,
     };
     markJobTree(app, session, job_root, .{
-        .coordinator = coordinator,
-        .job_root = job_root,
         .base_depth = visualDepth(app, job_root),
         .now_ns = now_ns,
         .bounds = &bounds,
@@ -808,8 +866,6 @@ fn markJobTree(
     index: usize,
     walk: JobWalk,
 ) void {
-    if (index < app.pack_root.items.len) app.pack_root.items[index] = walk.coordinator;
-    if (index < app.pack_job.items.len) app.pack_job.items[index] = walk.job_root;
     const proc = session.processes.items[index];
     if (proc.start_ns < walk.bounds.start_ns) walk.bounds.start_ns = proc.start_ns;
     const proc_end = proc.end_ns orelse walk.now_ns;
@@ -829,38 +885,130 @@ fn jobLessThan(_: void, a: JobSpan, b: JobSpan) bool {
     return a.root < b.root;
 }
 
+fn laneOccLess(_: void, a: App.LaneOcc, b: App.LaneOcc) bool {
+    if (a.end_ns != b.end_ns) return a.end_ns < b.end_ns;
+    return a.lane < b.lane;
+}
+
+fn siftUpOcc(items: []App.LaneOcc, start: usize) void {
+    var i = start;
+    while (i > 0) {
+        const parent = (i - 1) / 2;
+        if (!laneOccLess({}, items[i], items[parent])) break;
+        const tmp = items[i];
+        items[i] = items[parent];
+        items[parent] = tmp;
+        i = parent;
+    }
+}
+
+fn siftDownOcc(items: []App.LaneOcc, start: usize) void {
+    var i = start;
+    while (true) {
+        var best = i;
+        const left = 2 * i + 1;
+        const right = 2 * i + 2;
+        if (left < items.len and laneOccLess({}, items[left], items[best])) best = left;
+        if (right < items.len and laneOccLess({}, items[right], items[best])) best = right;
+        if (best == i) break;
+        const tmp = items[i];
+        items[i] = items[best];
+        items[best] = tmp;
+        i = best;
+    }
+}
+
+fn siftUpLane(items: []u16, start: usize) void {
+    var i = start;
+    while (i > 0) {
+        const parent = (i - 1) / 2;
+        if (items[i] >= items[parent]) break;
+        const tmp = items[i];
+        items[i] = items[parent];
+        items[parent] = tmp;
+        i = parent;
+    }
+}
+
+fn siftDownLane(items: []u16, start: usize) void {
+    var i = start;
+    while (true) {
+        var best = i;
+        const left = 2 * i + 1;
+        const right = 2 * i + 2;
+        if (left < items.len and items[left] < items[best]) best = left;
+        if (right < items.len and items[right] < items[best]) best = right;
+        if (best == i) break;
+        const tmp = items[i];
+        items[i] = items[best];
+        items[best] = tmp;
+        i = best;
+    }
+}
+
+fn layoutJobLanes(
+    app: *App,
+    jobs: []JobSpan,
+) Allocator.Error!u16 {
+    app.occupied_scratch.clearRetainingCapacity();
+    app.free_lanes_scratch.clearRetainingCapacity();
+    app.heights_scratch.clearRetainingCapacity();
+    try app.occupied_scratch.ensureTotalCapacity(app.gpa, jobs.len);
+    try app.free_lanes_scratch.ensureTotalCapacity(app.gpa, jobs.len);
+    try app.heights_scratch.ensureTotalCapacity(app.gpa, jobs.len);
+
+    std.sort.pdq(JobSpan, jobs, {}, jobLessThan);
+    var next_lane: u16 = 0;
+    for (jobs) |*job| {
+        while (app.occupied_scratch.items.len > 0 and
+            app.occupied_scratch.items[0].end_ns <= job.start_ns)
+        {
+            const freed = app.occupied_scratch.items[0];
+            const last = app.occupied_scratch.items[app.occupied_scratch.items.len - 1];
+            app.occupied_scratch.items.len -= 1;
+            if (app.occupied_scratch.items.len > 0) {
+                app.occupied_scratch.items[0] = last;
+                siftDownOcc(app.occupied_scratch.items, 0);
+            }
+            app.free_lanes_scratch.appendAssumeCapacity(freed.lane);
+            siftUpLane(app.free_lanes_scratch.items, app.free_lanes_scratch.items.len - 1);
+        }
+
+        const lane: u16 = if (app.free_lanes_scratch.items.len > 0) blk: {
+            const id = app.free_lanes_scratch.items[0];
+            const last = app.free_lanes_scratch.items[app.free_lanes_scratch.items.len - 1];
+            app.free_lanes_scratch.items.len -= 1;
+            if (app.free_lanes_scratch.items.len > 0) {
+                app.free_lanes_scratch.items[0] = last;
+                siftDownLane(app.free_lanes_scratch.items, 0);
+            }
+            break :blk id;
+        } else blk: {
+            const id = next_lane;
+            next_lane += 1;
+            app.heights_scratch.appendAssumeCapacity(0);
+            break :blk id;
+        };
+        if (lane < app.heights_scratch.items.len and
+            job.height > app.heights_scratch.items[lane])
+        {
+            app.heights_scratch.items[lane] = job.height;
+        }
+        app.occupied_scratch.appendAssumeCapacity(.{ .end_ns = job.end_ns, .lane = lane });
+        siftUpOcc(app.occupied_scratch.items, app.occupied_scratch.items.len - 1);
+        job.lane = lane;
+    }
+    return next_lane;
+}
+
 fn assignJobSlots(
     app: *App,
     jobs: []JobSpan,
 ) Allocator.Error!u16 {
-    app.free_at_scratch.clearRetainingCapacity();
-    app.heights_scratch.clearRetainingCapacity();
-    try app.free_at_scratch.ensureTotalCapacity(app.gpa, jobs.len);
-    try app.heights_scratch.ensureTotalCapacity(app.gpa, jobs.len);
-
-    std.sort.pdq(JobSpan, jobs, {}, jobLessThan);
-    for (jobs) |job| {
-        var lane: usize = 0;
-        while (lane < app.free_at_scratch.items.len) : (lane += 1) {
-            if (app.free_at_scratch.items[lane] <= job.start_ns) break;
-        }
-        if (lane == app.free_at_scratch.items.len) {
-            app.free_at_scratch.appendAssumeCapacity(job.end_ns);
-            app.heights_scratch.appendAssumeCapacity(job.height);
-        } else {
-            app.free_at_scratch.items[lane] = @max(
-                app.free_at_scratch.items[lane],
-                job.end_ns,
-            );
-            if (lane < app.heights_scratch.items.len and
-                job.height > app.heights_scratch.items[lane])
-            {
-                app.heights_scratch.items[lane] = job.height;
-            }
-        }
-        setSubtreeSlot(app, job.root, @intCast(lane));
-    }
-    return @intCast(app.free_at_scratch.items.len);
+    const lanes = try layoutJobLanes(app, jobs);
+    for (jobs) |job| setSubtreeSlot(app, job.root, job.lane);
+    perf.noteRebuild(jobs.len);
+    return lanes;
 }
 
 fn setSubtreeSlot(app: *App, index: usize, lane: u16) void {
@@ -896,6 +1044,68 @@ fn linkPackedSubtree(app: *App, index: usize, base_depth: u16, row_base: usize) 
     }
 }
 
+fn packedMemberLessThan(processes: []const tracer.Process, a: usize, b: usize) bool {
+    if (processes[a].start_ns != processes[b].start_ns) {
+        return processes[a].start_ns < processes[b].start_ns;
+    }
+    return a < b;
+}
+
+fn flattenPackedMembers(
+    app: *App,
+    session: *const tracer.Session,
+    row_base: usize,
+    slot_rows: usize,
+) Allocator.Error!void {
+    const processes = session.processes.items;
+    for (row_base..row_base + slot_rows) |row_index| {
+        const slot = &app.row_order.items[row_index].slot;
+        slot.members_off = @intCast(app.packed_members.items.len);
+        var member = slot.head;
+        while (member) |index| : (member = app.slot_next.items[index]) {
+            try app.packed_members.append(app.gpa, index);
+        }
+        slot.members_len = @intCast(app.packed_members.items.len - slot.members_off);
+        if (slot.members_len > 0) {
+            const members = app.packed_members.items[slot.members_off..][0..slot.members_len];
+            std.mem.sort(usize, members, processes, packedMemberLessThan);
+            slot.head = members[0];
+            slot.tail = members[members.len - 1];
+            for (members, 0..) |index, i| {
+                app.slot_next.items[index] = if (i + 1 < members.len) members[i + 1] else null;
+            }
+        }
+    }
+}
+
+fn slotMembers(app: *const App, slot: anytype) []const usize {
+    const off = slot.members_off;
+    const len = slot.members_len;
+    if (off >= app.packed_members.items.len) return &.{};
+    return app.packed_members.items[off..@min(off + len, app.packed_members.items.len)];
+}
+
+fn firstPackedVisible(
+    members: []const usize,
+    processes: []const tracer.Process,
+    window_start_ns: u64,
+    now_ns: u64,
+) usize {
+    var lo: usize = 0;
+    var hi: usize = members.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const process = processes[members[mid]];
+        const end_ns = process.end_ns orelse now_ns;
+        if (end_ns <= window_start_ns) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 fn laneHeight(app: *const App, parent: usize, lane: u16) u16 {
     if (parent >= app.lane_height_off.items.len) return 1;
     const idx = app.lane_height_off.items[parent] + lane;
@@ -920,7 +1130,6 @@ const BarLayout = struct {
 
 const TimelineHover = struct {
     process_index: usize,
-    cpu_slice_index: ?usize = null,
 };
 
 fn lifetimeBar(process: *const tracer.Process, now_ns: u64, layout: BarLayout) ?rl.Rectangle {
@@ -949,7 +1158,8 @@ fn cpuSliceHeight(
 ) f32 {
     const available_height = @max(@as(f32, 1), row_height - process_row_gap);
     const host_cores: f64 = @floatFromInt(@max(host_cpu_count, 1));
-    const occupancy = @min(slice.averageCores() / host_cores, 1);
+    const full_at_cores = @max(host_cores * cpu_bar_full_core_fraction, 1);
+    const occupancy = @min(slice.averageCores() / full_at_cores, 1);
     return @min(
         available_height,
         @max(min_cpu_slice_height, available_height * @as(f32, @floatCast(occupancy))),
@@ -991,29 +1201,76 @@ fn cpuSliceRect(
     );
 }
 
+fn paintCpuSlice(slice: tracer.Process.CpuSlice, rect: rl.Rectangle) void {
+    const base = toRaylibColor(cpu_hot);
+    rl.drawRectangleRec(rect, .init(base.r, base.g, base.b, cpuSliceAlpha(slice.band)));
+    if (slice.band > 4) {
+        rl.drawRectangleRec(
+            .init(rect.x, rect.y, rect.width, 1),
+            rl.Color.init(255, 178, 178, 255),
+        );
+    }
+}
+
+fn mergeCpuColumn(column: *App.CpuColumn, slice: tracer.Process.CpuSlice) void {
+    if (!column.occupied) {
+        column.* = .{
+            .band = slice.band,
+            .cpu_ns = slice.cpu_ns,
+            .start_ns = slice.start_ns,
+            .end_ns = slice.end_ns,
+            .occupied = true,
+        };
+        return;
+    }
+    if (slice.band > column.band) column.band = slice.band;
+    column.cpu_ns +|= slice.cpu_ns;
+    column.start_ns = @min(column.start_ns, slice.start_ns);
+    column.end_ns = @max(column.end_ns, slice.end_ns);
+}
+
 fn paintCpuSlices(
+    app: *App,
     process: *const tracer.Process,
     layout: BarLayout,
-    mouse: rl.Vector2,
     host_cpu_count: usize,
-) ?usize {
-    var hovered: ?usize = null;
-    for (process.cpu_slices.items, 0..) |slice, index| {
+) Allocator.Error!void {
+    const slices = process.cpu_slices.items;
+    const view_end_ns = layout.window.start_ns + layout.view_span;
+    const first = tracer.Process.firstVisibleSlice(slices, layout.window.start_ns, view_end_ns);
+    const width = @max(1, @as(usize, @intFromFloat(@floor(layout.timeline_width))));
+    try app.cpu_columns.resize(app.gpa, width);
+    @memset(app.cpu_columns.items, .{});
+    var scanned: usize = 0;
+    var drawn: usize = 0;
+    for (slices[first..]) |slice| {
+        if (slice.start_ns >= view_end_ns) break;
+        scanned += 1;
         const rect = cpuSliceRect(slice, layout, host_cpu_count) orelse continue;
-        const base = toRaylibColor(cpu_hot);
-        rl.drawRectangleRec(rect, .init(base.r, base.g, base.b, cpuSliceAlpha(slice.band)));
-        if (slice.band > 4) {
-            rl.drawRectangleRec(
-                .init(rect.x, rect.y, rect.width, 1),
-                rl.Color.init(255, 178, 178, 255),
-            );
+        if (rect.width >= 1.5) {
+            paintCpuSlice(slice, rect);
+            drawn += 1;
+            continue;
         }
-        if (pointInRect(mouse, rect)) {
-            hovered = index;
-            rl.drawRectangleLinesEx(rect, 1, rl.Color.white);
-        }
+        const px_f = @floor(rect.x - layout.timeline_x);
+        if (px_f < 0) continue;
+        const px: usize = @intFromFloat(px_f);
+        if (px >= width) continue;
+        mergeCpuColumn(&app.cpu_columns.items[px], slice);
     }
-    return hovered;
+    for (app.cpu_columns.items) |column| {
+        if (!column.occupied) continue;
+        const synthetic = tracer.Process.CpuSlice{
+            .start_ns = column.start_ns,
+            .end_ns = column.end_ns,
+            .cpu_ns = column.cpu_ns,
+            .band = column.band,
+        };
+        const rect = cpuSliceRect(synthetic, layout, host_cpu_count) orelse continue;
+        paintCpuSlice(synthetic, rect);
+        drawn += 1;
+    }
+    perf.noteSlices(scanned, drawn);
 }
 
 fn cpuSliceAlpha(band: u8) u8 {
@@ -1094,8 +1351,15 @@ fn collapseButton(gutter: rl.Rectangle) CollapseButton {
 }
 
 fn paintCollapseButton(button: CollapseButton, collapsed: bool, hovered: bool) void {
-    const outline = toRaylibColor(if (hovered) accent else border);
-    rl.drawRectangleRoundedLinesEx(button.visual_box, 0.25, 4, 1, outline);
+    if (hovered) {
+        rl.drawRectangleRoundedLinesEx(
+            button.visual_box,
+            0.25,
+            4,
+            1,
+            toRaylibColor(accent),
+        );
+    }
 
     const center = rl.Vector2{
         .x = button.visual_box.x + button.visual_box.width / 2,
@@ -1152,7 +1416,6 @@ fn applyTimelineClick(app: *App, target: TimelineClick) void {
 fn paintLifetimeBar(
     app: *const App,
     process: *const tracer.Process,
-    metadata: []const u8,
     index: usize,
     bar: rl.Rectangle,
     look: BarLook,
@@ -1172,24 +1435,32 @@ fn paintLifetimeBar(
             rl.drawRectangleLinesEx(bar, 1, toRaylibColor(accent));
         }
     }
-    if (bar.width > 54) {
-        var summary_buf: [64]u8 = undefined;
-        const summary = process.argSummary(metadata, &summary_buf);
-        var bar_label_buf: [96]u8 = undefined;
-        const name = process.nameSlice();
-        const bar_label = if (summary.len == 0) name else std.fmt.bufPrint(
-            &bar_label_buf,
-            "{s}  {s}",
-            .{ name, summary },
-        ) catch name;
-        drawTextSliceClipped(bar_label, .{
-            .font = look.font,
-            .position = .{ .x = bar.x + bar_label_inset, .y = bar.y + 8 },
-            .size = 12,
-            .color = barNameInk(process.name_kind),
-            .max_width = bar.width - bar_label_inset - 5,
-        });
-    }
+}
+
+fn paintBarLabel(
+    process: *const tracer.Process,
+    metadata: []const u8,
+    bar: rl.Rectangle,
+    look: BarLook,
+) void {
+    const name = process.nameSlice();
+    const name_width = measureTextSlice(look.font, name, 13).x;
+    if (bar.width < name_width + bar_label_inset * 2) return;
+    var summary_buf: [64]u8 = undefined;
+    const summary = process.argSummary(metadata, &summary_buf);
+    var bar_label_buf: [96]u8 = undefined;
+    const bar_label = if (summary.len == 0) name else std.fmt.bufPrint(
+        &bar_label_buf,
+        "{s}  {s}",
+        .{ name, summary },
+    ) catch name;
+    drawTextSliceClipped(bar_label, .{
+        .font = look.font,
+        .position = .{ .x = bar.x + bar_label_inset, .y = bar.y + 8 },
+        .size = 12,
+        .color = barNameInk(process.name_kind),
+        .max_width = bar.width - bar_label_inset - 5,
+    });
 }
 
 fn renderTimeline(
@@ -1508,25 +1779,21 @@ fn renderTimeline(
                     if (target) |click_target| applyTimelineClick(app, click_target);
                 }
                 if (bar) |b| {
-                    paintLifetimeBar(app, process, session.metadataBytes(), index, b, .{
+                    const look = BarLook{
                         .color = color,
                         .font = row_font,
                         .rounded = true,
-                    });
-                    const slice_index = paintCpuSlices(process, .{
+                    };
+                    paintLifetimeBar(app, process, index, b, look);
+                    try paintCpuSlices(app, process, .{
                         .window = window,
                         .view_span = view_span,
                         .timeline_x = timeline_x,
                         .timeline_width = timeline_width,
                         .y = y,
                         .row_height = row_height,
-                    }, mouse, input.host_cpu_count);
-                    if (!over_button and over_row and slice_index != null) {
-                        hovered = .{
-                            .process_index = index,
-                            .cpu_slice_index = slice_index,
-                        };
-                    }
+                    }, input.host_cpu_count);
+                    paintBarLabel(process, session.metadataBytes(), b, look);
                 }
                 if (button) |control| {
                     paintCollapseButton(
@@ -1555,10 +1822,17 @@ fn renderTimeline(
                     toRaylibColor(if (over_slot) .{ 30, 42, 66, 255 } else slot_bg),
                 );
                 var hit_index: ?usize = null;
-                var hit_slice: ?usize = null;
-                var member = slot.head;
-                while (member) |index| : (member = app.slot_next.items[index]) {
+                const members = slotMembers(app, slot);
+                const first_visible = firstPackedVisible(
+                    members,
+                    session.processes.items,
+                    window.start_ns,
+                    now_ns,
+                );
+                const view_end_ns = window.start_ns + view_span;
+                for (members[first_visible..]) |index| {
                     const process = &session.processes.items[index];
+                    if (process.start_ns >= view_end_ns) break;
                     const has_kids = hasChildren(app, index);
                     // Same bar geometry as regular process rows; lanes keep
                     // their normal row spacing instead of stretching bars.
@@ -1571,22 +1845,23 @@ fn renderTimeline(
                         .row_height = row_height,
                     });
                     if (bar) |b| {
-                        paintLifetimeBar(app, process, session.metadataBytes(), index, b, .{
+                        const look = BarLook{
                             .color = processColor(has_kids),
                             .font = row_font,
                             .rounded = !multi,
-                        });
-                        const slice_index = paintCpuSlices(process, .{
+                        };
+                        paintLifetimeBar(app, process, index, b, look);
+                        try paintCpuSlices(app, process, .{
                             .window = window,
                             .view_span = view_span,
                             .timeline_x = timeline_x,
                             .timeline_width = timeline_width,
                             .y = y,
                             .row_height = row_height,
-                        }, mouse, input.host_cpu_count);
+                        }, input.host_cpu_count);
+                        paintBarLabel(process, session.metadataBytes(), b, look);
                         if (over_slot and pointInRect(mouse, b)) {
                             hit_index = index;
-                            hit_slice = slice_index;
                         }
                     }
                 }
@@ -1617,10 +1892,7 @@ fn renderTimeline(
 
                 if (!over_button) {
                     if (hit_index) |index| {
-                        hovered = .{
-                            .process_index = index,
-                            .cpu_slice_index = hit_slice,
-                        };
+                        hovered = .{ .process_index = index };
                     }
                 }
                 if (clicked) {
@@ -1680,11 +1952,6 @@ fn renderTimeline(
 }
 
 const tooltip_max_width: f32 = 560;
-const tooltip_max_lines: usize = 96;
-const tooltip_store_cap: usize = 8192;
-// Hover tooltip shows at most this many rows; extra rows collapse into a
-// trailing overflow marker.
-const tooltip_max_rows: usize = 10;
 // Fixed pixel radius. A proportional radius made tall tooltips' corners round
 // enough to swallow the first and last text rows.
 const tooltip_corner_radius: f32 = 4;
@@ -1715,7 +1982,6 @@ const DetailTextSelection = struct {
 const DetailCapacity = struct {
     store: usize,
     lines: usize,
-    clipboard: usize,
 };
 
 const CpuGraphRange = struct {
@@ -1736,7 +2002,6 @@ fn detailCapacity(process: *const tracer.Process, metadata: []const u8) DetailCa
     return .{
         .store = store,
         .lines = lines,
-        .clipboard = store +| lines +| 1,
     };
 }
 
@@ -1748,12 +2013,14 @@ fn detailCpuGraphRange(process: *const tracer.Process, now_ns: u64) CpuGraphRang
 }
 
 fn detailCpuGraphCoreScale(process: *const tracer.Process, host_cpu_count: usize) f64 {
-    var observed_cores: f64 = 1;
-    for (process.cpu_slices.items) |slice| {
-        observed_cores = @max(observed_cores, slice.averageCores());
+    var observed_cores = process.cpu_peak_cores;
+    if (observed_cores <= 0) {
+        for (process.cpu_slices.items) |slice| {
+            observed_cores = @max(observed_cores, slice.averageCores());
+        }
     }
     const host_cores: f64 = @floatFromInt(@max(host_cpu_count, 1));
-    return @min(@ceil(observed_cores), host_cores);
+    return @min(@ceil(@max(observed_cores, 1)), host_cores);
 }
 
 fn detailCpuGraphX(range: CpuGraphRange, at_ns: u64, plot: rl.Rectangle) f32 {
@@ -1769,12 +2036,13 @@ fn detailCpuGraphY(cores: f64, core_scale: f64, plot: rl.Rectangle) f32 {
 }
 
 fn drawDetailCpuGraph(
+    app: *App,
     process: *const tracer.Process,
     now_ns: u64,
     host_cpu_count: usize,
     font: rl.Font,
     card: rl.Rectangle,
-) void {
+) Allocator.Error!void {
     rl.drawRectangleRounded(card, 0.04, 4, toRaylibColor(panel_raised));
     rl.drawRectangleRoundedLinesEx(card, 0.04, 4, 1, toRaylibColor(border));
 
@@ -1858,71 +2126,69 @@ fn drawDetailCpuGraph(
     const baseline_y = plot.y + plot.height;
     const fill_color = toRaylibColor(cpu_hot);
     const area_color = rl.Color.init(fill_color.r, fill_color.g, fill_color.b, 58);
-    var previous_end_ns: ?u64 = null;
-    var previous_end_x: f32 = 0;
-    var previous_y: f32 = baseline_y;
-    var drew_slice = false;
-    for (process.cpu_slices.items) |slice| {
-        if (slice.end_ns <= range.start_ns or slice.start_ns >= range.end_ns) continue;
+    const width = @max(1, @as(usize, @intFromFloat(@floor(plot.width))));
+    try app.graph_columns.resize(app.gpa, width);
+    @memset(app.graph_columns.items, -1);
+    const first = tracer.Process.firstVisibleSlice(
+        process.cpu_slices.items,
+        range.start_ns,
+        range.end_ns,
+    );
+    for (process.cpu_slices.items[first..]) |slice| {
+        if (slice.start_ns >= range.end_ns) break;
+        if (slice.end_ns <= range.start_ns) continue;
         const start_ns = @max(slice.start_ns, range.start_ns);
         const end_ns = @min(slice.end_ns, range.end_ns);
         if (end_ns <= start_ns) continue;
         const start_x = detailCpuGraphX(range, start_ns, plot);
         const end_x = detailCpuGraphX(range, end_ns, plot);
-        const y = detailCpuGraphY(slice.averageCores(), core_scale, plot);
-        rl.drawRectangleRec(
-            .init(start_x, y, @max(1, end_x - start_x), baseline_y - y),
-            area_color,
-        );
-        if (previous_end_ns) |previous_end| {
-            if (previous_end == start_ns) {
-                rl.drawLineEx(
-                    .{ .x = start_x, .y = previous_y },
-                    .{ .x = start_x, .y = y },
-                    2,
-                    fill_color,
-                );
-            } else {
-                rl.drawLineEx(
-                    .{ .x = previous_end_x, .y = previous_y },
-                    .{ .x = previous_end_x, .y = baseline_y },
-                    2,
-                    fill_color,
-                );
-                rl.drawLineEx(
-                    .{ .x = start_x, .y = baseline_y },
-                    .{ .x = start_x, .y = y },
-                    2,
-                    fill_color,
-                );
-            }
-        } else {
+        var px0: usize = 0;
+        if (start_x > plot.x) px0 = @min(width, @as(usize, @intFromFloat(@floor(start_x - plot.x))));
+        var px1: usize = width;
+        if (end_x > plot.x) px1 = @min(width, @as(usize, @intFromFloat(@ceil(end_x - plot.x))));
+        if (px1 <= px0) px1 = @min(width, px0 + 1);
+        const cores: f32 = @floatCast(slice.averageCores());
+        for (px0..px1) |px| {
+            app.graph_columns.items[px] = @max(app.graph_columns.items[px], cores);
+        }
+    }
+    var drew_slice = false;
+    var col: usize = 0;
+    while (col < width) {
+        const cores = app.graph_columns.items[col];
+        var run: usize = 1;
+        while (col + run < width and app.graph_columns.items[col + run] == cores) run += 1;
+        if (cores > 0) {
+            const start_x = plot.x + @as(f32, @floatFromInt(col));
+            const end_x = plot.x + @as(f32, @floatFromInt(col + run));
+            const y = detailCpuGraphY(@floatCast(cores), core_scale, plot);
+            rl.drawRectangleRec(
+                .init(start_x, y, @max(1, end_x - start_x), baseline_y - y),
+                area_color,
+            );
+            rl.drawLineEx(
+                .{ .x = start_x, .y = y },
+                .{ .x = end_x, .y = y },
+                2,
+                fill_color,
+            );
             rl.drawLineEx(
                 .{ .x = start_x, .y = baseline_y },
                 .{ .x = start_x, .y = y },
                 2,
                 fill_color,
             );
+            rl.drawLineEx(
+                .{ .x = end_x, .y = y },
+                .{ .x = end_x, .y = baseline_y },
+                2,
+                fill_color,
+            );
+            drew_slice = true;
         }
-        rl.drawLineEx(
-            .{ .x = start_x, .y = y },
-            .{ .x = end_x, .y = y },
-            2,
-            fill_color,
-        );
-        previous_end_ns = end_ns;
-        previous_end_x = end_x;
-        previous_y = y;
-        drew_slice = true;
+        col += run;
     }
-    if (drew_slice) {
-        rl.drawLineEx(
-            .{ .x = previous_end_x, .y = previous_y },
-            .{ .x = previous_end_x, .y = baseline_y },
-            2,
-            fill_color,
-        );
-    } else {
+    if (!drew_slice) {
         const no_samples = "NO CPU SAMPLES";
         const no_samples_size = measureTextSlice(font, no_samples, 11);
         drawTextSlice(
@@ -1977,6 +2243,7 @@ fn drawDetailCpuGraph(
 }
 
 fn renderProcessTooltip(
+    app: *App,
     session: *const tracer.Session,
     target: TimelineHover,
     font: rl.Font,
@@ -1986,46 +2253,75 @@ fn renderProcessTooltip(
     const screen_w: f32 = @floatFromInt(rl.getScreenWidth());
     const screen_h: f32 = @floatFromInt(rl.getScreenHeight());
     const box_w = @min(tooltip_max_width, screen_w - 40);
-
-    var tip_store: [tooltip_store_cap]u8 = undefined;
-    var tip_lines: [tooltip_max_lines]TooltipLine = undefined;
-    var tip = TooltipBuilder{
-        .font = font,
-        .inner_w = box_w - 20,
-        .store = &tip_store,
-        .lines = &tip_lines,
-    };
-    _ = buildProcessInfo(&tip, session, index, tooltip_sizes, target.cpu_slice_index);
-
+    const inner_w = box_w - 20;
+    const process = &session.processes.items[index];
     const line_gap: f32 = 4;
-    // Cap the visible height: keep one row for an overflow marker when lines
-    // do not all fit within tooltip_max_rows.
-    var shown = tip.line_count;
-    var truncated = tip.overflowed;
-    if (shown > tooltip_max_rows or (truncated and shown == tooltip_max_rows)) {
-        shown = tooltip_max_rows - 1;
-        truncated = true;
-    }
-    var content_h: f32 = 0;
-    for (tip.lines[0..shown]) |line| {
-        const measured = measureTextSlice(
-            font,
-            if (line.text.len == 0) " " else line.text,
-            line.size,
+
+    const cache_hit = app.tooltip_cache_process == index and
+        app.tooltip_cache_revision == process.revision and
+        @abs(app.tooltip_cache_width - inner_w) <= 0.5;
+    if (!cache_hit) {
+        var tip = TooltipBuilder{
+            .font = font,
+            .inner_w = inner_w,
+            .store = &app.tooltip_store,
+            .lines = &app.tooltip_lines,
+        };
+        const layout = buildProcessInfo(
+            &tip,
+            session,
+            index,
+            tooltip_sizes,
         );
-        content_h += measured.y + line_gap;
+        app.tooltip_line_count = tip.line_count;
+        app.tooltip_overflowed = tip.overflowed;
+        app.tooltip_timing_line = layout.timing_line;
+        var shown = tip.line_count;
+        var truncated = tip.overflowed;
+        if (shown > tooltip_max_rows or (truncated and shown == tooltip_max_rows)) {
+            shown = tooltip_max_rows - 1;
+            truncated = true;
+        }
+        var content_h: f32 = 0;
+        for (app.tooltip_lines[0..shown], 0..) |line, line_index| {
+            const measured = measureTextSlice(
+                font,
+                if (line.text.len == 0) " " else line.text,
+                line.size,
+            );
+            app.tooltip_row_heights[line_index] = measured.y;
+            content_h += measured.y + line_gap;
+        }
+        if (truncated) {
+            content_h += measureTextSlice(font, tooltip_more_marker, tooltip_sizes.body).y +
+                line_gap;
+        }
+        app.tooltip_shown = shown;
+        app.tooltip_truncated = truncated;
+        app.tooltip_content_h = content_h;
+        app.tooltip_cache_process = index;
+        app.tooltip_cache_revision = process.revision;
+        app.tooltip_cache_width = inner_w;
     }
-    if (truncated) {
-        content_h += measureTextSlice(font, tooltip_more_marker, tooltip_sizes.body).y +
-            line_gap;
+
+    if (app.tooltip_timing_line) |timing_index| {
+        if (timing_index < app.tooltip_shown) {
+            const timing = process_info.formatTimingLine(
+                process,
+                session.timelineNs(),
+                &app.tooltip_timing,
+            );
+            app.tooltip_timing_len = timing.len;
+            app.tooltip_lines[timing_index].text = app.tooltip_timing[0..app.tooltip_timing_len];
+        }
     }
-    const box_h = @min(content_h + 16, screen_h - 16);
+
+    const box_h = @min(app.tooltip_content_h + 16, screen_h - 16);
     var x = mouse.x + 14;
     var y = mouse.y + 14;
     if (x + box_w > screen_w) x = @max(8, mouse.x - box_w - 12);
     if (y + box_h + 8 > screen_h) y = @max(8, screen_h - box_h - 8);
     const tooltip = rl.Rectangle.init(x, y, box_w, box_h);
-    // Boxy corners: fixed radius instead of a fraction of the box size.
     const roundness = rectangleRoundness(
         .{ .x = x, .y = y, .width = box_w, .height = box_h },
         tooltip_corner_radius,
@@ -2039,17 +2335,12 @@ fn renderProcessTooltip(
         @intFromFloat(box_h - 2),
     );
     var text_y = y + 8;
-    for (tip.lines[0..shown]) |line| {
+    for (app.tooltip_lines[0..app.tooltip_shown], 0..) |line, line_index| {
         if (text_y > y + box_h - 8) break;
         drawTextSlice(font, line.text, .{ .x = x + 10, .y = text_y }, line.size, line.color);
-        const measured = measureTextSlice(
-            font,
-            if (line.text.len == 0) " " else line.text,
-            line.size,
-        );
-        text_y += measured.y + line_gap;
+        text_y += app.tooltip_row_heights[line_index] + line_gap;
     }
-    if (truncated and text_y <= y + box_h - 8) {
+    if (app.tooltip_truncated and text_y <= y + box_h - 8) {
         drawTextSlice(
             font,
             tooltip_more_marker,
@@ -2162,20 +2453,27 @@ fn detailTextSelection(app: *const App) ?DetailTextSelection {
 
 fn copyDetailTextSelection(app: *App) void {
     const selection = detailTextSelection(app) orelse return;
+    var needed: usize = 1;
+    for (selection.start.line..selection.end.line + 1) |line_index| {
+        const line = app.detail_lines[line_index];
+        const start = if (line_index == selection.start.line) selection.start.byte else 0;
+        const end = if (line_index == selection.end.line) selection.end.byte else line.text.len;
+        needed += end - start;
+        if (line_index < selection.end.line and line.break_after) needed += 1;
+    }
+    app.ensureClipboardCapacity(needed) catch return;
     var clipboard_len: usize = 0;
     for (selection.start.line..selection.end.line + 1) |line_index| {
         const line = app.detail_lines[line_index];
         const start = if (line_index == selection.start.line) selection.start.byte else 0;
         const end = if (line_index == selection.end.line) selection.end.byte else line.text.len;
-        const amount = @min(end - start, app.detail_clipboard.len - clipboard_len - 1);
+        const amount = end - start;
         @memcpy(
             app.detail_clipboard[clipboard_len..][0..amount],
             line.text[start..][0..amount],
         );
         clipboard_len += amount;
-        if (amount < end - start) break;
         if (line_index < selection.end.line and line.break_after) {
-            if (clipboard_len + 1 >= app.detail_clipboard.len) break;
             app.detail_clipboard[clipboard_len] = '\n';
             clipboard_len += 1;
         }
@@ -2303,7 +2601,6 @@ fn renderDetailPane(
     try app.ensureDetailCapacity(
         capacities.store,
         capacities.lines,
-        capacities.clipboard,
     );
     var head_buf: [128]u8 = undefined;
     const head_label = std.fmt.bufPrint(
@@ -2327,7 +2624,7 @@ fn renderDetailPane(
                 .store = app.detail_store,
                 .lines = app.detail_lines,
             };
-            const layout = buildProcessInfo(&tip, session, index, detail_sizes, null);
+            const layout = buildProcessInfo(&tip, session, index, detail_sizes);
             if (!tip.overflowed) {
                 app.detail_line_count = tip.line_count;
                 app.detail_timing_line = layout.timing_line;
@@ -2343,15 +2640,9 @@ fn renderDetailPane(
                 app.detail_lines.len,
                 2,
             ) catch return error.OutOfMemory;
-            const clipboard_capacity = std.math.add(
-                usize,
-                store_capacity,
-                line_capacity,
-            ) catch return error.OutOfMemory;
             try app.ensureDetailCapacity(
                 store_capacity,
                 line_capacity,
-                clipboard_capacity,
             );
         }
         app.detail_cache_process = selected;
@@ -2484,7 +2775,8 @@ fn renderDetailPane(
     if (graph_y + detail_cpu_graph_height >= content.y and
         graph_y <= content.y + content.height)
     {
-        drawDetailCpuGraph(
+        try drawDetailCpuGraph(
+            app,
             process,
             session.timelineNs(),
             input.host_cpu_count,
@@ -2779,7 +3071,26 @@ test "CPU slice height scales to host capacity" {
     };
 
     try testing.expectEqual(@as(f32, 27), cpuSliceHeight(full_row, 28, 8));
-    try testing.expectEqual(@as(f32, 13.5), cpuSliceHeight(half_row, 28, 8));
+    try testing.expectEqual(@as(f32, 18), cpuSliceHeight(half_row, 28, 8));
+}
+
+test "CPU slice height fills the row at three quarters of host cores" {
+    const testing = std.testing;
+    const three_quarter = tracer.Process.CpuSlice{
+        .start_ns = 0,
+        .end_ns = 100,
+        .cpu_ns = 600,
+        .band = 24,
+    };
+    const one_core = tracer.Process.CpuSlice{
+        .start_ns = 0,
+        .end_ns = 100,
+        .cpu_ns = 100,
+        .band = 4,
+    };
+
+    try testing.expectEqual(@as(f32, 27), cpuSliceHeight(three_quarter, 28, 8));
+    try testing.expectEqual(@as(f32, 4.5), cpuSliceHeight(one_core, 28, 8));
 }
 
 test "CPU slice height keeps light activity visible" {
@@ -3072,8 +3383,7 @@ fn graphRowsContainProcess(app: *const App, target: usize) bool {
     for (app.row_order.items) |row| switch (row) {
         .process => |index| if (index == target) return true,
         .slot => |slot| {
-            var member = slot.head;
-            while (member) |index| : (member = app.slot_next.items[index]) {
+            for (slotMembers(app, slot)) |index| {
                 if (index == target) return true;
             }
         },
@@ -3088,4 +3398,5 @@ test {
     _ = @import("text.zig");
     _ = @import("process_info.zig");
     _ = @import("theme.zig");
+    _ = @import("perf.zig");
 }

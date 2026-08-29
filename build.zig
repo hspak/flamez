@@ -35,9 +35,15 @@ pub fn build(b: *std.Build) void {
         "fps-counter",
         "Draw a green FPS counter beside the footer title",
     ) orelse false;
+    const enable_perf_telemetry = b.option(
+        bool,
+        "perf-telemetry",
+        "Log one performance summary line per second and a session total",
+    ) orelse false;
     const build_options = b.addOptions();
     build_options.addOption(bool, "ebpf", enable_ebpf);
     build_options.addOption(bool, "fps_counter", enable_fps_counter);
+    build_options.addOption(bool, "perf_telemetry", enable_perf_telemetry);
     const footer_font_files = b.addWriteFiles();
     const footer_font_source = footer_font_files.add(
         "footer_font.zig",
@@ -122,6 +128,8 @@ pub fn build(b: *std.Build) void {
 
     const tracer_options = b.addOptions();
     tracer_options.addOption(bool, "ebpf", enable_ebpf);
+    tracer_options.addOption(bool, "fps_counter", enable_fps_counter);
+    tracer_options.addOption(bool, "perf_telemetry", enable_perf_telemetry);
     if (bpf_object) |path| {
         tracer_options.addOptionPath("bpf_object", path);
     } else {

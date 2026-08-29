@@ -10,8 +10,8 @@ The current vertical slice includes:
 - argv-preserving target launch and whole-process-group cancellation;
 - live elapsed/process/active counters;
 - a scrollable, hoverable process tree with normalized lifetime bars and red
-  self-CPU slices whose height scales to host CPU capacity, including CPU time
-  and average-core metadata;
+  self-CPU slices whose height fills the row at 75% of host logical cores,
+  including CPU time and average-core metadata;
 - a selected-process detail pane with a full-lifetime thread CPU graph, an
   independent session-time axis, and the existing process metadata below it;
 - Linux `sched_process_fork`, `sched_process_exec`, and
@@ -29,6 +29,10 @@ An optional green FPS counter can be compiled into the footer beside **FLAMEZ** 
 zig build -Dfps-counter=true
 ```
 
+An optional one-line-per-second performance summary (plus a session total) is
+compiled in with `-Dperf-telemetry=true`. Use it on an installed ReleaseSafe
+build when capturing a baseline; it is off by default.
+
 Build with `zig build`, then install the executable and BPF object with the
 narrow capabilities required for tracing:
 
@@ -42,6 +46,20 @@ through the installer:
 
 ```sh
 ./build.sh -Dfps-counter=true
+```
+
+`build.sh` installs under `/usr/local` by default. Set `FLAMEZ_PREFIX` to use
+another installation prefix (the destination must support Linux file
+capabilities):
+
+```sh
+FLAMEZ_PREFIX="$HOME/.local" ./build.sh
+```
+
+Run the unit tests with:
+
+```sh
+zig build test
 ```
 
 For example:
@@ -59,10 +77,25 @@ every row, or the matching button in the left gutter to toggle one row. For
 packed rows, the one button toggles the children of every top-level process
 block on that row, reducing a collapsed row to one block in height. Capture
 ends when the target process exits; descendants that outlive it do not extend
-the trace.
+the trace. If the kernel drops lifecycle records, the session is marked
+**INCOMPLETE** and recovered rows are labeled as inferred rather than observed.
+After capture ends, Flamez redraws at a low idle rate until you interact with
+the timeline or detail pane. Live and interactive frames follow the display
+refresh (vsync) instead of a fixed 60 FPS cap.
 
 Timeline zoom shortcuts mirror Ctrl+mouse-wheel zoom: **Ctrl+=** zooms in,
 **Ctrl+-** zooms out, and **Ctrl+0** restores the full default view.
+When zoomed, **Shift+mouse-wheel** pans horizontally; the timeline's bottom
+and right scrollbars can also be dragged. Without Ctrl or Shift, the wheel
+scrolls rows. In the timeline, **Up/Down**, **Page Up/Page Down**, **Home**,
+and **End** provide keyboard row navigation; **Left/Right** collapse or expand
+the selected process when it has children.
+
+Selecting a process opens its detail pane. The pane contains the process's
+full-lifetime CPU graph and metadata, supports its own scrollbar and
+mouse-wheel/Page Up/Page Down/Home/End navigation, and allows text selection.
+With the detail text focused, **Ctrl+A** selects all metadata and **Ctrl+C**
+copies the selection to the clipboard.
 
 On Linux v7 or newer, the build always enables the eBPF collector and needs `clang`,
 libbpf headers, and libbpf at link time. Capture is mandatory: if the BPF
@@ -138,9 +171,17 @@ wakeup/off-CPU accounting, zoom/pan, export, and explicit thread grouping are
 natural follow-on layers; the event/data model is intentionally separate from
 the UI so those can be added without rewriting capture sessions.
 
+Session JSON export, import into the GUI, and a headless `-o` mode are
+specified in [HEADLESS.md](HEADLESS.md) and are not implemented yet.
+
 ## Validation hooks
 
-For automated visual checks, `FLAMEZ_SCREENSHOT` writes a screenshot after
-roughly two-thirds of a second. Pass the target through the normal command-line
-arguments. The screenshot path is interpreted by raylib relative to the
-current working directory.
+For automated visual checks, `FLAMEZ_SCREENSHOT=<path>` writes a screenshot on
+frame 40 (about two-thirds of a second at the normal 60 FPS target) and exits.
+Pass the target through the normal command-line arguments. The screenshot path
+is interpreted by raylib relative to the current working directory.
+
+For root-run collector smoke tests, `FLAMEZ_BPF_OBJECT` can select a specific
+BPF object. Capable non-root runs still require the selected object to be a
+root-owned, non-writable regular file; normal installed runs resolve the object
+from the executable's `share/flamez` directory.

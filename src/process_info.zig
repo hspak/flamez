@@ -12,10 +12,11 @@ const log = std.log.scoped(.process_info);
 const toRaylibColor = theme.toRaylibColor;
 const ink = theme.ink;
 const muted = theme.muted;
-const cpu_hot = theme.cpu_hot;
 
 /// Trailing overflow marker when an info block exceeds its row budget.
 pub const tooltip_more_marker = "…";
+/// Visible hover-tooltip rows, including a trailing overflow marker when needed.
+pub const tooltip_max_rows: usize = 7;
 
 pub const TooltipLine = struct {
     text: []const u8,
@@ -82,6 +83,10 @@ pub const TooltipBuilder = struct {
     }
 
     fn addWrapped(self: *TooltipBuilder, value: []const u8, size: f32, color: rl.Color) void {
+        if (self.line_count >= self.lines.len) {
+            self.overflowed = true;
+            return;
+        }
         var rest = value;
         while (rest.len > 0 and self.line_count < self.lines.len) {
             const take = wrapPrefix(self.font, rest, size, self.inner_w);
@@ -102,6 +107,10 @@ pub const TooltipBuilder = struct {
         size: f32,
         color: rl.Color,
     ) void {
+        if (self.line_count >= self.lines.len) {
+            self.overflowed = true;
+            return;
+        }
         var rest = value;
         while (rest.len > 0 and self.line_count < self.lines.len) {
             const take = wrapPrefix(self.font, rest, size, self.inner_w);
@@ -119,11 +128,17 @@ pub const TooltipBuilder = struct {
     }
 };
 
+/// Upper bound on bytes worth measuring for one wrapped line. Glyphs are at
+/// least 1px wide at the sizes Flamez uses, so prefixes longer than `max_width`
+/// cannot fit and must not be walked by `measureTextEx`.
+pub fn wrapProbeLimit(input_len: usize, max_width: f32) usize {
+    const pixel_bound = @as(usize, @intFromFloat(@floor(@max(max_width, 1)))) + 1;
+    return @min(input_len, @min(pixel_bound, text.text_buffer_capacity - 1));
+}
+
 fn wrapPrefix(font: rl.Font, input: []const u8, size: f32, max_width: f32) usize {
     if (input.len == 0) return 0;
-    // The raylib bridge measures through a fixed sentinel buffer. A visual
-    // line cannot approach this limit, so probe long arguments in safe chunks.
-    const measurable_len = @min(input.len, text.text_buffer_capacity - 1);
+    const measurable_len = wrapProbeLimit(input.len, max_width);
     if (measurable_len == input.len and
         text.measureTextSlice(font, input, size).x <= max_width)
     {
@@ -161,11 +176,21 @@ fn addArguments(
     size: f32,
     color: rl.Color,
 ) void {
-    const remaining = tip.store[tip.store_len..];
-    const arguments = formatArguments(process, metadata, arg_count, remaining) orelse {
+    if (tip.line_count >= tip.lines.len) {
         tip.overflowed = true;
         return;
+    }
+    const remaining = tip.store[tip.store_len..];
+    const arguments = if (formatArguments(process, metadata, arg_count, remaining)) |full|
+        full
+    else blk: {
+        tip.overflowed = true;
+        break :blk formatArgumentsPrefix(process, metadata, arg_count, remaining);
     };
+    if (arguments.len == 0) {
+        tip.overflowed = true;
+        return;
+    }
     const start = tip.store_len;
     tip.store_len += arguments.len;
     tip.addStoredWrapped(tip.store[start..tip.store_len], size, color);
@@ -190,6 +215,36 @@ fn formatArguments(
     return output[0 .. prefix.len + arguments.len];
 }
 
+fn formatArgumentsPrefix(
+    process: *const tracer.Process,
+    metadata: []const u8,
+    arg_count: usize,
+    output: []u8,
+) []const u8 {
+    var prefix_buf: [64]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "ARGS  ({d})  ·  ", .{arg_count}) catch
+        unreachable;
+    if (output.len <= prefix.len) return output[0..0];
+    @memcpy(output[0..prefix.len], prefix);
+    var len = prefix.len;
+    var args = process.argsIter(metadata);
+    _ = args.next();
+    var argument_index: usize = 0;
+    while (args.next()) |arg| {
+        if (argument_index > 0) {
+            if (len >= output.len) return output[0..len];
+            output[len] = ' ';
+            len += 1;
+        }
+        const take = @min(arg.len, output.len - len);
+        @memcpy(output[len..][0..take], arg[0..take]);
+        len += take;
+        if (take < arg.len) return output[0..len];
+        argument_index += 1;
+    }
+    return output[0..len];
+}
+
 /// Font sizes for a process info block. The hover tooltip uses the compact set;
 /// the bottom detail pane renders the same lines slightly larger.
 pub const InfoSizes = struct {
@@ -211,22 +266,39 @@ pub fn formatTimingLine(
     var cpu_buf: [32]u8 = undefined;
     var start_buf: [32]u8 = undefined;
     var end_buf: [32]u8 = undefined;
-    const duration = text.formatDuration(process.durationNs(now_ns), &duration_buf);
+    const inferred_start = process.origin == .recovered_parent or
+        process.origin == .recovered_exec or
+        process.origin == .recovered_exit;
+    const duration = if (inferred_start and process.origin == .recovered_exit)
+        "unknown"
+    else
+        text.formatDuration(process.durationNs(now_ns), &duration_buf);
+    const cpu_partial = process.end_kind == .capture_clipped;
     const cpu = text.formatDuration(process.cpu_time_ns, &cpu_buf);
-    const average_cores = if (process.durationNs(now_ns) == 0)
+    const average_cores = if (process.durationNs(now_ns) == 0 or inferred_start)
         0
     else
         @as(f64, @floatFromInt(process.cpu_time_ns)) /
             @as(f64, @floatFromInt(process.durationNs(now_ns)));
-    const start = text.formatDuration(process.start_ns, &start_buf);
-    const end = if (process.end_ns) |at|
+    const start = if (inferred_start)
+        "inferred"
+    else
+        text.formatDuration(process.start_ns, &start_buf);
+    const end = if (process.end_kind == .capture_clipped) blk: {
+        var edge_buf: [32]u8 = undefined;
+        const at = process.end_ns orelse now_ns;
+        break :blk std.fmt.bufPrint(&end_buf, "{s} (edge)", .{
+            text.formatDuration(at, &edge_buf),
+        }) catch "capture edge";
+    } else if (process.end_ns) |at|
         text.formatDuration(at, &end_buf)
     else
         "running";
+    const cpu_label: []const u8 = if (cpu_partial) "CPU~" else "CPU";
     return std.fmt.bufPrint(
         buffer,
-        "START  {s}  ·  END  {s}  ·  WALL  {s}  ·  CPU  {s}  ·  AVG  {d:.2} CORES",
-        .{ start, end, duration, cpu, average_cores },
+        "START  {s}  ·  END  {s}  ·  WALL  {s}  ·  {s}  {s}  ·  AVG  {d:.2} CORES",
+        .{ start, end, duration, cpu_label, cpu, average_cores },
     ) catch "START  —  ·  END  —  ·  WALL  —  ·  CPU  —";
 }
 
@@ -237,7 +309,6 @@ pub fn buildProcessInfo(
     session: *const tracer.Session,
     index: usize,
     sizes: InfoSizes,
-    cpu_slice_index: ?usize,
 ) InfoLayout {
     const process = &session.processes.items[index];
     const metadata = session.metadataBytes();
@@ -262,33 +333,35 @@ pub fn buildProcessInfo(
             toRaylibColor(muted),
         );
     }
+    if (process.origin != .observed or
+        process.end_kind == .capture_clipped or
+        session.incomplete)
+    {
+        tip.addFmt(
+            "CAPTURE  {s}  ·  END  {s}{s}",
+            .{
+                switch (process.origin) {
+                    .observed => "observed",
+                    .recovered_parent => "inferred parent",
+                    .recovered_exec => "inferred exec",
+                    .recovered_exit => "exit only",
+                },
+                switch (process.end_kind) {
+                    .open => "open",
+                    .observed_exit => "observed",
+                    .capture_clipped => "capture edge",
+                },
+                if (session.incomplete) "  ·  SESSION INCOMPLETE" else "",
+            },
+            sizes.body,
+            toRaylibColor(theme.danger),
+        );
+    }
     var timing_buf: [160]u8 = undefined;
     const timing = formatTimingLine(process, session.timelineNs(), &timing_buf);
     const timing_index = tip.line_count;
     tip.add(timing, sizes.body, toRaylibColor(muted));
     if (tip.line_count > timing_index) layout.timing_line = timing_index;
-
-    if (cpu_slice_index) |slice_index| {
-        if (slice_index < process.cpu_slices.items.len) {
-            const slice = process.cpu_slices.items[slice_index];
-            var slice_start_buf: [32]u8 = undefined;
-            var slice_end_buf: [32]u8 = undefined;
-            var slice_wall_buf: [32]u8 = undefined;
-            var slice_cpu_buf: [32]u8 = undefined;
-            tip.addFmt(
-                "CPU SLICE  {s}–{s}  ·  WALL  {s}  ·  CPU  {s}  ·  AVG  {d:.2} CORES",
-                .{
-                    text.formatDuration(slice.start_ns, &slice_start_buf),
-                    text.formatDuration(slice.end_ns, &slice_end_buf),
-                    text.formatDuration(slice.durationNs(), &slice_wall_buf),
-                    text.formatDuration(slice.cpu_ns, &slice_cpu_buf),
-                    slice.averageCores(),
-                },
-                sizes.body,
-                toRaylibColor(cpu_hot),
-            );
-        }
-    }
 
     // Process fields are fixed-capacity; the extra bytes cover every inline
     // label and delimiter, so the following formatting cannot overflow.
@@ -354,6 +427,13 @@ test "TooltipBuilder interns text into caller storage" {
     try testing.expect(tip.overflowed);
 }
 
+test "wrap probe limit never exceeds the pixel budget" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 81), wrapProbeLimit(10_000, 80));
+    try testing.expectEqual(@as(usize, 40), wrapProbeLimit(40, 80));
+    try testing.expectEqual(@as(usize, 2), wrapProbeLimit(100, 0));
+}
+
 test "timing line reports self CPU and average cores" {
     var process = tracer.Process{ .pid = 7, .start_ns = 0 };
     process.end_ns = 2 * std.time.ns_per_s;
@@ -364,6 +444,20 @@ test "timing line reports self CPU and average cores" {
 
     try std.testing.expect(std.mem.indexOf(u8, line, "CPU  5.00 s") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "AVG  2.50 CORES") != null);
+}
+
+test "argument prefix fills available storage without requiring the full argv" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var metadata = tracer.Process.MetadataStore.empty;
+    defer metadata.deinit(gpa);
+    var process = tracer.Process{ .pid = 7 };
+    try process.setArgsFromArgv(&metadata, gpa, &.{ "clang", "-c", "source file.c" });
+    var buffer: [24]u8 = undefined;
+
+    const row = formatArgumentsPrefix(&process, metadata.items, 2, &buffer);
+    try testing.expect(std.mem.startsWith(u8, row, "ARGS  (2)  ·  "));
+    try testing.expect(row.len == buffer.len);
 }
 
 test "argument row joins argv with spaces" {

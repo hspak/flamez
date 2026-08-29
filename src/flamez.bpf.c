@@ -44,6 +44,12 @@ struct linux_binprm {
     const char *filename;
 } __attribute__((preserve_access_index));
 
+/* Preallocated kernel footprint, kept large so hot tracepoints never allocate:
+ *   events ring          16 MiB
+ *   tracked_pids         65536 x (u32 key + u8)
+ *   process_cpu          65536 x (u32 key + u64)
+ *   running_threads      65536 x (u32 key + 16-byte value)
+ * Do not shrink these without a loss/peak-occupancy test. */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24);
