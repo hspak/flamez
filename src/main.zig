@@ -10,6 +10,7 @@ const rl = @import("raylib");
 const footer_font = @import("footer_font");
 const tracer = @import("tracer.zig");
 const App = @import("App.zig");
+const page_layout = @import("layout.zig");
 const theme = @import("theme.zig");
 const text = @import("text.zig");
 const process_info = @import("process_info.zig");
@@ -18,14 +19,12 @@ const perf = @import("perf.zig");
 const log = std.log.scoped(.flamez);
 
 const canvas = theme.canvas;
-const panel = theme.panel;
 const panel_raised = theme.panel_raised;
 const border = theme.border;
 const accent = theme.accent;
 const blue = theme.blue;
 const yellow = theme.yellow;
 const cpu_hot = theme.cpu_hot;
-const fps_green = theme.fps_green;
 const ink = theme.ink;
 const muted = theme.muted;
 const faint = theme.faint;
@@ -282,9 +281,9 @@ pub fn main(init: std.process.Init) !void {
                 countSlices(&session),
             );
         }
-        const view_text = makeViewText(&session);
+        const view_text = page_layout.makeViewText(&session);
         perf.enter(.clay_layout);
-        const commands = createLayout(&app, &session, &view_text);
+        const commands = page_layout.create(&app, &session, &view_text);
         perf.leave();
 
         rl.beginDrawing();
@@ -322,273 +321,12 @@ fn countSlices(session: *const tracer.Session) usize {
     return total;
 }
 
-const ViewText = struct {
-    fps: [32]u8 = [_]u8{0} ** 32,
-    fps_len: usize = 0,
-    status: [64]u8 = [_]u8{0} ** 64,
-    status_len: usize = 0,
-    elapsed: [32]u8 = [_]u8{0} ** 32,
-    elapsed_len: usize = 0,
-    process_count: [32]u8 = [_]u8{0} ** 32,
-    process_count_len: usize = 0,
-    active_count: [32]u8 = [_]u8{0} ** 32,
-    active_count_len: usize = 0,
-    dropped: [32]u8 = [_]u8{0} ** 32,
-    dropped_len: usize = 0,
-
-    fn fpsSlice(self: *const ViewText) []const u8 {
-        return self.fps[0..self.fps_len];
-    }
-    fn statusSlice(self: *const ViewText) []const u8 {
-        return self.status[0..self.status_len];
-    }
-    fn elapsedSlice(self: *const ViewText) []const u8 {
-        return self.elapsed[0..self.elapsed_len];
-    }
-    fn processCount(self: *const ViewText) []const u8 {
-        return self.process_count[0..self.process_count_len];
-    }
-    fn activeCount(self: *const ViewText) []const u8 {
-        return self.active_count[0..self.active_count_len];
-    }
-    fn droppedSlice(self: *const ViewText) []const u8 {
-        return self.dropped[0..self.dropped_len];
-    }
-};
-
-fn makeViewText(session: *const tracer.Session) ViewText {
-    var vt = ViewText{};
-    if (comptime build_options.fps_counter) {
-        const fps = std.fmt.bufPrint(&vt.fps, "{d} FPS", .{rl.getFPS()}) catch "0 FPS";
-        vt.fps_len = fps.len;
-    }
-    const status = if (session.incomplete and session.running)
-        "INCOMPLETE"
-    else if (session.running)
-        "RUNNING"
-    else if (session.incomplete) status: {
-        if (session.exit_code) |code|
-            break :status std.fmt.bufPrint(
-                &vt.status,
-                "INCOMPLETE · EXIT {d}",
-                .{code},
-            ) catch "INCOMPLETE";
-        if (session.exit_signal) |signal|
-            break :status std.fmt.bufPrint(
-                &vt.status,
-                "INCOMPLETE · SIGNAL {d}",
-                .{signal},
-            ) catch "INCOMPLETE";
-        break :status "INCOMPLETE";
-    } else if (session.exit_code) |code|
-        std.fmt.bufPrint(&vt.status, "FINISHED · EXIT {d}", .{code}) catch "FINISHED"
-    else if (session.exit_signal) |signal|
-        std.fmt.bufPrint(&vt.status, "STOPPED · SIGNAL {d}", .{signal}) catch "STOPPED"
-    else
-        "READY";
-    vt.status_len = status.len;
-    vt.elapsed_len = formatDuration(session.timelineNs(), &vt.elapsed).len;
-    const process_count: []const u8 = std.fmt.bufPrint(
-        &vt.process_count,
-        "{d}",
-        .{session.processes.items.len},
-    ) catch "0";
-    vt.process_count_len = process_count.len;
-    const active_count: []const u8 = std.fmt.bufPrint(
-        &vt.active_count,
-        "{d}",
-        .{session.activeCount()},
-    ) catch "0";
-    vt.active_count_len = active_count.len;
-    if (session.lost_events > 0) {
-        const dropped = std.fmt.bufPrint(&vt.dropped, "{d}", .{session.lost_events}) catch "1";
-        vt.dropped_len = dropped.len;
-    }
-    return vt;
-}
-
 fn handleClayError(error_data: clay.ErrorData) callconv(.c) void {
     const message = error_data.error_text.chars[0..@intCast(error_data.error_text.length)];
     log.err("clay layout ({s}): {s}", .{ @tagName(error_data.error_type), message });
 }
 
-fn createLayout(
-    app: *const App,
-    session: *const tracer.Session,
-    view_text: *const ViewText,
-) []clay.RenderCommand {
-    const compact = rl.getScreenWidth() < 900;
-    clay.beginLayout();
-    clay.UI()(.{
-        .id = .ID("Page"),
-        .layout = .{ .direction = .top_to_bottom, .sizing = .grow },
-        .background_color = canvas,
-    })({
-        clay.UI()(.{
-            .layout = .{
-                .direction = .top_to_bottom,
-                .sizing = .grow,
-                .child_gap = 1,
-            },
-        })({
-            clay.UI()(.{
-                .id = .ID("TimelineViewport"),
-                .layout = .{ .sizing = .{ .w = .grow, .h = .growMinMax(.{ .min = 180 }) } },
-                .background_color = panel,
-            })({});
-            // The detail pane exists only while a process is selected; without
-            // it the timeline grows back over the freed space.
-            if (app.selected_process != null) {
-                clay.UI()(.{
-                    .id = .ID("DetailPane"),
-                    .layout = .{
-                        .direction = .top_to_bottom,
-                        .sizing = .{ .w = .grow, .h = .percent(detail_pane_fraction) },
-                    },
-                    .background_color = panel,
-                })({
-                    clay.UI()(.{
-                        .layout = .{
-                            .sizing = .{ .w = .grow, .h = .fixed(42) },
-                            .padding = .{ .right = 8 },
-                            .child_alignment = .{ .x = .right, .y = .center },
-                        },
-                    })({
-                        clay.UI()(.{
-                            .id = .ID("DetailCloseButton"),
-                            .layout = .{
-                                .sizing = .{ .w = .fixed(20), .h = .fixed(20) },
-                            },
-                        })({});
-                    });
-                });
-            }
-        });
-
-        clay.UI()(.{
-            .id = .ID("Footer"),
-            .layout = .{
-                .sizing = .{ .w = .grow, .h = .fixed(process_row_height) },
-                .padding = .axes(0, 8),
-                .child_alignment = .{ .x = .left, .y = .center },
-                .child_gap = if (compact) 8 else 12,
-            },
-            .background_color = panel,
-            .border = .{ .color = border, .width = .{ .top = 1 } },
-        })({
-            clay.text("FLAMEZ", .{
-                .font_size = 12,
-                .color = ink,
-                .wrap_mode = .none,
-                .letter_spacing = 1,
-            });
-            if (comptime build_options.fps_counter) {
-                clay.UI()(.{
-                    .layout = .{
-                        .sizing = .{ .w = .fixed(54), .h = .fit },
-                        .child_alignment = .{ .x = .left, .y = .center },
-                    },
-                })({
-                    clay.text(view_text.fpsSlice(), .{
-                        .font_id = footer_font_id,
-                        .font_size = 12,
-                        .color = fps_green,
-                        .wrap_mode = .none,
-                    });
-                });
-            }
-            clay.UI()(.{
-                .layout = .{
-                    .sizing = .{ .w = .grow, .h = .fit },
-                    .child_alignment = .{ .x = .left, .y = .center },
-                    .child_gap = if (compact) 8 else 14,
-                },
-                .clip = .{ .horizontal = true },
-            })({
-                footerLegendItem("PARENT PROCESS", blue);
-                footerLegendItem("LEAF PROCESS", yellow);
-                if (app.message_len > 0) {
-                    clay.text(app.messageSlice(), .{
-                        .font_size = 12,
-                        .color = danger,
-                        .wrap_mode = .none,
-                    });
-                }
-            });
-            footerStat("ELAPSED", view_text.elapsedSlice(), accent);
-            footerStat("PROCESSES", view_text.processCount(), blue);
-            footerStat("ACTIVE", view_text.activeCount(), danger);
-            footerStat("SESSION", view_text.statusSlice(), muted);
-            if (view_text.dropped_len > 0) {
-                footerStat("DROPPED", view_text.droppedSlice(), danger);
-            }
-            if (session.running) {
-                clay.UI()(.{
-                    .id = .ID("StopButton"),
-                    .layout = .{
-                        .sizing = .{ .w = .fixed(54), .h = .fixed(22) },
-                        .child_alignment = .center,
-                    },
-                    .background_color = if (clay.hovered()) .{ 255, 132, 145, 255 } else danger,
-                    .corner_radius = .all(5),
-                })({
-                    clay.text("STOP", .{
-                        .font_id = footer_font_id,
-                        .font_size = 12,
-                        .color = canvas,
-                        .wrap_mode = .none,
-                    });
-                });
-            }
-        });
-    });
-    return clay.endLayout();
-}
-
-fn footerStat(label: []const u8, value: []const u8, value_color: clay.Color) void {
-    clay.UI()(.{
-        .layout = .{
-            .child_gap = 4,
-            .child_alignment = .{ .x = .left, .y = .center },
-        },
-    })({
-        clay.text(label, .{
-            .font_id = footer_font_id,
-            .font_size = 12,
-            .color = muted,
-            .wrap_mode = .none,
-            .letter_spacing = 1,
-        });
-        clay.text(value, .{
-            .font_id = footer_font_id,
-            .font_size = 12,
-            .color = value_color,
-            .wrap_mode = .none,
-        });
-    });
-}
-
-fn footerLegendItem(label: []const u8, color: clay.Color) void {
-    clay.UI()(.{
-        .layout = .{
-            .child_gap = 5,
-            .child_alignment = .{ .x = .left, .y = .center },
-        },
-    })({
-        clay.UI()(.{
-            .layout = .{ .sizing = .{ .w = .fixed(10), .h = .fixed(10) } },
-            .background_color = color,
-        })({});
-        clay.text(label, .{
-            .font_id = footer_font_id,
-            .font_size = 12,
-            .color = muted,
-            .wrap_mode = .none,
-        });
-    });
-}
-
-const process_row_height: f32 = 28;
+const process_row_height = page_layout.process_row_height;
 const process_row_gap: f32 = 1;
 const min_cpu_slice_height: f32 = 2;
 /// Timeline CPU bars fill the row at this fraction of host logical cores.
@@ -1505,7 +1243,11 @@ fn paintBarLabel(
     if (app.bar_name_widths.items[process_index] < 0 or
         app.bar_name_hashes.items[process_index] != name_hash)
     {
-        app.bar_name_widths.items[process_index] = measureTextSlice(look.font, name, 13).x;
+        app.bar_name_widths.items[process_index] = measureTextSlice(
+            look.font,
+            name,
+            bar_label_size,
+        ).x;
         app.bar_name_hashes.items[process_index] = name_hash;
     }
     const name_width = app.bar_name_widths.items[process_index];
@@ -1520,8 +1262,10 @@ fn paintBarLabel(
     ) catch name;
     const label_height = measureTextSlice(look.font, bar_label, bar_label_size).y;
     const label_position = rl.Vector2{
-        .x = bar.x + bar_label_inset,
-        .y = bar.y + (bar.height - label_height) / 2,
+        // Bar positions are time-derived and commonly fractional. Sampling a
+        // glyph atlas between screen pixels makes the small row labels fuzzy.
+        .x = @round(bar.x + bar_label_inset),
+        .y = @round(bar.y + (bar.height - label_height) / 2),
     };
     const max_width = bar.width - bar_label_inset - bar_label_right_padding;
     const outline_offsets = [_]rl.Vector2{
@@ -1538,7 +1282,7 @@ fn paintBarLabel(
                 .y = label_position.y + offset.y,
             },
             .size = bar_label_size,
-            .color = rl.Color.init(5, 10, 18, 235),
+            .color = rl.Color.black,
             .max_width = max_width,
         });
     }
@@ -2097,8 +1841,6 @@ fn ratio(numerator: usize, denominator: usize) f32 {
     return @floatCast(numerator_f / denominator_f);
 }
 
-// Bottom detail pane occupies this share of the body column's height.
-const detail_pane_fraction: f32 = 0.6;
 const detail_line_gap: f32 = 5;
 const detail_min_line_glyphs: usize = 8;
 const detail_cpu_graph_height: f32 = 174;
@@ -3136,7 +2878,8 @@ fn raylibSpacing(_: rl.Font, _: u16, letter_spacing: u16) f32 {
     return @floatFromInt(letter_spacing);
 }
 
-// Inter Regular and Bold, SIL OFL 1.1. Atlas at 64px so 11–30px UI sizes scale cleanly.
+// Inter Regular and Bold, SIL OFL 1.1. UI atlases use 64px for their range of
+// sizes; row labels use a native 12px atlas for FreeType's pixel hinting.
 const ui_font_ttf = @embedFile("fonts/Inter-Regular.ttf");
 const row_font_ttf = @embedFile("fonts/Inter-Bold.ttf");
 const footer_font_ttf = footer_font.ttf;
@@ -3154,13 +2897,13 @@ const extra_codepoints = [_]i32{
 
 fn loadFonts() FontBook {
     return .{
-        .ui = loadEmbeddedFont(ui_font_ttf),
-        .row = loadEmbeddedFont(row_font_ttf),
-        .footer = loadEmbeddedFont(footer_font_ttf),
+        .ui = loadEmbeddedFont(ui_font_ttf, ui_font_atlas_size),
+        .row = loadEmbeddedFont(row_font_ttf, bar_label_size),
+        .footer = loadEmbeddedFont(footer_font_ttf, ui_font_atlas_size),
     };
 }
 
-fn loadEmbeddedFont(ttf: []const u8) rl.Font {
+fn loadEmbeddedFont(ttf: []const u8, font_size: i32) rl.Font {
     var codepoints: [256]i32 = undefined;
     var count: usize = 0;
     var cp: i32 = 32;
@@ -3180,7 +2923,7 @@ fn loadEmbeddedFont(ttf: []const u8) rl.Font {
     const font = rl.loadFontFromMemory(
         ".ttf",
         ttf,
-        ui_font_atlas_size,
+        font_size,
         codepoints[0..count],
     ) catch {
         return rl.getFontDefault() catch unreachable;
