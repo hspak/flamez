@@ -203,7 +203,7 @@ fn formatArguments(
     output: []u8,
 ) ?[]const u8 {
     var prefix_buf: [64]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&prefix_buf, "ARGS  ({d})  ·  ", .{arg_count}) catch
+    const prefix = std.fmt.bufPrint(&prefix_buf, "Command (args: {d}): ", .{arg_count}) catch
         unreachable;
     const required = std.math.add(usize, prefix.len, process.args_len) catch return null;
     if (required > output.len) return null;
@@ -222,7 +222,7 @@ fn formatArgumentsPrefix(
     output: []u8,
 ) []const u8 {
     var prefix_buf: [64]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&prefix_buf, "ARGS  ({d})  ·  ", .{arg_count}) catch
+    const prefix = std.fmt.bufPrint(&prefix_buf, "Command  (args: {d}): ", .{arg_count}) catch
         unreachable;
     if (output.len <= prefix.len) return output[0..0];
     @memcpy(output[0..prefix.len], prefix);
@@ -313,11 +313,6 @@ pub fn buildProcessInfo(
     const process = &session.processes.items[index];
     const metadata = session.metadataBytes();
     var layout = InfoLayout{};
-
-    tip.addFmt("{s}{s}", .{
-        process.nameSlice(),
-        if (process.name_kind == .other) "  ·  not a process name" else "",
-    }, sizes.title, toRaylibColor(ink));
     if (process.parent_pid) |ppid| {
         tip.addFmt(
             "PID  {d}  ·  PPID  {d}  ·  DEPTH  {d}",
@@ -366,21 +361,10 @@ pub fn buildProcessInfo(
     // Process fields are fixed-capacity; the extra bytes cover every inline
     // label and delimiter, so the following formatting cannot overflow.
     var wide_buf: [tracer.max_path_len + 128]u8 = undefined;
-    const path = if (process.exeSlice(metadata).len > 0)
-        process.exeSlice(metadata)
-    else
-        process.argv0(metadata);
-    if (path.len > 0) {
-        const path_line = std.fmt.bufPrint(&wide_buf, "PATH{s}  ·  {s}", .{
-            if (process.exe_truncated) "  (TRUNCATED)" else "",
-            path,
-        }) catch unreachable;
-        tip.addWrapped(path_line, sizes.body, toRaylibColor(ink));
-    }
     if (process.cwdSlice(metadata).len > 0) {
         const cwd_line = std.fmt.bufPrint(
             &wide_buf,
-            "CWD{s}  ·  {s}",
+            "Directory{s}: {s}",
             .{
                 if (process.cwd_truncated) "  (TRUNCATED)" else "",
                 process.cwdSlice(metadata),
@@ -389,6 +373,7 @@ pub fn buildProcessInfo(
         tip.addWrapped(cwd_line, sizes.body, toRaylibColor(ink));
     }
 
+    // Minus 1 to not count the program itself.
     const arg_count = process.args_count -| 1;
     if (arg_count > 0) {
         addArguments(

@@ -198,7 +198,7 @@ pub fn create(
             stat("ELAPSED", view_text.elapsedSlice(), theme.accent);
             stat("PROCESSES", view_text.processCount(), theme.blue);
             stat("ACTIVE", view_text.activeCount(), theme.danger);
-            stat("SESSION", view_text.statusSlice(), theme.muted);
+            stat("", view_text.statusSlice(), theme.muted);
             if (view_text.dropped_len > 0) stat("DROPPED", view_text.droppedSlice(), theme.danger);
             if (session.running) {
                 clay.UI()(.{

@@ -702,8 +702,6 @@ pub fn render(
         12,
         toRaylibColor(muted),
     );
-    const title_w = header_title_size.x;
-
     const index = selected.?;
 
     // Restart at the top whenever the inspected process changes.
@@ -719,13 +717,6 @@ pub fn render(
         capacities.store,
         capacities.lines,
     );
-    var head_buf: [128]u8 = undefined;
-    const head_label = std.fmt.bufPrint(
-        &head_buf,
-        "{s}  ·  pid {d}",
-        .{ process.nameSlice(), process.pid },
-    ) catch "";
-
     const inner_w = @max(120, content.width - pad * 2 - scrollbar_width - 6);
     const rebuild_detail = app.detail_cache_process != selected or
         app.detail_cache_revision != process.revision or
@@ -949,20 +940,6 @@ pub fn render(
             4,
             toRaylibColor(thumb_color),
         );
-    }
-
-    // Draw the selected-process label last so it stays above the scissored
-    // content-area edge.
-    if (head_label.len > 0) {
-        var head_x: f32 = box.x + pad + title_w + 16;
-        drawClippedAt(head_label, .{
-            .x = &head_x,
-            .right = close_box.x - 8,
-            .font = font,
-            .y = box.y + 14,
-            .size = 12,
-            .color = toRaylibColor(faint),
-        });
     }
     drawDetailCloseButton(font, mouse, close_box);
 }
