@@ -45,8 +45,8 @@ message_len: usize = 0,
 row_order: std.ArrayList(GraphRow) = .empty,
 first_child: std.ArrayList(?usize) = .empty,
 next_sibling: std.ArrayList(?usize) = .empty,
-visual_depth: std.ArrayList(u16) = .empty,
 pack_slot: std.ArrayList(u16) = .empty,
+pack_subrow: std.ArrayList(u16) = .empty,
 /// Intrusive next links used while packing; render walks `packed_members`.
 slot_next: std.ArrayList(?usize) = .empty,
 /// Process indexes on packed rows, grouped by slot and sorted by start time.
@@ -60,6 +60,7 @@ heights_scratch: std.ArrayList(u16) = .empty,
 occupied_scratch: std.ArrayList(LaneOcc) = .empty,
 free_lanes_scratch: std.ArrayList(u16) = .empty,
 lane_offsets_scratch: std.ArrayList(usize) = .empty,
+row_heads_scratch: std.ArrayList(?usize) = .empty,
 cpu_columns: std.ArrayList(CpuColumn) = .empty,
 cpu_touched_columns: std.ArrayList(usize) = .empty,
 packed_columns: std.ArrayList(?usize) = .empty,
@@ -174,8 +175,8 @@ pub fn deinit(self: *App) void {
     self.row_order.deinit(self.gpa);
     self.first_child.deinit(self.gpa);
     self.next_sibling.deinit(self.gpa);
-    self.visual_depth.deinit(self.gpa);
     self.pack_slot.deinit(self.gpa);
+    self.pack_subrow.deinit(self.gpa);
     self.slot_next.deinit(self.gpa);
     self.packed_members.deinit(self.gpa);
     self.lane_height_off.deinit(self.gpa);
@@ -187,6 +188,7 @@ pub fn deinit(self: *App) void {
     self.occupied_scratch.deinit(self.gpa);
     self.free_lanes_scratch.deinit(self.gpa);
     self.lane_offsets_scratch.deinit(self.gpa);
+    self.row_heads_scratch.deinit(self.gpa);
     self.cpu_columns.deinit(self.gpa);
     self.cpu_touched_columns.deinit(self.gpa);
     self.packed_columns.deinit(self.gpa);

@@ -32,11 +32,12 @@ fn rebuildProcessTree(
     const n = session.processes.items.len;
     try app.first_child.ensureTotalCapacity(app.gpa, n);
     try app.next_sibling.ensureTotalCapacity(app.gpa, n);
-    try app.visual_depth.ensureTotalCapacity(app.gpa, n);
     try app.pack_slot.ensureTotalCapacity(app.gpa, n);
+    try app.pack_subrow.ensureTotalCapacity(app.gpa, n);
     try app.slot_next.ensureTotalCapacity(app.gpa, n);
     try app.lane_height_off.ensureTotalCapacity(app.gpa, n);
     try app.last_child_scratch.ensureTotalCapacity(app.gpa, n);
+    try app.row_heads_scratch.ensureTotalCapacity(app.gpa, n);
     try app.bar_name_widths.ensureTotalCapacity(app.gpa, n);
     try app.bar_name_hashes.ensureTotalCapacity(app.gpa, n);
     if (app.bar_name_widths.items.len < n) {
@@ -53,8 +54,8 @@ fn rebuildProcessTree(
     app.row_order.clearRetainingCapacity();
     app.first_child.clearRetainingCapacity();
     app.next_sibling.clearRetainingCapacity();
-    app.visual_depth.clearRetainingCapacity();
     app.pack_slot.clearRetainingCapacity();
+    app.pack_subrow.clearRetainingCapacity();
     app.slot_next.clearRetainingCapacity();
     app.packed_members.clearRetainingCapacity();
     app.lane_height_off.clearRetainingCapacity();
@@ -64,8 +65,8 @@ fn rebuildProcessTree(
     if (n == 0) return;
     app.first_child.appendNTimesAssumeCapacity(null, n);
     app.next_sibling.appendNTimesAssumeCapacity(null, n);
-    app.visual_depth.appendNTimesAssumeCapacity(0, n);
     app.pack_slot.appendNTimesAssumeCapacity(0, n);
+    app.pack_subrow.appendNTimesAssumeCapacity(0, n);
     app.slot_next.appendNTimesAssumeCapacity(null, n);
     app.lane_height_off.appendNTimesAssumeCapacity(0, n);
     app.last_child_scratch.appendNTimesAssumeCapacity(null, n);
@@ -79,7 +80,6 @@ fn rebuildProcessTree(
     for (0..n) |index| {
         const process = &session.processes.items[index];
         if (process.parent_index) |parent| {
-            app.visual_depth.items[index] = app.visual_depth.items[parent] + 1;
             if (app.first_child.items[parent] == null) {
                 app.first_child.items[parent] = index;
             } else if (app.last_child_scratch.items[parent]) |prev| {
@@ -91,8 +91,7 @@ fn rebuildProcessTree(
         }
     }
 
-    const now_ns = session.timelineNs();
-    for (app.roots_scratch.items) |root| try appendSubtree(app, session, root, now_ns);
+    for (app.roots_scratch.items) |root| try appendSubtree(app, session, root);
 }
 
 pub fn isCollapsed(app: *const App, index: usize) bool {
@@ -192,8 +191,7 @@ const JobBounds = struct {
 };
 
 const JobWalk = struct {
-    base_depth: u16,
-    now_ns: u64,
+    min_subrow: usize,
     bounds: *JobBounds,
 };
 
@@ -201,7 +199,6 @@ fn appendSubtree(
     app: *App,
     session: *const tracer.Session,
     index: usize,
-    now_ns: u64,
 ) Allocator.Error!void {
     try app.row_order.append(app.gpa, .{ .process = index });
     if (isCollapsed(app, index)) return;
@@ -211,7 +208,7 @@ fn appendSubtree(
     const child_has_kids = child_index < app.first_child.items.len and
         app.first_child.items[child_index] != null;
     if (unary and child_has_kids) {
-        try appendSubtree(app, session, child_index, now_ns);
+        try appendSubtree(app, session, child_index);
         return;
     }
 
@@ -223,7 +220,7 @@ fn appendSubtree(
 
     child = first;
     while (child) |job_root| {
-        app.jobs_scratch.appendAssumeCapacity(collectJob(app, session, job_root, now_ns));
+        app.jobs_scratch.appendAssumeCapacity(collectJob(app, session, job_root));
         child = app.next_sibling.items[job_root];
     }
     if (app.jobs_scratch.items.len == 0) return;
@@ -259,7 +256,7 @@ fn appendSubtree(
         }
     }
     for (app.jobs_scratch.items) |job| {
-        linkPackedSubtree(app, job.root, visualDepth(app, job.root), row_base);
+        linkPackedSubtree(app, job.root, row_base);
     }
     try flattenPackedMembers(app, session, row_base, slot_rows);
 }
@@ -268,15 +265,14 @@ fn collectJob(
     app: *App,
     session: *const tracer.Session,
     job_root: usize,
-    now_ns: u64,
 ) JobSpan {
+    app.row_heads_scratch.clearRetainingCapacity();
     var bounds = JobBounds{
         .start_ns = session.processes.items[job_root].start_ns,
-        .end_ns = session.processes.items[job_root].end_ns orelse now_ns,
+        .end_ns = packingEnd(&session.processes.items[job_root]),
     };
     markJobTree(app, session, job_root, .{
-        .base_depth = visualDepth(app, job_root),
-        .now_ns = now_ns,
+        .min_subrow = 0,
         .bounds = &bounds,
     });
     return .{
@@ -287,22 +283,59 @@ fn collectJob(
     };
 }
 
+fn packingEnd(process: *const tracer.Process) u64 {
+    // Live bars keep growing without another topology rebuild, so their rows
+    // must remain occupied until a later rebuild observes a real end time.
+    return process.end_ns orelse std.math.maxInt(u64);
+}
+
+fn overlapsPackedRow(
+    app: *const App,
+    processes: []const tracer.Process,
+    index: usize,
+    head: ?usize,
+) bool {
+    const process = &processes[index];
+    const process_end = packingEnd(process);
+    var member = head;
+    while (member) |other_index| : (member = app.slot_next.items[other_index]) {
+        const other = &processes[other_index];
+        if (process.start_ns < packingEnd(other) and other.start_ns < process_end) return true;
+    }
+    return false;
+}
+
 fn markJobTree(
     app: *App,
     session: *const tracer.Session,
     index: usize,
     walk: JobWalk,
 ) void {
-    const proc = session.processes.items[index];
-    if (proc.start_ns < walk.bounds.start_ns) walk.bounds.start_ns = proc.start_ns;
-    const proc_end = proc.end_ns orelse walk.now_ns;
+    const processes = session.processes.items;
+    const process = &processes[index];
+    if (process.start_ns < walk.bounds.start_ns) walk.bounds.start_ns = process.start_ns;
+    const proc_end = packingEnd(process);
     if (proc_end > walk.bounds.end_ns) walk.bounds.end_ns = proc_end;
-    const rel = visualDepth(app, index) -| walk.base_depth;
-    if (rel + 1 > walk.bounds.height) walk.bounds.height = rel + 1;
+
+    var subrow = walk.min_subrow;
+    while (subrow < app.row_heads_scratch.items.len) : (subrow += 1) {
+        if (!overlapsPackedRow(app, processes, index, app.row_heads_scratch.items[subrow])) break;
+    }
+    if (subrow == app.row_heads_scratch.items.len) {
+        app.row_heads_scratch.appendAssumeCapacity(null);
+    }
+    app.pack_subrow.items[index] = @intCast(subrow);
+    app.slot_next.items[index] = app.row_heads_scratch.items[subrow];
+    app.row_heads_scratch.items[subrow] = index;
+    walk.bounds.height = @max(walk.bounds.height, @as(u16, @intCast(subrow + 1)));
+
     if (isCollapsed(app, index)) return;
     var child = if (index < app.first_child.items.len) app.first_child.items[index] else null;
     while (child) |child_index| {
-        markJobTree(app, session, child_index, walk);
+        markJobTree(app, session, child_index, .{
+            .min_subrow = subrow + 1,
+            .bounds = walk.bounds,
+        });
         child = app.next_sibling.items[child_index];
     }
 }
@@ -448,10 +481,11 @@ fn setSubtreeSlot(app: *App, index: usize, lane: u16) void {
     }
 }
 
-fn linkPackedSubtree(app: *App, index: usize, base_depth: u16, row_base: usize) void {
+fn linkPackedSubtree(app: *App, index: usize, row_base: usize) void {
     const lane = app.pack_slot.items[index];
-    const subrow = visualDepth(app, index) -| base_depth;
+    const subrow = app.pack_subrow.items[index];
     const row_index = row_base + app.lane_offsets_scratch.items[lane] + subrow;
+    app.slot_next.items[index] = null;
     switch (app.row_order.items[row_index]) {
         .slot => {},
         .process => unreachable,
@@ -466,7 +500,7 @@ fn linkPackedSubtree(app: *App, index: usize, base_depth: u16, row_base: usize) 
     if (isCollapsed(app, index)) return;
     var child = app.first_child.items[index];
     while (child) |child_index| {
-        linkPackedSubtree(app, child_index, base_depth, row_base);
+        linkPackedSubtree(app, child_index, row_base);
         child = app.next_sibling.items[child_index];
     }
 }
@@ -540,6 +574,71 @@ pub fn laneHeight(app: *const App, parent: usize, lane: u16) u16 {
     return @max(@as(u16, 1), app.lane_heights.items[idx]);
 }
 
-fn visualDepth(app: *const App, index: usize) u16 {
-    return if (index < app.visual_depth.items.len) app.visual_depth.items[index] else 0;
+test "overlapping packed descendants move down until the row is clear" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var session = tracer.Session.init(gpa, testing.io);
+    defer session.deinit();
+    try session.processes.append(gpa, .{ .pid = 1, .end_ns = 200 });
+    try session.processes.append(gpa, .{
+        .pid = 2,
+        .parent_pid = 1,
+        .parent_index = 0,
+        .depth = 1,
+        .end_ns = 150,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 3,
+        .parent_pid = 1,
+        .parent_index = 0,
+        .depth = 1,
+        .end_ns = 150,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 4,
+        .parent_pid = 2,
+        .parent_index = 1,
+        .depth = 2,
+        .start_ns = 10,
+        .end_ns = 100,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 5,
+        .parent_pid = 2,
+        .parent_index = 1,
+        .depth = 2,
+        .start_ns = 20,
+        .end_ns = 110,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 6,
+        .parent_pid = 2,
+        .parent_index = 1,
+        .depth = 2,
+        .start_ns = 30,
+        .end_ns = 120,
+    });
+
+    var app = try App.init(gpa);
+    defer app.deinit();
+    try ensureProcessTree(&app, &session);
+
+    const first_row = packedRowForProcess(&app, 3).?;
+    const second_row = packedRowForProcess(&app, 4).?;
+    const third_row = packedRowForProcess(&app, 5).?;
+    try testing.expectEqual(first_row + 1, second_row);
+    try testing.expectEqual(second_row + 1, third_row);
+}
+
+fn packedRowForProcess(app: *const App, target: usize) ?usize {
+    for (app.row_order.items, 0..) |row, row_index| switch (row) {
+        .process => {},
+        .slot => |slot| {
+            for (slotMembers(app, slot)) |index| {
+                if (index == target) return row_index;
+            }
+        },
+    };
+    return null;
 }
