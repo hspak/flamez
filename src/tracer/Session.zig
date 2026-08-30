@@ -1,19 +1,19 @@
-//! Capture orchestration: spawns the target in its own process group,
-//! ingests eBPF lifecycle events, cumulative self-CPU snapshots, and immediate
-//! /proc metadata, and owns the process timeline until the target exits.
+//! Capture orchestration: spawns the target in its own process group, ingests
+//! backend-neutral lifecycle events and cumulative self-CPU snapshots, and
+//! owns the process timeline until the target exits.
 //! Ownership: `Session` owns every `Process` record and the pid index;
 //! `start(collector, argv)` borrows `argv` only for the call.
 
 const std = @import("std");
 const builtin = @import("builtin");
-
 const Allocator = std.mem.Allocator;
-const log = std.log.scoped(.tracer);
-
 const signals = @import("signals.zig");
 const Process = @import("Process.zig");
-const ebpf = @import("ebpf.zig");
+const capture = @import("capture.zig");
+const process_ops = @import("process_ops.zig");
 const perf = @import("../perf.zig");
+
+const log = std.log.scoped(.tracer);
 
 const Session = @This();
 
@@ -61,15 +61,8 @@ pub const StartError =
     Allocator.Error ||
     error{
         MissingTarget,
-        PidTrackingRejected,
+        LaunchTrackingRejected,
     };
-
-const WaitNowait = union(enum) {
-    still_running,
-    interrupted,
-    no_child,
-    reaped: u32,
-};
 
 const ProcessSpec = struct {
     pid: std.posix.pid_t,
@@ -105,7 +98,7 @@ pub fn deinit(self: *Session) void {
 /// `self` is stopped first.
 pub fn start(
     self: *Session,
-    collector: *ebpf.Collector,
+    collector: *capture.Collector,
     argv: []const []const u8,
 ) StartError!void {
     if (argv.len == 0 or argv[0].len == 0) return error.MissingTarget;
@@ -129,9 +122,9 @@ pub fn start(
     try self.by_pid.ensureUnusedCapacity(self.gpa, 1);
 
     self.started_at = std.Io.Clock.awake.now(self.io);
-    const launcher_pid: std.posix.pid_t = @intCast(std.os.linux.getpid());
-    try collector.seedParent(launcher_pid);
-    defer collector.untrackPid(launcher_pid);
+    const launcher_pid = process_ops.currentPid();
+    try collector.armLaunch(launcher_pid);
+    defer collector.untrack(launcher_pid);
 
     var child = try std.process.spawn(self.io, .{
         .argv = argv,
@@ -143,7 +136,7 @@ pub fn start(
     errdefer child.kill(self.io);
 
     const pid = child.id.?;
-    errdefer collector.untrackPid(pid);
+    errdefer collector.untrack(pid);
     // Arm the signal-handler escape hatch immediately: if flamez is killed
     // from here on (Ctrl+C, closed terminal, ...), the handler tears down
     // the target group instead of orphaning it.
@@ -160,7 +153,7 @@ pub fn start(
     });
     try self.processes.items[root_index].setArgsFromArgv(&self.metadata, self.gpa, argv);
     try self.refreshCwd(root_index);
-    try collector.trackPid(pid);
+    try collector.trackRoot(pid);
     self.child = child;
     self.root_pid = pid;
     self.running = true;
@@ -195,17 +188,17 @@ pub fn stop(self: *Session) void {
     self.compactMetadata() catch {};
 }
 
-/// Drains eBPF events into the process tree, advances the clock, and
+/// Drains capture events into the process tree, advances the clock, and
 /// non-blockingly checks for target exit. Capture ends with the target;
 /// descendants still running at that point are closed at the same timestamp.
 /// Cumulative CPU maps are snapshotted on `cpu_sample_period_ns`, not the
 /// render frame rate.
-pub fn update(self: *Session, collector: *ebpf.Collector) void {
+pub fn update(self: *Session, collector: *capture.Collector) void {
     if (!self.running) return;
 
     self.elapsed_ns = self.nowElapsedNs();
     perf.enter(.ring_poll);
-    collector.pollEvents(self);
+    collector.pollEvents(self.captureSink());
     self.lost_events = collector.lost_events;
     if (self.lost_events > 0) self.incomplete = true;
     self.elapsed_ns = self.nowElapsedNs();
@@ -213,11 +206,34 @@ pub fn update(self: *Session, collector: *ebpf.Collector) void {
         self.elapsed_ns -| self.last_cpu_sample_ns >= cpu_sample_period_ns;
     if (due) {
         perf.enter(.cpu_snapshot);
-        collector.snapshotCpu(self);
+        collector.snapshotCpu(self.captureSink());
         self.last_cpu_sample_ns = self.elapsed_ns;
     }
     perf.leave();
     self.pollSession();
+}
+
+fn captureSink(self: *Session) capture.Sink {
+    return .{
+        .ptr = self,
+        .event_fn = consumeCaptureEvent,
+        .cpu_sample_fn = consumeCaptureCpuSample,
+    };
+}
+
+fn consumeCaptureEvent(ptr: *anyopaque, event: capture.Event) void {
+    const self: *Session = @ptrCast(@alignCast(ptr));
+    self.consumeEvent(event);
+}
+
+fn consumeCaptureCpuSample(
+    ptr: *anyopaque,
+    pid: std.posix.pid_t,
+    total_ns: u64,
+    timestamp_ns: u64,
+) void {
+    const self: *Session = @ptrCast(@alignCast(ptr));
+    self.consumeCpuSnapshot(pid, total_ns, timestamp_ns);
 }
 
 fn clearProcesses(self: *Session) void {
@@ -279,21 +295,6 @@ fn addProcess(self: *Session, spec: ProcessSpec) !usize {
     return index;
 }
 
-fn waitNowait(pid: std.posix.pid_t) WaitNowait {
-    var status: u32 = 0;
-    const rc = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
-    switch (std.os.linux.errno(rc)) {
-        .SUCCESS => {
-            if (rc == 0) return .still_running;
-            return .{ .reaped = status };
-        },
-        .INTR => return .interrupted,
-        .CHILD => return .no_child,
-        .INVAL => unreachable,
-        else => unreachable,
-    }
-}
-
 fn finishProcess(self: *Session, index: usize, at_ns: u64, kind: Process.EndKind) void {
     const process = &self.processes.items[index];
     if (!process.finish(at_ns, kind)) return;
@@ -306,77 +307,10 @@ fn finishProcess(self: *Session, index: usize, at_ns: u64, kind: Process.EndKind
     self.interval_revision +%= 1;
 }
 
-fn readSmallFileZ(path: [*:0]const u8, buffer: []u8) ?[]u8 {
-    const rc = std.os.linux.open(path, .{ .CLOEXEC = true }, 0);
-    const fd: i32 = switch (std.os.linux.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        else => return null,
-    };
-    defer _ = std.os.linux.close(fd);
-    const n = std.os.linux.read(fd, buffer.ptr, buffer.len);
-    if (std.os.linux.errno(n) != .SUCCESS) return null;
-    return buffer[0..n];
-}
-
-fn readComm(pid: std.posix.pid_t, buffer: *[max_name_len]u8) ?[]const u8 {
-    var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/comm", .{pid}) catch unreachable;
-    const contents = readSmallFileZ(path, buffer[0..]) orelse return null;
-    const trimmed = std.mem.trim(u8, contents, " \t\r\n");
-    return if (trimmed.len == 0) null else trimmed;
-}
-
-fn readCmdline(
-    gpa: Allocator,
-    pid: std.posix.pid_t,
-) Allocator.Error!?std.ArrayList(u8) {
-    var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cmdline", .{pid}) catch unreachable;
-    const rc = std.os.linux.open(path, .{ .CLOEXEC = true }, 0);
-    const fd: i32 = switch (std.os.linux.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        else => return null,
-    };
-    defer _ = std.os.linux.close(fd);
-
-    var contents: std.ArrayList(u8) = .empty;
-    errdefer contents.deinit(gpa);
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const n = std.os.linux.read(fd, &chunk, chunk.len);
-        switch (std.os.linux.errno(n)) {
-            .SUCCESS => {
-                if (n == 0) break;
-                try contents.appendSlice(gpa, chunk[0..n]);
-            },
-            .INTR => continue,
-            else => {
-                contents.deinit(gpa);
-                return null;
-            },
-        }
-    }
-    if (contents.items.len == 0) {
-        contents.deinit(gpa);
-        return null;
-    }
-    return contents;
-}
-
-fn readLink(pid: std.posix.pid_t, field: []const u8, buffer: *[max_path_len]u8) ?[]const u8 {
-    var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/{s}", .{ pid, field }) catch unreachable;
-    const n = std.os.linux.readlink(path, buffer.ptr, buffer.len);
-    return switch (std.os.linux.errno(n)) {
-        .SUCCESS => buffer[0..@min(n, buffer.len)],
-        else => null,
-    };
-}
-
 fn refreshCwd(self: *Session, index: usize) Allocator.Error!void {
     const pid = self.processes.items[index].pid;
     var buf: [max_path_len]u8 = undefined;
-    if (readLink(pid, "cwd", &buf)) |cwd| {
+    if (process_ops.readCwd(pid, &buf)) |cwd| {
         try self.processes.items[index].setCwd(&self.metadata, self.gpa, cwd);
     }
 }
@@ -384,7 +318,7 @@ fn refreshCwd(self: *Session, index: usize) Allocator.Error!void {
 fn captureMissingMetadata(self: *Session, index: usize) Allocator.Error!void {
     const pid = self.processes.items[index].pid;
     if (self.processes.items[index].args_len == 0) {
-        if (try readCmdline(self.gpa, pid)) |cmdline| {
+        if (try process_ops.readArgs(self.gpa, pid)) |cmdline| {
             var owned = cmdline;
             defer owned.deinit(self.gpa);
             try self.processes.items[index].setArgsFromCmdline(
@@ -396,12 +330,12 @@ fn captureMissingMetadata(self: *Session, index: usize) Allocator.Error!void {
     }
     var path_buf: [max_path_len]u8 = undefined;
     if (self.processes.items[index].exe_len == 0) {
-        if (readLink(pid, "exe", &path_buf)) |exe| {
+        if (process_ops.readExecutable(pid, &path_buf)) |exe| {
             try self.processes.items[index].setExe(&self.metadata, self.gpa, exe);
         }
     }
     if (self.processes.items[index].cwd_len == 0) {
-        if (readLink(pid, "cwd", &path_buf)) |cwd| {
+        if (process_ops.readCwd(pid, &path_buf)) |cwd| {
             try self.processes.items[index].setCwd(&self.metadata, self.gpa, cwd);
         }
     }
@@ -409,23 +343,23 @@ fn captureMissingMetadata(self: *Session, index: usize) Allocator.Error!void {
 
 fn rootLabel(pid: std.posix.pid_t, argv0: []const u8, comm_buf: *[max_name_len]u8) Named {
     const argv_name = std.fs.path.basename(argv0);
-    if (readComm(pid, comm_buf)) |comm| {
+    if (process_ops.readName(pid, comm_buf)) |comm| {
         if (std.mem.eql(u8, argv_name, comm)) return .fromComm(comm);
     }
     return .fromOther(argv_name);
 }
 
 fn recordRootStatus(self: *Session, status: u32) void {
-    if (std.os.linux.W.IFEXITED(status)) {
-        self.exit_code = std.os.linux.W.EXITSTATUS(status);
-    } else if (std.os.linux.W.IFSIGNALED(status)) {
-        self.exit_signal = @intCast(@intFromEnum(std.os.linux.W.TERMSIG(status)));
+    if (process_ops.exitCode(status)) |code| {
+        self.exit_code = code;
+    } else if (process_ops.exitSignal(status)) |signal| {
+        self.exit_signal = signal;
         // The UI shows STOPPED · SIGNAL n; the log keeps the detail.
         // Suppressed in test binaries: their stderr garbles `zig build`
         // IPC progress output even when every test passes.
         if (comptime !builtin.is_test) {
             log.warn("target root terminated by signal {d}", .{
-                @intFromEnum(std.os.linux.W.TERMSIG(status)),
+                signal,
             });
         }
     }
@@ -446,7 +380,7 @@ fn onRootExited(self: *Session, status: ?u32) void {
 fn pollSession(self: *Session) void {
     const child = if (self.child) |*child| child else return;
     const pid = child.id orelse return;
-    switch (waitNowait(pid)) {
+    switch (process_ops.waitNowait(pid)) {
         .still_running, .interrupted => {},
         .reaped => |status| {
             self.onRootExited(status);
@@ -666,90 +600,85 @@ fn recoverFromExit(
 fn applyExec(
     self: *Session,
     index: usize,
-    event: *const ebpf.Event,
-    record_size: usize,
-    name: []const u8,
+    event: capture.Event.Exec,
 ) void {
-    if (name.len > 0) self.processes.items[index].setName(name, .process);
+    if (event.name.len > 0) self.processes.items[index].setName(event.name, .process);
     self.processes.items[index].clearExecMetadata();
     self.label_revision +%= 1;
-    if (ebpf.execMetadata(event, record_size)) |metadata| {
-        if (metadata.exe) |exe| {
-            self.processes.items[index].setExeFromKernel(
-                &self.metadata,
-                self.gpa,
-                exe,
-                metadata.exe_truncated,
-            ) catch |err| {
-                @branchHint(.cold);
-                log.warn("could not store executable metadata: {s}", .{@errorName(err)});
-            };
-        }
-        if (metadata.args) |args| {
-            self.processes.items[index].setArgsFromKernel(
-                &self.metadata,
-                self.gpa,
-                args,
-            ) catch |err| {
-                @branchHint(.cold);
-                log.warn("could not store argv metadata: {s}", .{@errorName(err)});
-            };
-        }
+    if (event.exe) |exe| {
+        self.processes.items[index].setExeFromKernel(
+            &self.metadata,
+            self.gpa,
+            exe,
+            event.exe_truncated,
+        ) catch |err| {
+            @branchHint(.cold);
+            log.warn("could not store executable metadata: {s}", .{@errorName(err)});
+        };
     }
-    // A child may chdir between fork and exec. Refresh when procfs is
-    // still available, retaining the fork-time snapshot if it is not.
+    if (event.args) |args| {
+        self.processes.items[index].setArgsFromKernel(
+            &self.metadata,
+            self.gpa,
+            args,
+        ) catch |err| {
+            @branchHint(.cold);
+            log.warn("could not store argv metadata: {s}", .{@errorName(err)});
+        };
+    }
+    // A child may chdir between fork and exec. Refresh when platform metadata
+    // is available, retaining the fork-time snapshot if it is not.
     self.refreshCwd(index) catch {};
     self.captureMissingMetadata(index) catch |err| {
         @branchHint(.cold);
-        log.warn("could not store procfs metadata: {s}", .{@errorName(err)});
+        log.warn("could not store process metadata: {s}", .{@errorName(err)});
     };
 }
 
-/// Folds one kernel event into the process tree. The event is borrowed only
+/// Folds one capture event into the process tree. The event is borrowed only
 /// for this call. A live tgid is updated in place; a finished tgid that
 /// reappears becomes a new record. A fork whose parent is missing, an exec
 /// whose pid is missing, or an exit whose pid was never seen, is recovered
-/// under the session root so a lost ring-buffer record cannot hide that
+/// under the session root so a lost backend record cannot hide that
 /// subtree.
-pub fn consumeEbpfEvent(self: *Session, event: *const ebpf.Event, record_size: usize) void {
+pub fn consumeEvent(self: *Session, event: capture.Event) void {
     if (!self.running) return;
     const event_ns = self.eventElapsedNs(event.timestamp_ns);
-    const name = std.mem.sliceTo(&event.comm, 0);
 
-    switch (event.kind) {
-        .fork => {
-            const parent_index = self.ensureParent(event.parent_pid, event_ns) orelse return;
+    switch (event.payload) {
+        .fork => |fork| {
+            const parent_index = self.ensureParent(fork.parent_pid, event_ns) orelse return;
             _ = self.addProcess(.{
-                .pid = event.pid,
-                .parent_pid = event.parent_pid,
-                .named = .fromComm(name),
+                .pid = fork.pid,
+                .parent_pid = fork.parent_pid,
+                .named = .fromComm(fork.name),
                 .depth = self.processes.items[parent_index].depth + 1,
                 .start_ns = event_ns,
             }) catch |err| {
                 @branchHint(.cold);
                 log.warn(
                     "dropped process record for pid {d}: {s}",
-                    .{ event.pid, @errorName(err) },
+                    .{ fork.pid, @errorName(err) },
                 );
                 return;
             };
         },
-        .exec => {
-            const index = self.liveIndex(event.pid) orelse
-                self.recoverFromExec(event.pid, name, event_ns) orelse return;
-            self.applyExec(index, event, record_size, name);
+        .exec => |exec| {
+            const index = self.liveIndex(exec.pid) orelse
+                self.recoverFromExec(exec.pid, exec.name, event_ns) orelse return;
+            self.applyExec(index, exec);
         },
-        .exit => {
-            const index = self.liveIndex(event.pid) orelse
-                self.recoverFromExit(event.pid, name, event_ns) orelse return;
+        .exit => |exit| {
+            const index = self.liveIndex(exit.pid) orelse
+                self.recoverFromExit(exit.pid, exit.name, event_ns) orelse return;
             self.processes.items[index].recordFinalCpuSnapshot(
                 self.gpa,
                 event_ns,
-                event.cpu_ns,
+                exit.cpu_ns,
             ) catch |err| {
                 @branchHint(.cold);
                 log.warn("could not store final CPU slice for pid {d}: {s}", .{
-                    event.pid,
+                    exit.pid,
                     @errorName(err),
                 });
             };
@@ -758,19 +687,9 @@ pub fn consumeEbpfEvent(self: *Session, event: *const ebpf.Event, record_size: u
     }
 }
 
-/// Records one cumulative process self-CPU snapshot from the kernel map.
+/// Records one cumulative process self-CPU snapshot from the capture backend.
 /// Unknown and already-finished TGIDs are ignored; a later lifecycle event can
 /// still recover them without attributing CPU to the wrong PID generation.
-pub fn consumeCpuSnapshots(
-    self: *Session,
-    samples: []const ebpf.CpuTotal,
-    timestamp_ns: u64,
-) void {
-    for (samples) |sample| {
-        self.consumeCpuSnapshot(@intCast(sample.tgid), sample.total_ns, timestamp_ns);
-    }
-}
-
 pub fn consumeCpuSnapshot(
     self: *Session,
     pid: std.posix.pid_t,
@@ -789,9 +708,59 @@ pub fn consumeCpuSnapshot(
     };
 }
 
+fn forkEvent(
+    pid: std.posix.pid_t,
+    parent_pid: std.posix.pid_t,
+    timestamp_ns: u64,
+    name: []const u8,
+) capture.Event {
+    return .{
+        .timestamp_ns = timestamp_ns,
+        .payload = .{ .fork = .{
+            .pid = pid,
+            .parent_pid = parent_pid,
+            .name = name,
+        } },
+    };
+}
+
+fn execEvent(
+    pid: std.posix.pid_t,
+    timestamp_ns: u64,
+    name: []const u8,
+    exe: ?[]const u8,
+    args: ?[]const u8,
+) capture.Event {
+    return .{
+        .timestamp_ns = timestamp_ns,
+        .payload = .{ .exec = .{
+            .pid = pid,
+            .name = name,
+            .exe = exe,
+            .args = args,
+        } },
+    };
+}
+
+fn exitEvent(
+    pid: std.posix.pid_t,
+    timestamp_ns: u64,
+    name: []const u8,
+    cpu_ns: u64,
+) capture.Event {
+    return .{
+        .timestamp_ns = timestamp_ns,
+        .payload = .{ .exit = .{
+            .pid = pid,
+            .name = name,
+            .cpu_ns = cpu_ns,
+        } },
+    };
+}
+
 test "terminateTargetGroup tears down the whole spawned group" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var collector = ebpf.Collector{}; // unprivileged default: no kernel load in tests
+    var collector = capture.Collector{}; // Default collector does not load the kernel backend.
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sh", "-c", "sleep 30 & sleep 30 & wait" });
@@ -813,7 +782,7 @@ test "terminateTargetGroup tears down the whole spawned group" {
 
 test "stop reaps a job-control-stopped target" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{
@@ -835,7 +804,7 @@ test "stop reaps a job-control-stopped target" {
 
 test "session stops when the root exits while a descendant is still running" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sh", "-c", "sleep 2 & exec true" });
@@ -854,7 +823,7 @@ test "session stops when the root exits while a descendant is still running" {
 
 test "session ends cleanly across a build-like churn of children" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{
@@ -879,9 +848,8 @@ test "session ends cleanly across a build-like churn of children" {
     try std.testing.expectEqual(@as(std.posix.pid_t, 0), signals.armedTargetPgid());
 }
 
-test "ebpf events drive the process tree" {
-    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+test "capture events drive the process tree" {
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sleep", "30" });
@@ -900,19 +868,13 @@ test "ebpf events drive the process tree" {
     );
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
-    var fork_event = ebpf.Event{
-        .kind = .fork,
-        .pid = 4242,
-        .parent_pid = root_pid,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 10 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-    };
-    @memcpy(fork_event.comm[0.."cc1plus".len], "cc1plus");
-    session.consumeEbpfEvent(&fork_event, @sizeOf(ebpf.Event));
+    const fork_event = forkEvent(
+        4242,
+        root_pid,
+        base_ns + 10 * std.time.ns_per_ms,
+        "cc1plus",
+    );
+    session.consumeEvent(fork_event);
 
     try std.testing.expectEqual(@as(usize, 2), session.processes.items.len);
     const child_index = session.by_pid.get(4242).?;
@@ -929,33 +891,19 @@ test "ebpf events drive the process tree" {
         child.copyCmdline(session.metadataBytes(), &arg_buf),
     );
 
-    session.consumeEbpfEvent(&fork_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(fork_event);
     try std.testing.expectEqual(@as(usize, 2), session.processes.items.len);
     try std.testing.expectEqual(child_index, session.by_pid.get(4242).?);
 
     const exec_args = "clang\x00-c\x00source.c\x00";
     const exec_exe = "/usr/bin/clang";
-    var exec_storage: [@sizeOf(ebpf.ExecEvent) + exec_args.len]u8 align(@alignOf(ebpf.ExecEvent)) =
-        [_]u8{0} ** (@sizeOf(ebpf.ExecEvent) + exec_args.len);
-    const exec_event: *ebpf.ExecEvent = @ptrCast(&exec_storage);
-    exec_event.* = .{
-        .base = .{
-            .kind = .exec,
-            .pid = 4242,
-            .parent_pid = 0,
-            .metadata_flags = ebpf.metadata_args | ebpf.metadata_exe,
-            .timestamp_ns = base_ns + 12 * std.time.ns_per_ms,
-            .comm = [_]u8{0} ** 16,
-            .args_len = exec_args.len,
-            .exe_len = exec_exe.len,
-            .reserved = 0,
-        },
-        .exe = [_]u8{0} ** ebpf.max_exec_path_len,
-    };
-    @memcpy(exec_event.base.comm[0.."clang".len], "clang");
-    @memcpy(exec_event.exe[0..exec_exe.len], exec_exe);
-    @memcpy(exec_storage[@sizeOf(ebpf.ExecEvent)..], exec_args);
-    session.consumeEbpfEvent(&exec_event.base, exec_storage.len);
+    session.consumeEvent(execEvent(
+        4242,
+        base_ns + 12 * std.time.ns_per_ms,
+        "clang",
+        exec_exe,
+        exec_args,
+    ));
     try std.testing.expectEqualStrings("clang", session.processes.items[child_index].nameSlice());
     try std.testing.expectEqual(NameKind.process, session.processes.items[child_index].name_kind);
     try std.testing.expectEqualStrings(
@@ -982,19 +930,12 @@ test "ebpf events drive the process tree" {
         base_ns + 14 * std.time.ns_per_ms,
     );
 
-    var exit_event = ebpf.Event{
-        .kind = .exit,
-        .pid = 4242,
-        .parent_pid = 4242,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 15 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-        .cpu_ns = 6 * std.time.ns_per_ms,
-    };
-    session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(exitEvent(
+        4242,
+        base_ns + 15 * std.time.ns_per_ms,
+        "clang",
+        6 * std.time.ns_per_ms,
+    ));
     try std.testing.expectEqual(
         @as(u64, 5 * std.time.ns_per_ms),
         session.processes.items[child_index].durationNs(session.elapsed_ns),
@@ -1007,44 +948,31 @@ test "ebpf events drive the process tree" {
 }
 
 test "fork after exit reuses a tgid as a new record" {
-    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sleep", "30" });
     const root_pid = session.root_pid.?;
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
-    var fork_event = ebpf.Event{
-        .kind = .fork,
-        .pid = 4242,
-        .parent_pid = root_pid,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 10 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-    };
-    @memcpy(fork_event.comm[0.."cc1plus".len], "cc1plus");
-    session.consumeEbpfEvent(&fork_event, @sizeOf(ebpf.Event));
+    var fork_event = forkEvent(
+        4242,
+        root_pid,
+        base_ns + 10 * std.time.ns_per_ms,
+        "cc1plus",
+    );
+    session.consumeEvent(fork_event);
     const first_index = session.by_pid.get(4242).?;
 
-    var exit_event = ebpf.Event{
-        .kind = .exit,
-        .pid = 4242,
-        .parent_pid = 4242,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 15 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-    };
-    session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(exitEvent(
+        4242,
+        base_ns + 15 * std.time.ns_per_ms,
+        "cc1plus",
+        0,
+    ));
 
     fork_event.timestamp_ns = base_ns + 20 * std.time.ns_per_ms;
-    session.consumeEbpfEvent(&fork_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(fork_event);
     const reused_index = session.by_pid.get(4242).?;
     try std.testing.expectEqual(@as(usize, 3), session.processes.items.len);
     try std.testing.expect(reused_index != first_index);
@@ -1058,26 +986,19 @@ test "fork after exit reuses a tgid as a new record" {
 }
 
 test "exit closes a live tgid immediately" {
-    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sleep", "30" });
     const root_pid = session.root_pid.?;
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
-    const exit_event = ebpf.Event{
-        .kind = .exit,
-        .pid = root_pid,
-        .parent_pid = 0,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 5 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-    };
-    session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(exitEvent(
+        root_pid,
+        base_ns + 5 * std.time.ns_per_ms,
+        "sleep",
+        0,
+    ));
 
     try std.testing.expectEqual(
         @as(u64, 5 * std.time.ns_per_ms),
@@ -1086,27 +1007,19 @@ test "exit closes a live tgid immediately" {
 }
 
 test "fork with unknown parent recovers a stub under the root" {
-    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sleep", "30" });
     const root_pid = session.root_pid.?;
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
-    var stray_fork = ebpf.Event{
-        .kind = .fork,
-        .pid = 9999,
-        .parent_pid = 7777,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 4 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-    };
-    @memcpy(stray_fork.comm[0.."cc1".len], "cc1");
-    session.consumeEbpfEvent(&stray_fork, @sizeOf(ebpf.Event));
+    session.consumeEvent(forkEvent(
+        9999,
+        7777,
+        base_ns + 4 * std.time.ns_per_ms,
+        "cc1",
+    ));
 
     try std.testing.expectEqual(@as(usize, 3), session.processes.items.len);
     const stub_index = session.by_pid.get(7777).?;
@@ -1124,8 +1037,7 @@ test "fork with unknown parent recovers a stub under the root" {
 }
 
 test "exec without a fork recovers the process under the root" {
-    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sleep", "30" });
@@ -1134,27 +1046,13 @@ test "exec without a fork recovers the process under the root" {
 
     const exec_args = "clang\x00-c\x00source.c\x00";
     const exec_exe = "/usr/bin/clang";
-    var exec_storage: [@sizeOf(ebpf.ExecEvent) + exec_args.len]u8 align(@alignOf(ebpf.ExecEvent)) =
-        [_]u8{0} ** (@sizeOf(ebpf.ExecEvent) + exec_args.len);
-    const exec_event: *ebpf.ExecEvent = @ptrCast(&exec_storage);
-    exec_event.* = .{
-        .base = .{
-            .kind = .exec,
-            .pid = 5555,
-            .parent_pid = 0,
-            .metadata_flags = ebpf.metadata_args | ebpf.metadata_exe,
-            .timestamp_ns = base_ns + 8 * std.time.ns_per_ms,
-            .comm = [_]u8{0} ** 16,
-            .args_len = exec_args.len,
-            .exe_len = exec_exe.len,
-            .reserved = 0,
-        },
-        .exe = [_]u8{0} ** ebpf.max_exec_path_len,
-    };
-    @memcpy(exec_event.base.comm[0.."clang".len], "clang");
-    @memcpy(exec_event.exe[0..exec_exe.len], exec_exe);
-    @memcpy(exec_storage[@sizeOf(ebpf.ExecEvent)..], exec_args);
-    session.consumeEbpfEvent(&exec_event.base, exec_storage.len);
+    session.consumeEvent(execEvent(
+        5555,
+        base_ns + 8 * std.time.ns_per_ms,
+        "clang",
+        exec_exe,
+        exec_args,
+    ));
 
     try std.testing.expectEqual(@as(usize, 2), session.processes.items.len);
     const index = session.by_pid.get(5555).?;
@@ -1171,27 +1069,16 @@ test "exec without a fork recovers the process under the root" {
 
     const long_arg_len = 8 * 1024;
     const long_args_len = "clang".len + 1 + long_arg_len + 1;
-    var long_storage: [@sizeOf(ebpf.ExecEvent) + long_args_len]u8 align(@alignOf(ebpf.ExecEvent)) =
-        [_]u8{0} ** (@sizeOf(ebpf.ExecEvent) + long_args_len);
-    const long_event: *ebpf.ExecEvent = @ptrCast(&long_storage);
-    long_event.* = .{
-        .base = .{
-            .kind = .exec,
-            .pid = 5555,
-            .parent_pid = 0,
-            .metadata_flags = ebpf.metadata_args,
-            .timestamp_ns = base_ns + 9 * std.time.ns_per_ms,
-            .comm = [_]u8{0} ** 16,
-            .args_len = long_args_len,
-            .exe_len = 0,
-            .reserved = 0,
-        },
-        .exe = [_]u8{0} ** ebpf.max_exec_path_len,
-    };
-    const long_payload = long_storage[@sizeOf(ebpf.ExecEvent)..];
-    @memcpy(long_payload[0.."clang".len], "clang");
-    @memset(long_payload["clang".len + 1 .. long_payload.len - 1], 'x');
-    session.consumeEbpfEvent(&long_event.base, long_storage.len);
+    var long_args_buffer = [_]u8{0} ** long_args_len;
+    @memcpy(long_args_buffer[0.."clang".len], "clang");
+    @memset(long_args_buffer["clang".len + 1 .. long_args_buffer.len - 1], 'x');
+    session.consumeEvent(execEvent(
+        5555,
+        base_ns + 9 * std.time.ns_per_ms,
+        "clang",
+        null,
+        &long_args_buffer,
+    ));
 
     const updated = session.processes.items[index];
     try std.testing.expectEqual(@as(usize, 2), updated.args_count);
@@ -1202,27 +1089,15 @@ test "exec without a fork recovers the process under the root" {
 }
 
 test "exit without a fork recovers a zero-duration process" {
-    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sleep", "30" });
     const root_pid = session.root_pid.?;
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
-    var exit_event = ebpf.Event{
-        .kind = .exit,
-        .pid = 8888,
-        .parent_pid = 0,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 6 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-    };
-    @memcpy(exit_event.comm[0.."sleep".len], "sleep");
-    session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
+    var exit_event = exitEvent(8888, base_ns + 6 * std.time.ns_per_ms, "sleep", 0);
+    session.consumeEvent(exit_event);
 
     try std.testing.expectEqual(@as(usize, 2), session.processes.items.len);
     try std.testing.expect(session.by_pid.get(8888) == null);
@@ -1236,13 +1111,13 @@ test "exit without a fork recovers a zero-duration process" {
     try std.testing.expectEqual(@as(u64, 6 * std.time.ns_per_ms), process.end_ns.?);
     try std.testing.expectEqual(@as(u64, 0), process.durationNs(session.elapsed_ns));
 
-    session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(exit_event);
     try std.testing.expectEqual(@as(usize, 2), session.processes.items.len);
 
     // A later exit for the same numeric pid represents reuse when every
     // earlier event from the new lifetime was lost.
     exit_event.timestamp_ns = base_ns + 9 * std.time.ns_per_ms;
-    session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(exit_event);
     try std.testing.expectEqual(@as(usize, 3), session.processes.items.len);
     try std.testing.expect(session.by_pid.get(8888) == null);
     const reused = session.processes.items[session.latestIndex(8888).?];
@@ -1251,8 +1126,8 @@ test "exit without a fork recovers a zero-duration process" {
 }
 
 test "kernel fork events reach a live collector" {
-    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
-    var collector = ebpf.Collector.init();
+    if (capture.backend != .linux_ebpf) return error.SkipZigTest;
+    var collector = capture.Collector.init();
     defer collector.deinit();
     if (!collector.available()) {
         if (std.mem.startsWith(
@@ -1260,11 +1135,6 @@ test "kernel fork events reach a live collector" {
             collector.diagnosticSlice(),
             "effective capabilities lack",
         )) return error.SkipZigTest;
-        if (std.os.linux.geteuid() == 0) {
-            // Root must attach once the build has handed us the object path.
-            std.debug.print("root but eBPF unavailable: {s}\n", .{collector.diagnosticSlice()});
-            return error.TestUnexpectedResult;
-        }
         return error.SkipZigTest;
     }
 
@@ -1282,8 +1152,7 @@ test "kernel fork events reach a live collector" {
 }
 
 test "exec does not rebuild tree topology" {
-    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sleep", "30" });
@@ -1292,59 +1161,40 @@ test "exec does not rebuild tree topology" {
     const topology = session.topology_revision;
     const interval = session.interval_revision;
 
-    var fork_event = ebpf.Event{
-        .kind = .fork,
-        .pid = 4242,
-        .parent_pid = root_pid,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 10 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-    };
-    session.consumeEbpfEvent(&fork_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(forkEvent(
+        4242,
+        root_pid,
+        base_ns + 10 * std.time.ns_per_ms,
+        "process",
+    ));
     try std.testing.expect(session.topology_revision != topology);
     const after_fork_topology = session.topology_revision;
     const after_fork_labels = session.label_revision;
 
-    var exec_event = ebpf.Event{
-        .kind = .exec,
-        .pid = 4242,
-        .parent_pid = 0,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 12 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-    };
-    @memcpy(exec_event.comm[0.."clang".len], "clang");
-    session.consumeEbpfEvent(&exec_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(execEvent(
+        4242,
+        base_ns + 12 * std.time.ns_per_ms,
+        "clang",
+        null,
+        null,
+    ));
     try std.testing.expectEqual(after_fork_topology, session.topology_revision);
     try std.testing.expect(session.label_revision != after_fork_labels);
     try std.testing.expectEqual(interval, session.interval_revision);
 
-    var exit_event = ebpf.Event{
-        .kind = .exit,
-        .pid = 4242,
-        .parent_pid = 4242,
-        .metadata_flags = 0,
-        .timestamp_ns = base_ns + 15 * std.time.ns_per_ms,
-        .comm = [_]u8{0} ** 16,
-        .args_len = 0,
-        .exe_len = 0,
-        .reserved = 0,
-    };
-    session.consumeEbpfEvent(&exit_event, @sizeOf(ebpf.Event));
+    session.consumeEvent(exitEvent(
+        4242,
+        base_ns + 15 * std.time.ns_per_ms,
+        "clang",
+        0,
+    ));
     try std.testing.expectEqual(after_fork_topology, session.topology_revision);
     try std.testing.expect(session.interval_revision != interval);
     try std.testing.expect(session.by_pid.get(4242) == null);
 }
 
 test "metadata compaction keeps reachable argv and drops superseded bytes" {
-    if (!ebpf.ebpfSupported()) return error.SkipZigTest;
-    var collector = ebpf.Collector{};
+    var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, &.{ "sleep", "30" });
@@ -1368,8 +1218,8 @@ test "metadata compaction keeps reachable argv and drops superseded bytes" {
 test "root label matches the process when argv basename equals comm" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var comm_buf: [max_name_len]u8 = undefined;
-    const self_pid: std.posix.pid_t = @intCast(std.os.linux.getpid());
-    const comm = Session.readComm(self_pid, &comm_buf) orelse return;
+    const self_pid = process_ops.currentPid();
+    const comm = process_ops.readName(self_pid, &comm_buf) orelse return;
     var argv_buf: [max_name_len]u8 = undefined;
     @memcpy(argv_buf[0..comm.len], comm);
     const named = Session.rootLabel(self_pid, argv_buf[0..comm.len], &comm_buf);

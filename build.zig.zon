@@ -40,6 +40,13 @@
             .url = "git+https://github.com/raylib-zig/raylib-zig?ref=devel#8758f4cd3a5ae0df6941c4715257223d34c5ad3e",
             .hash = "raylib_zig-6.0.0-KE8RECZ8BQDm-txuospkpZHbJ6DNpacUF7D88RWQ_qAe",
         },
+        // raylib's static-library module does not propagate framework search
+        // paths to executable roots during macOS cross-compilation.
+        .xcode_frameworks = .{
+            .url = "https://pkg.machengine.org/xcode-frameworks/8a1cfb373587ea4c9bb1468b7c986462d8d4e10e.tar.gz",
+            .hash = "N-V-__8AALShqgXkvqYU6f__FrA22SMWmi2TXCJjNTO1m8XJ",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

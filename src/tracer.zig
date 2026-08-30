@@ -1,10 +1,9 @@
-//! Process-tree capture subsystem: spawns the build target in its own process
-//! group, ingests eBPF lifecycle events and CPU snapshots plus immediate /proc
-//! metadata, and maintains process lifetimes and activity slices for the UI.
-//! The UI talks only to this file, never to the children directly.
+//! Process-tree capture subsystem: spawns the target in its own process group,
+//! ingests backend-neutral lifecycle events and CPU snapshots, and maintains
+//! process lifetimes and activity slices for the UI.
 
 const process_mod = @import("tracer/Process.zig");
-const ebpf_mod = @import("tracer/ebpf.zig");
+const capture = @import("tracer/capture.zig");
 const signals = @import("tracer/signals.zig");
 
 /// Spawn orchestration and the process timeline.
@@ -22,8 +21,10 @@ pub const max_name_len = process_mod.max_name_len;
 pub const max_path_len = process_mod.max_path_len;
 pub const cpu_sample_period_ns = Session.cpu_sample_period_ns;
 
-/// eBPF event collector; inert when unsupported — see `available()`.
-pub const EbpfCollector = ebpf_mod.Collector;
+/// Process-event collector selected for the target operating system.
+pub const Collector = capture.Collector;
+/// Compile-time capture backend selected for the target operating system.
+pub const capture_backend = capture.backend;
 
 pub const installFatalSignalHandlers = signals.installFatalSignalHandlers;
 
@@ -31,5 +32,6 @@ test {
     _ = @import("tracer/signals.zig");
     _ = @import("tracer/Process.zig");
     _ = @import("tracer/Session.zig");
-    _ = @import("tracer/ebpf.zig");
+    _ = @import("tracer/capture.zig");
+    _ = @import("tracer/process_ops.zig");
 }

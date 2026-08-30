@@ -1,10 +1,8 @@
 //! Flamez entry point and raylib/Clay renderer for live process timelines.
 
 const std = @import("std");
-const build_options = @import("build_options");
-
 const Allocator = std.mem.Allocator;
-
+const build_options = @import("build_options");
 const clay = @import("zclay");
 const rl = @import("raylib");
 const footer_font = @import("footer_font");
@@ -131,33 +129,38 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // eBPF capture is mandatory: fail fast with guidance, before any window
-    // is opened. There is no procfs lifecycle fallback.
-    var ebpf = tracer.EbpfCollector.init();
-    if (!ebpf.available()) {
+    // Live capture is mandatory: fail fast with backend diagnostics before any
+    // window is opened. Session-file import can bypass this when implemented.
+    var collector = tracer.Collector.init();
+    if (!collector.available()) {
         std.debug.print(
-            \\flamez: cannot start — eBPF process-event capture is required.
+            \\flamez: cannot start — process-event capture is required.
             \\
             \\Failed because: {s}
             \\
-            \\Fixes:
-            \\  • run ./build.sh to install flamez with
-            \\    cap_bpf,cap_perfmon
             \\
-        , .{ebpf.diagnosticSlice()});
+        , .{collector.diagnosticSlice()});
+        if (comptime tracer.capture_backend == .linux_ebpf) {
+            std.debug.print(
+                \\Fixes:
+                \\  • run ./build.sh to install flamez with
+                \\    cap_bpf,cap_perfmon
+                \\
+            , .{});
+        }
         std.process.exit(1);
     }
-    var ebpf_attached = true;
-    defer if (ebpf_attached) ebpf.deinit();
+    var collector_attached = true;
+    defer if (collector_attached) collector.deinit();
 
-    ebpf.dropCapabilities() catch {
-        std.debug.print("flamez: could not drop eBPF capabilities after attach\n", .{});
+    collector.dropPrivileges() catch {
+        std.debug.print("flamez: could not drop capture privileges after attach\n", .{});
         std.process.exit(1);
     };
     var session = tracer.Session.init(init.gpa, init.io);
     defer session.deinit();
     var start_error: ?tracer.Session.StartError = null;
-    session.start(&ebpf, target_argv.items) catch |err| {
+    session.start(&collector, target_argv.items) catch |err| {
         start_error = err;
     };
     var app = try App.init(init.gpa);
@@ -250,12 +253,12 @@ pub fn main(init: std.process.Init) !void {
         if (rl.isKeyPressed(.f5)) clay.setDebugModeEnabled(!clay.isDebugModeEnabled());
 
         if (session.running) {
-            session.update(&ebpf);
-            perf.noteSnapshot(ebpf.last_cpu_samples, ebpf.last_ring_events);
+            session.update(&collector);
+            perf.noteSnapshot(collector.last_cpu_samples, collector.last_ring_events);
         }
-        if (!session.running and ebpf_attached) {
-            ebpf.deinit();
-            ebpf_attached = false;
+        if (!session.running and collector_attached) {
+            collector.deinit();
+            collector_attached = false;
         }
         const frame_input = FrameInput{
             .font = font,

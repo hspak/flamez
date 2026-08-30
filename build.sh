@@ -11,7 +11,7 @@ if ! command -v findmnt >/dev/null 2>&1; then
     exit 1
 fi
 
-zig build -Dfps-counter=true -Dmsaa=false "$@"
+zig build --release=safe -Dfps-counter=true -Dmsaa=false "$@"
 
 # Install the loader and its compiled BPF object together. The executable
 # derives this share path from /proc/self/exe, so it works from any cwd.

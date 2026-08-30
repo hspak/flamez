@@ -46,7 +46,8 @@ The relevant files are:
 | `src/flamez.bpf.c` | kernel programs, filtering, metadata capture, CPU accounting |
 | `src/flamez_event.h` | shared C record layout and ABI assertions |
 | `src/ebpf_shim.c` | trust gate, libbpf load/attach, capabilities, map access |
-| `src/tracer/ebpf.zig` | Zig ABI mirror and collector wrapper |
+| `src/tracer/capture/linux.zig` | Zig ABI mirror and Linux collector wrapper |
+| `src/tracer/capture.zig` | backend-neutral events, sink, and collector selection |
 | `src/tracer/Session.zig` | target handoff and event-to-process state |
 | `build.zig` | warning-clean host/BPF compilation and installation graph |
 | `build.sh` | privileged install, file capabilities, and mount validation |

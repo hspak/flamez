@@ -24,10 +24,10 @@ see HEADLESS.md.
 │  │  raylib window + frame loop                   │   │  Session                                 │  │
 │  │  ├── input → Clay pointer/scroll state        │──▶│  ├── Process records + CPU slices        │  │
 │  │  ├── createLayout() → Clay render commands    │   │  ├── spawn target (own process group)    │  │
-│  │  ├── renderClay() → raylib draws              │◀──│  └── waitpid polling of root             │  │
+│  │  ├── renderClay() → raylib draws              │◀──│  └── process_ops root polling            │  │
 │  │  └── renderTimeline(): custom Gantt rows      │   │                                          │  │
 │  │       drawn over a Clay placeholder box       │   └──────────────────▲───────────────────────┘  │
-│  └───────────────────────────────────────────────┘                      │ C ABI                    │
+│  └───────────────────────────────────────────────┘                      │ normalized events        │
 │                                              ┌──────────────────────────┴─────────────────┐         │
 │                                              │ ebpf_shim.c — loader, ring + CPU snapshots │         │
 │                                              │ (hard-fails verbosely when unavailable)    │         │
@@ -65,17 +65,17 @@ Owns everything that is *not* UI:
   Canonical slices are retained for the whole capture; pixel aggregation and the
   detail graph are derived views over that source data.
 - **`Session`** — the heart of the tracker:
-  - `start(collector, argv)` temporarily marks Flamez as a BPF seed parent,
+  - `start(collector, argv)` asks the selected collector to arm the launch,
     directly spawns the target in its own process group, inserts it as the first
-    `Process`, and removes the seed. The fork hook installs the target pid in
-    `tracked_pids` before it can run, closing the launch-to-exec race without a
-    shell wrapper or procfs discovery.
-  - `update(ebpf)` runs once per live frame: advances `elapsed_ns` (monotonic
-    awake clock), drains the eBPF ring buffer into the process tree, snapshots
-    cumulative CPU accounting on `cpu_sample_period_ns` (~16 ms) rather than
-    the render rate, and non-blockingly `waitpid`s the root to detect exit
-    code/signal. Lost ring/map events mark the session incomplete.
-  - `consumeEbpfEvent` folds kernel events into records: `fork` appends a
+    `Process`, and removes the launch marker. On Linux the eBPF fork hook
+    installs the target pid in `tracked_pids` before it can run, closing the
+    launch-to-exec race without a shell wrapper or procfs discovery.
+  - `update(collector)` runs once per live frame: advances `elapsed_ns`
+    (monotonic awake clock), drains normalized capture events into the process
+    tree, snapshots cumulative CPU accounting on `cpu_sample_period_ns`
+    (~16 ms) rather than the render rate, and non-blockingly checks the root for
+    exit code/signal. Backend loss marks the session incomplete.
+  - `consumeEvent` folds backend-neutral events into records: `fork` appends a
     child below its parent and inherits its metadata, `exec` renames an
     existing record, applies the kernel's filename/argv snapshot, and tries to
     refresh CWD, while the final `group_dead` exit records final self CPU and
@@ -83,14 +83,14 @@ Owns everything that is *not* UI:
     `by_pid` is live-only; finished generations are found with `latestIndex`
     when duplicate-exit recovery needs them. A fork whose parent is missing,
     an exec whose pid is missing, or an exit whose pid was never seen, is
-    recovered under the session root rather than dropped, so a lost ring-buffer
+    recovered under the session root rather than dropped, so a lost backend
     record cannot hide that subtree. Recovered rows carry `origin` and are
     shown as inferred. An exit-only recovery is a zero-width bar at the death
     timestamp: the fork time is unknown. Root exit and forced Stop close
-    remaining open descendants with `end_kind = capture_clipped`. `/proc` only
-    enriches fields absent from the event path. Identical CWD/exe refreshes
-    reuse the stored offset; reachable metadata is compacted when capture ends.
-    Kernel timestamps are rebased against session start so all
+    remaining open descendants with `end_kind = capture_clipped`. Platform
+    inspection only enriches fields absent from the event path. Identical
+    CWD/exe refreshes reuse the stored offset; reachable metadata is compacted
+    when capture ends. Backend timestamps are rebased against session start so all
     lifetimes share the session's timeline domain. The BPF fork handler admits
     a child only when its parent is tracked and adds that child synchronously,
     so unrelated system-wide fork/exec/exit traffic never reaches the ring
@@ -102,32 +102,45 @@ Owns everything that is *not* UI:
     and its userspace timestamp have bounded sampling skew; a natural exit's
     kernel-timestamped final total reconciles any transient overestimate from
     the newest slices.
-  - Root exit is detected with `waitpid(..., WNOHANG)` and ends the session.
+  - Root exit is detected with `process_ops.waitNowait()` and ends the session.
     Any descendant records still open are closed at the target's exit time,
-    tracked-pid state is cleared, and the eBPF collector is detached. While the
+    tracked-pid state is cleared, and the collector is detached. While the
     target is live, teardown can still kill every remembered tgid, not only
     `-pgid`. Natural process exits carry one final CPU snapshot in the exit
     record. A user-forced Stop closes bars at the last sampled total because
     it tears down without waiting for another collector poll; that total is
     labeled partial (`CPU~`) rather than presented as an exact kernel final.
-- **`EbpfCollector`** — owns the loaded BPF object via the C shim. `init()`
+- **`capture.zig`** — defines the backend-neutral `Event`, callback `Sink`, and
+  compile-time `Collector` selection. `Session` depends only on this contract.
+  Linux selects `capture/linux.zig`; macOS currently selects an inert backend
+  that reports an explicit unsupported diagnostic. A future macOS
+  collector can therefore normalize native lifecycle and CPU observations
+  without changing the session or UI.
+- **Linux `Collector`** — owns the loaded BPF object via the C shim. `init()`
   attempts load + attach; on any failure it stores a human-readable reason
   (missing capabilities, missing BPF object, failed load/attach) retrievable
   through `diagnosticSlice()`, and `available()` returns false. Because there
   is no fallback backend, callers abort startup when that happens. After the
-  programs attach, `dropCapabilities()` clears the process capability sets
+  programs attach, `dropPrivileges()` clears the process capability sets
   before target spawn and GUI initialization. `pollEvents()` drains the ring
   buffer with timeout 0 so rendering is never blocked; `snapshotCpu()` is
-  scheduled independently. Collection and rendering share the main thread and
-  target the session via a file-scope `active_session` slot, keeping C ignorant
-  of Zig layouts. The C shim batch-reads the completed-CPU and running-thread
+  scheduled independently. Collection and rendering share the main thread;
+  the backend delivers normalized events through a file-scope `Sink` active
+  only during polling, keeping C ignorant of Zig layouts. The C shim batch-reads
+  the completed-CPU and running-thread
   maps, merges them through a reusable hash index, and returns the snapshot
   array once for Zig to apply.
+- **`process_ops.zig`** — compile-time-selected process operations used by
+  `Session` and signal teardown: current PID, nonblocking wait/status decoding,
+  metadata enrichment, best-effort signaling, existence checks, and the short
+  termination grace period. Linux raw syscalls and procfs live only in
+  `process_ops/linux.zig`; the macOS implementation uses libc/libproc and does
+  not leak platform calls into the shared session.
 
 Unit tests cover duration clamping, name trimming, CPU-bucket coalescing and
 parallel occupancy, CPU timing formatting, fatal-signal handler installation,
 process-group teardown, session lifecycle across child churn, and — by feeding
-synthesized events directly to `consumeEbpfEvent` without kernel privileges —
+synthesized events directly to `consumeEvent` without kernel privileges —
 the full fork/exec/exit tree-building rules including final CPU attribution,
 live-pid dedup, pid-reuse after exit, and recovery of missing parents/execs/exits.
 A live attach smoke test loads the compiled BPF object and is skipped without
@@ -289,11 +302,11 @@ Other responsibilities:
 per live frame (vsync, main thread; completed captures drop to a low idle rate):
   1. read mouse/wheel/keys            (raylib)
   2. feed Clay pointer + scroll state
-  3. session.update(&ebpf) when capturing
+  3. session.update(&collector) when capturing
        ├─ advance elapsed_ns
-       ├─ ebpf.pollEvents() → ring_buffer__poll(0) → N × consumeEbpfEvent()
+       ├─ collector.pollEvents() → N × consumeEvent()
        ├─ if cpu_sample_period_ns elapsed: one CPU snapshot array
-       └─ waitpid(root, NOHANG) → exit_code/signal or still-running
+       └─ process_ops.waitNowait(root) → exit_code/signal or still-running
   4. format counters/status into ViewText (stack)
   5. createLayout() → clay.endLayout() → render commands
   6. renderClay(commands)              (raylib)
@@ -349,8 +362,9 @@ signal — ends with the target group terminated.
 
 ## Build system
 
-- **Toolchain**: Zig 0.16 (`minimum_zig_version = "0.16.0"`), Linux v7 or newer
-  at runtime (eBPF capture is mandatory).
+- **Toolchain**: Zig 0.16 (`minimum_zig_version = "0.16.0"`). Linux v7 or newer
+  is the only live-capture runtime today; unsupported targets fail before the
+  GUI opens with the selected backend's diagnostic.
 - **Dependencies** (`build.zig.zon`): `zclay` (Clay Zig bindings) and
   `raylib-zig` built with the Wayland GLFW backend to avoid X11 fallback.
 - **eBPF build graph**: on Linux the build graph always:
@@ -359,7 +373,7 @@ signal — ends with the target group terminated.
   - compiles `src/ebpf_shim.c` into the executable and links `libbpf`
     (requires clang + libbpf headers/libs on the host);
   - exposes the platform decision to Zig as `build_options.ebpf`, which gates
-    the `comptime` branches in `EbpfCollector`, plus the default-off
+    the `comptime` branches in the Linux collector, plus the default-off
     `build_options.fps_counter` renderer cut and `build_options.perf_telemetry`
     counters.
 - **`build.sh`** is the privileged installer: copies the binary and BPF object
@@ -369,12 +383,21 @@ signal — ends with the target group terminated.
   Raw tracepoints do not read tracingfs IDs, so no DAC capability is granted.
   The dev
   artifact `zig-out/bin/flamez` intentionally stays unprivileged.
+- **macOS build graph**: Clay, raylib, the application, and both test roots
+  compile for `aarch64-macos`. The pinned framework package is a direct lazy
+  dependency because raylib's static-library framework search paths are not
+  transitive in Zig 0.16. `zig build test-compile -Dtarget=aarch64-macos`
+  validates the complete graph without trying to execute a cross-built binary.
 
 ## Extension points
 
-The event/data model (`Session`, `Process`, `EbpfEvent`) is deliberately
-independent of the UI, and the timeline already works in a wall-clock domain,
-so these layers can be added without touching capture:
+The event/data model (`Session`, `Process`, `capture.Event`) is deliberately
+independent of both the UI and the Linux raw-event ABI. The timeline already
+works in a wall-clock domain, so these layers can be added without changing
+the renderer:
+
+- a macOS collector implementing the `capture.Collector` contract and emitting
+  the same normalized lifecycle events and cumulative CPU samples;
 
 - sampled user stacks associated with CPU slices, allowing a busy interval to
   identify hot functions after symbolization;

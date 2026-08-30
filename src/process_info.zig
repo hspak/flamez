@@ -222,7 +222,7 @@ fn formatArgumentsPrefix(
     output: []u8,
 ) []const u8 {
     var prefix_buf: [64]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&prefix_buf, "Command  (args: {d}): ", .{arg_count}) catch
+    const prefix = std.fmt.bufPrint(&prefix_buf, "Command (args: {d}): ", .{arg_count}) catch
         unreachable;
     if (output.len <= prefix.len) return output[0..0];
     @memcpy(output[0..prefix.len], prefix);
@@ -441,7 +441,7 @@ test "argument prefix fills available storage without requiring the full argv" {
     var buffer: [24]u8 = undefined;
 
     const row = formatArgumentsPrefix(&process, metadata.items, 2, &buffer);
-    try testing.expect(std.mem.startsWith(u8, row, "ARGS  (2)  ·  "));
+    try testing.expect(std.mem.startsWith(u8, row, "Command (args: 2): "));
     try testing.expect(row.len == buffer.len);
 }
 
@@ -456,5 +456,5 @@ test "argument row joins argv with spaces" {
 
     const row = formatArguments(&process, metadata.items, 2, &buffer).?;
 
-    try testing.expectEqualStrings("ARGS  (2)  ·  -c source file.c", row);
+    try testing.expectEqualStrings("Command (args: 2): -c source file.c", row);
 }

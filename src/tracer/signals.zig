@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const process_ops = @import("process_ops.zig");
 
 const log = std.log.scoped(.signals);
 
@@ -79,8 +80,8 @@ fn killTracked(sig: std.posix.SIG) void {
     for (&tracked_pids) |*slot| {
         const pid = slot.load(.monotonic);
         if (pid > 1) {
-            safeKill(pid, sig);
-            safeKill(-pid, sig);
+            process_ops.safeKill(pid, sig);
+            process_ops.safeKill(-pid, sig);
         }
     }
 }
@@ -88,8 +89,8 @@ fn killTracked(sig: std.posix.SIG) void {
 /// Sends SIGTERM to the target tree (armed pgid + every tracked tgid/group).
 pub fn termTargetTree(pgid: std.posix.pid_t) void {
     if (pgid > 1) {
-        safeKill(-pgid, .TERM);
-        safeKill(pgid, .TERM);
+        process_ops.safeKill(-pgid, .TERM);
+        process_ops.safeKill(pgid, .TERM);
     }
     killTracked(.TERM);
 }
@@ -97,30 +98,16 @@ pub fn termTargetTree(pgid: std.posix.pid_t) void {
 /// Follow-up SIGKILL sweep; pair with `termTargetTree`.
 pub fn killTargetTree(pgid: std.posix.pid_t) void {
     if (pgid > 1) {
-        safeKill(-pgid, .KILL);
-        safeKill(pgid, .KILL);
+        process_ops.safeKill(-pgid, .KILL);
+        process_ops.safeKill(pgid, .KILL);
     }
     killTracked(.KILL);
-}
-
-// Best-effort kill(2). Tolerates ESRCH (target already gone) and EPERM
-// instead of tripping std.posix.kill's unreachable paths: a group that fully
-// exited between two frames is normal, not a programmer bug.
-fn safeKill(pid: std.posix.pid_t, sig: std.posix.SIG) void {
-    _ = std.os.linux.kill(pid, sig);
 }
 
 /// True if `pid` still exists (running or zombie). EPERM means it exists but
 /// we cannot signal it; ESRCH means it is gone.
 pub fn pidAlive(pid: std.posix.pid_t) bool {
-    if (pid <= 1) return false;
-    const rc = std.os.linux.kill(pid, @enumFromInt(0));
-    return switch (std.os.linux.errno(rc)) {
-        .SUCCESS, .PERM => true,
-        .SRCH => false,
-        .INVAL => unreachable,
-        else => unreachable,
-    };
+    return process_ops.pidAlive(pid);
 }
 
 /// TERM, short grace, then KILL. Async-signal-safe: used from handleFatalSignal.
@@ -128,20 +115,14 @@ pub fn pidAlive(pid: std.posix.pid_t) bool {
 /// ninja's compile/link jobs live in their own process groups.
 pub fn terminateTargetGroup(pgid: std.posix.pid_t) void {
     if (pgid > 1) {
-        safeKill(-pgid, .TERM);
-        safeKill(pgid, .TERM);
+        process_ops.safeKill(-pgid, .TERM);
+        process_ops.safeKill(pgid, .TERM);
     }
     killTracked(.TERM);
-    var req: std.os.linux.timespec = .{ .sec = 0, .nsec = 120 * std.time.ns_per_ms };
-    var rest: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
-    while (true) {
-        const rc = std.os.linux.nanosleep(&req, &rest);
-        if (rc != @intFromEnum(std.os.linux.E.INTR)) break;
-        req = rest;
-    }
+    process_ops.sleepTerminationGrace();
     if (pgid > 1) {
-        safeKill(-pgid, .KILL);
-        safeKill(pgid, .KILL);
+        process_ops.safeKill(-pgid, .KILL);
+        process_ops.safeKill(pgid, .KILL);
     }
     killTracked(.KILL);
 }
@@ -161,7 +142,7 @@ fn handleFatalSignal(sig: std.posix.SIG) callconv(.c) void {
         .flags = 0,
     };
     std.posix.sigaction(sig, &dfl, null);
-    safeKill(std.os.linux.getpid(), sig);
+    process_ops.safeKill(process_ops.currentPid(), sig);
     @panic("fatal signal did not terminate the process");
 }
 

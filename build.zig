@@ -18,12 +18,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const raylib_dep = b.dependency("raylib_zig", .{
-        .target = target,
-        .optimize = optimize,
-        // Avoid an X11 fallback so development runs use the active Wayland session.
-        .linux_display_backend = .Wayland,
-    });
+    const raylib_dep = if (target.result.os.tag == .linux)
+        b.dependency("raylib_zig", .{
+            .target = target,
+            .optimize = optimize,
+            // Avoid an X11 fallback so development runs use the active Wayland session.
+            .linux_display_backend = .Wayland,
+        })
+    else
+        b.dependency("raylib_zig", .{
+            .target = target,
+            .optimize = optimize,
+        });
     const raylib = raylib_dep.module("raylib");
     const raylib_artifact = raylib_dep.artifact("raylib");
     if (target.result.os.tag == .linux) moveRaylibLinuxLibraries(raylib_artifact, raylib);
@@ -81,6 +87,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("raylib", raylib);
     exe.root_module.addImport("footer_font", footer_font);
     exe.root_module.addOptions("build_options", build_options);
+    if (target.result.os.tag == .macos) {
+        addRaylibMacosPaths(b, main_module);
+        addRaylibMacosPaths(b, exe.root_module);
+    }
 
     var bpf_object: ?std.Build.LazyPath = null;
     if (enable_ebpf) {
@@ -151,6 +161,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tracer_tests.root_module.addOptions("build_options", tracer_options);
+    if (target.result.os.tag == .macos) tracer_tests.root_module.link_libc = true;
     if (enable_ebpf) {
         tracer_tests.root_module.addCSourceFile(.{
             .file = b.path("src/ebpf_shim.c"),
@@ -161,9 +172,23 @@ pub fn build(b: *std.Build) void {
     }
     const run_tracer_tests = b.addRunArtifact(tracer_tests);
 
+    const test_compile_step = b.step("test-compile", "Compile tests without running them");
+    test_compile_step.dependOn(&main_tests.step);
+    test_compile_step.dependOn(&tracer_tests.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_main_tests.step);
     test_step.dependOn(&run_tracer_tests.step);
+}
+
+// raylib's framework search paths live on its static-library module and are
+// not transitive in Zig 0.16. Copy them to each macOS root that links raylib.
+fn addRaylibMacosPaths(b: *std.Build, module: *std.Build.Module) void {
+    const frameworks = b.lazyDependency("xcode_frameworks", .{}) orelse return;
+    module.addSystemFrameworkPath(frameworks.path("Frameworks"));
+    module.addSystemIncludePath(frameworks.path("include"));
+    module.addLibraryPath(frameworks.path("lib"));
+    module.link_libc = true;
 }
 
 // raylib-zig attaches Linux system libraries to raylib's static-library root.

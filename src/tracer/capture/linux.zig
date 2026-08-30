@@ -1,14 +1,13 @@
-//! eBPF ingestion: loads the BPF object through the C shim and turns
-//! ring-buffer events into `Session` mutations. The collector is inert
-//! off-Linux or when built without eBPF; callers check `available()`.
+//! Linux eBPF capture backend: object loading, raw-event normalization, and
+//! cumulative CPU snapshots delivered through the shared capture contract.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const capture = @import("../capture.zig");
+const Event = capture.Event;
 
 const log = std.log.scoped(.ebpf);
-
-const Session = @import("Session.zig");
 
 const Kind = enum(u32) {
     fork = 1,
@@ -16,13 +15,13 @@ const Kind = enum(u32) {
     exit = 3,
 };
 
-pub const max_exec_path_len = 512;
+const max_exec_path_len = 512;
 
-pub const metadata_args: u32 = 1 << 0;
-pub const metadata_exe: u32 = 1 << 1;
-pub const metadata_exe_truncated: u32 = 1 << 3;
+const metadata_args: u32 = 1 << 0;
+const metadata_exe: u32 = 1 << 1;
+const metadata_exe_truncated: u32 = 1 << 3;
 
-pub const Event = extern struct {
+const RawEvent = extern struct {
     kind: Kind,
     pid: std.posix.pid_t,
     parent_pid: std.posix.pid_t,
@@ -36,23 +35,23 @@ pub const Event = extern struct {
     cpu_ns: u64 = 0,
 };
 
-pub const ExecEvent = extern struct {
-    base: Event,
+const RawExecEvent = extern struct {
+    base: RawEvent,
     exe: [max_exec_path_len]u8,
 };
 
-pub const ExecMetadata = struct {
+const ExecMetadata = struct {
     exe: ?[]const u8,
     args: ?[]const u8,
     exe_truncated: bool,
 };
 
 const Handle = opaque {};
-const EbpfCallback = *const fn (*const Event, usize, ?*anyopaque) callconv(.c) void;
+const EbpfCallback = *const fn (*const RawEvent, usize, ?*anyopaque) callconv(.c) void;
 
 /// One cumulative self-CPU sample from the C snapshot buffer. Layout matches
 /// `struct flamez_cpu_total` in `ebpf_shim.c`.
-pub const CpuTotal = extern struct {
+const RawCpuTotal = extern struct {
     tgid: u32,
     reserved: u32 = 0,
     total_ns: u64,
@@ -69,7 +68,7 @@ extern fn flamez_ebpf_poll(handle: *Handle) c_int;
 extern fn flamez_ebpf_lost_events(handle: *Handle) u64;
 extern fn flamez_ebpf_snapshot_cpu(
     handle: *Handle,
-    out_samples: *?[*]const CpuTotal,
+    out_samples: *?[*]const RawCpuTotal,
     out_count: *usize,
     out_timestamp_ns: *u64,
 ) c_int;
@@ -79,20 +78,20 @@ extern fn flamez_ebpf_untrack_pid(handle: *Handle, pid: std.posix.pid_t) void;
 extern fn flamez_ebpf_close(handle: *Handle) void;
 
 comptime {
-    std.debug.assert(@sizeOf(Event) == 56);
-    std.debug.assert(@sizeOf(ExecEvent) == 568);
-    std.debug.assert(@sizeOf(CpuTotal) == 16);
+    std.debug.assert(@sizeOf(RawEvent) == 56);
+    std.debug.assert(@sizeOf(RawExecEvent) == 568);
+    std.debug.assert(@sizeOf(RawCpuTotal) == 16);
 }
 
 /// Borrows the metadata attached to a successful exec event.
 /// Returns null for non-exec or malformed records.
-pub fn execMetadata(event: *const Event, record_size: usize) ?ExecMetadata {
-    if (event.kind != .exec or record_size < @sizeOf(ExecEvent)) return null;
-    const record: *const ExecEvent = @ptrCast(event);
+fn execMetadata(event: *const RawEvent, record_size: usize) ?ExecMetadata {
+    if (event.kind != .exec or record_size < @sizeOf(RawExecEvent)) return null;
+    const record: *const RawExecEvent = @ptrCast(event);
     const exe_len: usize = event.exe_len;
     if (exe_len > record.exe.len) return null;
     const args_len: usize = event.args_len;
-    if (args_len != record_size - @sizeOf(ExecEvent)) return null;
+    if (args_len != record_size - @sizeOf(RawExecEvent)) return null;
     const record_bytes: [*]const u8 = @ptrCast(event);
     return .{
         .exe = if (event.metadata_flags & metadata_exe != 0)
@@ -100,37 +99,41 @@ pub fn execMetadata(event: *const Event, record_size: usize) ?ExecMetadata {
         else
             null,
         .args = if (event.metadata_flags & metadata_args != 0)
-            record_bytes[@sizeOf(ExecEvent)..][0..args_len]
+            record_bytes[@sizeOf(RawExecEvent)..][0..args_len]
         else
             null,
         .exe_truncated = event.metadata_flags & metadata_exe_truncated != 0,
     };
 }
 
-/// Returns whether this build includes the Linux eBPF bridge.
-pub fn ebpfSupported() bool {
+fn supported() bool {
     return builtin.os.tag == .linux and build_options.ebpf;
 }
 
+/// Owns one attached eBPF capture and normalizes its records for `Session`.
 pub const Collector = struct {
+    /// Owned libbpf handle; `deinit` closes it when non-null.
     handle: ?*Handle = null,
+    /// Latest cumulative count of kernel-side event or accounting loss.
     lost_events: u64 = 0,
     diagnostic_buffer: [512]u8 = [_]u8{0} ** 512,
     diagnostic_len: usize = 0,
     cpu_snapshot_error: c_int = 0,
+    /// Result of the latest nonblocking ring-buffer poll.
     last_ring_events: i32 = 0,
+    /// Number of samples delivered by the latest successful CPU snapshot.
     last_cpu_samples: usize = 0,
 
     // Rendering and collection share one thread, so the callback target only
-    // needs to remain set during `poll`.
-    var active_session: ?*Session = null;
+    // needs to remain set while the ring buffer is polled.
+    var active_sink: ?capture.Sink = null;
 
     /// Loads the BPF object. On failure `available()` returns false and
     /// `diagnosticSlice()` explains why; callers are expected to abort startup.
     pub fn init() Collector {
         var self = Collector{};
-        if (comptime !ebpfSupported()) {
-            self.setDiagnostic("the eBPF collector is only built on Linux");
+        if (comptime !supported()) {
+            self.setDiagnostic("the Linux eBPF collector is not included in this build");
             return self;
         }
         if (comptime builtin.is_test) pointShimAtCompiledObject();
@@ -149,7 +152,7 @@ pub const Collector = struct {
 
     /// Detaches every program, closes the BPF object, and invalidates `self`.
     pub fn deinit(self: *Collector) void {
-        if (comptime ebpfSupported()) {
+        if (comptime supported()) {
             if (self.handle) |handle| flamez_ebpf_close(handle);
         }
         self.* = undefined;
@@ -162,10 +165,10 @@ pub const Collector = struct {
 
     /// Clears the process's effective, permitted, and inheritable capability
     /// sets after the programs attach and before the target is spawned.
-    pub fn dropCapabilities(self: *const Collector) error{CapabilityDropRejected}!void {
-        if (comptime ebpfSupported()) {
+    pub fn dropPrivileges(self: *const Collector) error{PrivilegeDropRejected}!void {
+        if (comptime supported()) {
             if (self.handle != null and flamez_ebpf_drop_capabilities() != 0)
-                return error.CapabilityDropRejected;
+                return error.PrivilegeDropRejected;
         }
     }
 
@@ -174,29 +177,29 @@ pub const Collector = struct {
         return self.diagnostic_buffer[0..self.diagnostic_len];
     }
 
-    /// Adds a process to the kernel-side target set before it can run.
-    pub fn trackPid(self: *Collector, pid: std.posix.pid_t) error{PidTrackingRejected}!void {
-        if (comptime ebpfSupported()) {
+    /// Ensures the spawned root belongs to this capture.
+    pub fn trackRoot(self: *Collector, pid: std.posix.pid_t) error{LaunchTrackingRejected}!void {
+        if (comptime supported()) {
             if (self.handle) |handle| {
                 if (flamez_ebpf_track_pid(handle, pid) != 0)
-                    return error.PidTrackingRejected;
+                    return error.LaunchTrackingRejected;
             }
         }
     }
 
     /// Arms exactly the next process spawned by `pid` as a tracked root.
-    pub fn seedParent(self: *Collector, pid: std.posix.pid_t) error{PidTrackingRejected}!void {
-        if (comptime ebpfSupported()) {
+    pub fn armLaunch(self: *Collector, pid: std.posix.pid_t) error{LaunchTrackingRejected}!void {
+        if (comptime supported()) {
             if (self.handle) |handle| {
                 if (flamez_ebpf_seed_parent(handle, pid) != 0)
-                    return error.PidTrackingRejected;
+                    return error.LaunchTrackingRejected;
             }
         }
     }
 
-    /// Removes a completed process from the kernel-side target set.
-    pub fn untrackPid(self: *Collector, pid: std.posix.pid_t) void {
-        if (comptime ebpfSupported()) {
+    /// Removes a launcher or process from backend tracking.
+    pub fn untrack(self: *Collector, pid: std.posix.pid_t) void {
+        if (comptime supported()) {
             if (self.handle) |handle| flamez_ebpf_untrack_pid(handle, pid);
         }
     }
@@ -207,11 +210,11 @@ pub const Collector = struct {
         self.diagnostic_len = amount;
     }
 
-    /// Drains pending lifecycle events without blocking and applies them to `session`.
-    pub fn pollEvents(self: *Collector, session: *Session) void {
-        if (comptime ebpfSupported()) {
-            active_session = session;
-            defer active_session = null;
+    /// Drains pending lifecycle events without blocking and delivers them to `sink`.
+    pub fn pollEvents(self: *Collector, sink: capture.Sink) void {
+        if (comptime supported()) {
+            active_sink = sink;
+            defer active_sink = null;
             if (self.handle) |handle| {
                 self.last_ring_events = flamez_ebpf_poll(handle);
                 const lost = flamez_ebpf_lost_events(handle);
@@ -226,11 +229,11 @@ pub const Collector = struct {
         }
     }
 
-    /// Reads cumulative process CPU totals once and applies them in Zig.
-    pub fn snapshotCpu(self: *Collector, session: *Session) void {
-        if (comptime !ebpfSupported()) return;
+    /// Reads cumulative process CPU totals once and delivers them to `sink`.
+    pub fn snapshotCpu(self: *Collector, sink: capture.Sink) void {
+        if (comptime !supported()) return;
         const handle = self.handle orelse return;
-        var samples_ptr: ?[*]const CpuTotal = null;
+        var samples_ptr: ?[*]const RawCpuTotal = null;
         var count: usize = 0;
         var timestamp_ns: u64 = 0;
         const snapshot_result = flamez_ebpf_snapshot_cpu(
@@ -245,18 +248,39 @@ pub const Collector = struct {
         self.cpu_snapshot_error = snapshot_result;
         self.last_cpu_samples = if (snapshot_result == 0) count else 0;
         if (snapshot_result != 0) return;
+        // The C shim owns this buffer until the next snapshot or collector teardown.
         const samples = (samples_ptr orelse return)[0..count];
-        session.consumeCpuSnapshots(samples, timestamp_ns);
+        for (samples) |sample| {
+            sink.cpuSample(@intCast(sample.tgid), sample.total_ns, timestamp_ns);
+        }
     }
 
-    /// Drains pending events without blocking and applies them to `session`.
-    pub fn poll(self: *Collector, session: *Session) void {
-        self.pollEvents(session);
-        self.snapshotCpu(session);
-    }
-
-    fn onEvent(event: *const Event, record_size: usize, _: ?*anyopaque) callconv(.c) void {
-        if (active_session) |session| session.consumeEbpfEvent(event, record_size);
+    fn onEvent(raw: *const RawEvent, record_size: usize, _: ?*anyopaque) callconv(.c) void {
+        const sink = active_sink orelse return;
+        const name = std.mem.sliceTo(&raw.comm, 0);
+        const payload: Event.Payload = switch (raw.kind) {
+            .fork => .{ .fork = .{
+                .pid = raw.pid,
+                .parent_pid = raw.parent_pid,
+                .name = name,
+            } },
+            .exec => exec: {
+                const metadata = execMetadata(raw, record_size);
+                break :exec .{ .exec = .{
+                    .pid = raw.pid,
+                    .name = name,
+                    .exe = if (metadata) |value| value.exe else null,
+                    .args = if (metadata) |value| value.args else null,
+                    .exe_truncated = if (metadata) |value| value.exe_truncated else false,
+                } };
+            },
+            .exit => .{ .exit = .{
+                .pid = raw.pid,
+                .name = name,
+                .cpu_ns = raw.cpu_ns,
+            } },
+        };
+        sink.event(.{ .timestamp_ns = raw.timestamp_ns, .payload = payload });
     }
 
     // Test binaries live in the cache, not next to share/flamez.
@@ -273,7 +297,7 @@ pub const Collector = struct {
 };
 
 test "collector attaches when privileges and object are present" {
-    if (!ebpfSupported()) return error.SkipZigTest;
+    if (!supported()) return error.SkipZigTest;
     var collector = Collector.init();
     defer collector.deinit();
     if (collector.available()) return;
@@ -293,9 +317,9 @@ test "collector attaches when privileges and object are present" {
 test "exec metadata validates size and exposes variable-length fields" {
     const args = "clang\x00-c\x00source.c\x00";
     const exe = "/usr/bin/clang";
-    var storage: [@sizeOf(ExecEvent) + args.len]u8 align(@alignOf(ExecEvent)) =
-        [_]u8{0} ** (@sizeOf(ExecEvent) + args.len);
-    const record: *ExecEvent = @ptrCast(&storage);
+    var storage: [@sizeOf(RawExecEvent) + args.len]u8 align(@alignOf(RawExecEvent)) =
+        [_]u8{0} ** (@sizeOf(RawExecEvent) + args.len);
+    const record: *RawExecEvent = @ptrCast(&storage);
     record.* = .{
         .base = .{
             .kind = .exec,
@@ -311,9 +335,9 @@ test "exec metadata validates size and exposes variable-length fields" {
         .exe = [_]u8{0} ** max_exec_path_len,
     };
     @memcpy(record.exe[0..exe.len], exe);
-    @memcpy(storage[@sizeOf(ExecEvent)..], args);
+    @memcpy(storage[@sizeOf(RawExecEvent)..], args);
 
-    try std.testing.expect(execMetadata(&record.base, @sizeOf(Event)) == null);
+    try std.testing.expect(execMetadata(&record.base, @sizeOf(RawEvent)) == null);
     try std.testing.expect(execMetadata(&record.base, storage.len - 1) == null);
     const metadata = execMetadata(&record.base, storage.len).?;
     try std.testing.expectEqualStrings(exe, metadata.exe.?);
@@ -323,9 +347,9 @@ test "exec metadata validates size and exposes variable-length fields" {
 
 test "exec metadata preserves argv beyond the former fixed limit" {
     const args_len = 8 * 1024 + 1;
-    var storage: [@sizeOf(ExecEvent) + args_len]u8 align(@alignOf(ExecEvent)) =
-        [_]u8{0} ** (@sizeOf(ExecEvent) + args_len);
-    const record: *ExecEvent = @ptrCast(&storage);
+    var storage: [@sizeOf(RawExecEvent) + args_len]u8 align(@alignOf(RawExecEvent)) =
+        [_]u8{0} ** (@sizeOf(RawExecEvent) + args_len);
+    const record: *RawExecEvent = @ptrCast(&storage);
     record.* = .{
         .base = .{
             .kind = .exec,
@@ -340,7 +364,7 @@ test "exec metadata preserves argv beyond the former fixed limit" {
         },
         .exe = [_]u8{0} ** max_exec_path_len,
     };
-    @memset(storage[@sizeOf(ExecEvent) .. storage.len - 1], 'x');
+    @memset(storage[@sizeOf(RawExecEvent) .. storage.len - 1], 'x');
 
     const metadata = execMetadata(&record.base, storage.len).?;
     try std.testing.expectEqual(@as(usize, args_len), metadata.args.?.len);

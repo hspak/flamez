@@ -62,6 +62,17 @@ Run the unit tests with:
 zig build test
 ```
 
+Compile the complete application and both test roots for macOS without running
+the cross-built tests with:
+
+```sh
+zig build test-compile -Dtarget=aarch64-macos
+```
+
+The macOS presentation and shared tracer layers compile, but live capture is
+not implemented yet; launching that build reports the unsupported collector
+before opening a window.
+
 For example:
 
 ```sh
@@ -160,8 +171,12 @@ process-image metadata.
 
 - `src/main.zig` owns interaction, the Clay layout, and the raylib timeline
   renderer.
-- `src/tracer.zig` owns sessions, process records, spawning, eBPF ingestion,
-  lifetime state, and bucketed CPU slices.
+- `src/tracer.zig` owns sessions, process records, spawning, normalized capture
+  ingestion, lifetime state, and bucketed CPU slices.
+- `src/tracer/capture.zig` selects an operating-system collector at compile
+  time and exposes the backend-neutral lifecycle event contract.
+- `src/tracer/process_ops.zig` selects process wait, metadata, and teardown
+  operations without exposing platform syscalls to `Session`.
 - `src/flamez.bpf.c` emits three scheduler lifecycle events and accounts
   process-exclusive CPU at scheduler switches without emitting per-switch
   records.

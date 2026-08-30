@@ -321,6 +321,7 @@ pub fn copyCmdline(self: *const Process, metadata: []const u8, dest: []u8) []con
 pub fn copyArguments(self: *const Process, metadata: []const u8, dest: []u8) []const u8 {
     std.debug.assert(dest.len >= self.args_len);
     var args = self.argsIter(metadata);
+    _ = args.next();
     var len: usize = 0;
     var argument_index: usize = 0;
     while (args.next()) |arg| {
