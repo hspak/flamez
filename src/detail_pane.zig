@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const clay = @import("zclay");
 const rl = @import("raylib");
 const App = @import("App.zig");
+const page_layout = @import("layout.zig");
 const process_info = @import("process_info.zig");
 const text = @import("text.zig");
 const theme = @import("theme.zig");
@@ -56,6 +57,9 @@ const detail_line_gap: f32 = 5;
 const detail_min_line_glyphs: usize = 8;
 const detail_cpu_graph_height: f32 = 174;
 const detail_cpu_graph_gap: f32 = 16;
+const detail_resize_handle_height: f32 = 8;
+const detail_min_height: f32 = 160;
+const timeline_min_height: f32 = 180;
 
 const tooltip_sizes = InfoSizes{ .title = 14, .body = 13 };
 const detail_sizes = InfoSizes{ .title = 16, .body = 15 };
@@ -666,6 +670,32 @@ pub fn render(
     if (!element.found) return; // pane joins the layout on the frame after a click
     const box = element.bounding_box;
     if (box.width < 80 or box.height < 80) return;
+    const resize_handle = clay.BoundingBox{
+        .x = box.x,
+        .y = box.y - detail_resize_handle_height / 2,
+        .width = box.width,
+        .height = detail_resize_handle_height,
+    };
+    const over_resize_handle = pointInBox(mouse, resize_handle);
+    const left_down = rl.isMouseButtonDown(.left);
+    if (!left_down) app.detail_resize_dragging = false;
+    if (app.detail_resize_dragging or over_resize_handle) rl.setMouseCursor(.resize_ns);
+    if (clicked and over_resize_handle) {
+        app.detail_resize_dragging = true;
+        app.detail_dragging = false;
+        app.detail_text_selecting = false;
+        app.detail_text_focused = false;
+    }
+    if (app.detail_resize_dragging) {
+        const page_height = @as(f32, @floatFromInt(rl.getScreenHeight())) -
+            page_layout.process_row_height;
+        const max_height = @max(detail_min_height, page_height - timeline_min_height - 1);
+        app.detail_pane_height = std.math.clamp(
+            box.y + box.height - mouse.y,
+            detail_min_height,
+            max_height,
+        );
+    }
     const close_element = clay.getElementData(.ID("DetailCloseButton"));
     const close_box = if (close_element.found)
         close_element.bounding_box
@@ -689,6 +719,13 @@ pub fn render(
     rl.drawRectangleRec(
         .init(box.x, box.y, box.width, header_height),
         toRaylibColor(panel_raised),
+    );
+    rl.drawRectangleRec(
+        .init(box.x, box.y - 1, box.width, 2),
+        toRaylibColor(if (app.detail_resize_dragging or over_resize_handle)
+            .{ 92, 151, 255, 255 }
+        else
+            border),
     );
     const header_title = "PROCESS DETAILS";
     const header_title_size = measureTextSlice(font, header_title, 12);
@@ -808,7 +845,6 @@ pub fn render(
         .height = thumb_height,
     };
 
-    const left_down = rl.isMouseButtonDown(.left);
     if (!left_down) {
         app.detail_dragging = false;
         app.detail_text_selecting = false;

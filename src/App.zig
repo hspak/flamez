@@ -22,6 +22,9 @@ detail_scroll_px: f32 = 0,
 detail_for: ?usize = null,
 detail_dragging: bool = false,
 detail_grab: f32 = 0,
+/// Explicit height of the bottom detail pane. Zero uses the responsive default.
+detail_pane_height: f32 = 0,
+detail_resize_dragging: bool = false,
 /// Builder storage for the detail pane, allocated once in `init`.
 detail_store: []u8 = &.{},
 detail_lines: []TooltipLine = &.{},

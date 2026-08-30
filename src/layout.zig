@@ -128,7 +128,10 @@ pub fn create(
                     .id = .ID("DetailPane"),
                     .layout = .{
                         .direction = .top_to_bottom,
-                        .sizing = .{ .w = .grow, .h = .percent(detail_pane_fraction) },
+                        .sizing = .{ .w = .grow, .h = if (app.detail_pane_height > 0)
+                            .fixed(app.detail_pane_height)
+                        else
+                            .percent(detail_pane_fraction) },
                     },
                     .background_color = theme.panel,
                 })({

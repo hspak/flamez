@@ -177,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
         .vsync_hint = screenshot_path == null,
         .window_highdpi = screenshot_path == null,
     });
-    rl.initWindow(window_width, window_height, "Flamez — process lifetime profiler");
+    rl.initWindow(window_width, window_height, "Flamez");
     if (!rl.isWindowReady()) {
         log.err("raylib could not create a window", .{});
         return;
