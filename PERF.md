@@ -1,588 +1,410 @@
-# Performance assessment
+# Performance implementation
 
-Date: 2026-08-28
+This document describes the performance-specific code that exists in Flamez.
+It is not a list of optimization ideas or a claim that a particular path is a
+measured bottleneck. Cross-platform ownership and data flow are documented in
+[ARCHITECTURE.md](ARCHITECTURE.md); Linux collector details are in
+[EBPF.md](EBPF.md), and macOS API details are in [MACAPI.md](MACAPI.md).
 
-This is a static review of the current Zig, C, eBPF, Clay, and raylib paths. It
-does not claim a measured bottleneck yet. The first recommendation is therefore
-to add counters and capture baselines before making the structural changes
-below.
+## Implemented performance model
 
-## Executive summary
+Flamez keeps canonical capture data for the full session, but tries to make
+recurring work depend on current activity and the visible viewport rather than
+all retained history.
 
-Flamez has a sound performance baseline for small and medium captures:
+| Area | Implemented behavior | Scope |
+|---|---|---|
+| Lifecycle collection | Producers queue normalized lifecycle events; the main thread drains them without a blocking wait | Shared contract, platform-specific producers |
+| CPU sampling | Cumulative totals are sampled on a ~16 ms cadence independent of render FPS | Shared |
+| CPU history | Idle samples allocate nothing; adjacent active samples in the same quarter-core band coalesce | Shared |
+| Process lookup | The PID hash contains live processes only | Shared |
+| Metadata | Forks share immutable offsets, identical paths reuse storage, and reachable bytes are compacted at capture completion | Shared |
+| Tree layout | Revision-gated rebuilds, stable live lanes, and heap-based sibling lane assignment | UI |
+| Timeline | Vertical and temporal culling, followed by pixel-column aggregation | UI |
+| Detail pane | Revision/width caches and a width-decimated CPU graph | UI |
+| Completed capture | Unchanged frames are not laid out or rendered; input is polled on a short idle interval | UI |
+| Telemetry | Compile-time phase timing and shape counters | Shared/UI |
 
-- lifecycle traffic is filtered in the kernel;
-- scheduler switches update maps instead of producing userspace events;
-- map reads are batched 256 entries at a time;
-- forked processes share immutable metadata bytes;
-- CPU activity is quantized and adjacent equal bands coalesce;
-- Clay uses fixed arena memory, most transient strings are stack-backed, and
-  the UI retains heap capacity;
-- tree geometry is revision-gated, timeline drawing is vertically culled, and
-  detail text is cached.
+## Shared capture and storage
 
-The normal warmed-up frame is therefore mostly allocation-free. New process
-records, new CPU bands, larger tree caches, and newly selected detail text are
-the expected exceptions.
+### CPU sampling is independent of rendering
 
-The scaling risks are historical rather than constant overhead. CPU samples,
-metadata, process records, and UI indexes all grow for the full capture. Some
-render paths then scan or draw that history every frame. At the same time, the
-collector snapshots all live CPU map entries at the render rate. Those costs
-will eventually dominate a long or highly parallel build even though the
-steady-state design is otherwise careful.
+`Session.update` polls lifecycle events every live frame, but calls
+`Collector.snapshotCpu` only when `cpu_sample_period_ns` has elapsed. The
+period is currently 16 ms. A slow or skipped frame delays a sample; it does not
+lose CPU already accumulated by the platform collector because every sample is
+cumulative.
 
-The recommended order is:
+Each delivered sample has its own observation timestamp. `Process` converts
+successive cumulative totals into activity intervals. A natural exit can carry
+a final authoritative total; `recordFinalCpuSnapshot` reconciles a newer live
+sample that temporarily overestimated CPU, removes or shortens affected tail
+slices, and coalesces the corrected tail again.
 
-1. instrument representative captures;
-2. cull optional behavior that makes interaction, memory use, target
-   distortion, or measurement integrity worse;
-3. remove unused UI arrays and redundant scratch preallocation;
-4. decouple CPU sampling from 60 FPS and batch the C-to-Zig handoff;
-5. time-cull and pixel-aggregate CPU slices before drawing;
-6. narrow tree invalidation and improve the packed-lane algorithm;
-7. compact metadata/detail storage and only then consider lower-level render
-   batching or BPF map changes.
+This design keeps lifecycle polling responsive while preventing CPU collection
+from accidentally running once per render call or once per displayed process.
 
-## Product rule: cull before optimizing, preserve measurement integrity
+### CPU slices compress repeated and idle activity
 
-Performance and measurement integrity are both part of the product, especially
-for a profiler. A feature is not worth preserving merely because its
-implementation can be optimized. If it causes visible hitches, unbounded
-memory, unstable layout, excessive battery use, material target slowdown,
-dropped events, biased timing, or misleading precision, remove or reduce the
-feature unless it is essential to Flamez's core job.
+`Process.recordCpuSnapshot` stores only intervals with a positive CPU delta.
+It classifies average core occupancy in quarter-core bands, capped at sixteen
+cores. A new interval that is adjacent to the previous interval and has the same
+band extends that slice in place. Idle intervals advance the cumulative
+snapshot cursor without appending a slice.
 
-The core experience to protect is small:
+The process also maintains `cpu_peak_cores` while recording. The detail graph
+therefore does not rescan all CPU history merely to choose its vertical scale.
+Final-total correction recomputes the peak because it can rewrite previously
+recorded slices.
 
-- exact process lifecycle and parentage;
-- trustworthy process lifetime and total self-CPU accounting;
-- a documented temporal-resolution contract for CPU activity;
-- explicit loss, truncation, and precision boundaries rather than silent
-  degradation;
-- a responsive, stable flamegraph that does not materially distort the target;
-- enough identity to understand what each process was doing.
+Canonical slices remain retained for the capture. Rendering builds bounded
+views over them; it does not replace old source slices with screen-resolution
+data.
 
-Everything beyond that is negotiable. The first culling candidates are:
+### Process and metadata storage retain capacity
 
-- coupling capture cadence to render cadence: collect on an independent,
-  accuracy-tested schedule and let rendering consume the latest snapshot;
-- one hover target per original CPU slice: show a derived pixel/time-bucket
-  aggregate without discarding the canonical collected slices;
-- the full selected-process CPU graph if it duplicates the timeline without
-  adding enough value;
-- mouse text selection and retained clipboard staging in the detail pane if
-  their memory and complexity remain material after lazy allocation;
-- continuous 60 FPS redraw after capture completion;
-- optimal live lane repacking when stable, slightly sparse lanes are easier to
-  follow and cheaper to maintain;
-- rounded corners, outlines, four-times MSAA, high-DPI rendering, or labels on
-  bars too narrow to read.
+`Session`, `Process`, and `App` use unmanaged lists and maps whose capacity
+is retained across updates and rebuilds. The warmed-up main/UI frame normally
+allocates only when the capture grows into new process, exec-history, CPU-band,
+or viewport capacity.
 
-Cull presentation and optional subsystems before reducing canonical capture
-precision. Pixel aggregation, fewer labels, and a simpler detail pane are safe
-when they remain derived views over unchanged source data. Lower sampling,
-truncated argv, compacted history, or disabled CPU activity change the collected
-dataset and therefore require an intentional schema/product decision plus an
-accuracy test against a higher-fidelity reference.
+Variable-length argv, executable, and CWD bytes live in one session metadata
+store. Process and exec records hold offsets, so arena growth cannot invalidate
+them. A fork copies offsets and provenance instead of duplicating inherited
+metadata. Path setters compare the current value before appending, avoiding
+repeated storage for unchanged executable and CWD observations from the same
+source.
 
-Culling must be explicit rather than silent. If Flamez intentionally stops
-collecting a field, shortens a capture, or lowers temporal resolution, expose
-that boundary in the UI and session summary. If an optional feature cannot
-operate without drops, skew, or material observer effect, remove the feature
-instead of presenting compromised data as trustworthy.
+When capture stops or the root exits, `Session.compactMetadata` rebuilds the
+store from reachable process and exec-history references. An offset-remap table
+copies shared byte ranges once and updates every retained offset. Compaction is
+kept out of the live event path; its temporary allocation can approach the
+pre-compaction store size.
 
-### Accuracy and precision risks to remove or represent honestly
+`Session.by_pid` contains live processes only. Finishing the current
+generation removes its entry. Recovery code that needs a historical generation
+uses the slower reverse `latestIndex` scan instead of making every hot lookup
+pay for all historical PIDs.
 
-Several current recovery/boundary behaviors preserve a visible row by placing
-an inferred value into a field that otherwise means “observed.” That is useful
-for continuity, but it must not look equally authoritative:
+Fatal-signal teardown uses a fixed 65,536-entry atomic PID table. Each process
+stores the `u16` slot returned at admission, so normal process completion clears
+the exact slot without searching the table. Admission starts from a retained
+free-slot hint. The rare Stop/fatal-signal path deliberately scans the complete
+table so it can signal process groups that escaped the root group.
 
-- a lost fork can create a parent stub under the root with the later event time
-  as its start;
-- an unknown exec is attached under the root even though its true parent is
-  unknown;
-- an exit-only recovery becomes a zero-width lifetime even though only the
-  death timestamp is known;
-- root exit and forced Stop close every open descendant at the capture boundary,
-  which is not proof that each descendant exited then;
-- forced Stop retains the last userspace CPU snapshot rather than an exact
-  kernel final total;
-- live CPU buckets have documented map-read/timestamp skew and already trade
-  scheduler-transition precision for quarter-core-band coalescing.
+### Loss bounds prevent producer memory from growing silently
 
-Do not solve these cases by inventing plausible precision. Represent observed,
-inferred, unknown, and capture-clipped values separately, for example with a
-compact provenance/end-kind flag. Exclude inferred values from calculations
-that claim exactness. If the model or UI cannot communicate uncertainty without
-becoming confusing, cull the inferred field or row rather than displaying it as
-measured fact. A visible gap is more accurate than a fabricated interval.
+All lifecycle producers have a bounded queue or ring and expose known loss to
+`Session`. A nonzero loss count marks the session incomplete.
 
-The dropped-event counter is necessary but not sufficient: once lifecycle loss
-occurs, the session should be visibly marked incomplete, and export/summary
-consumers must receive that state. Natural-exit CPU reconciliation should have
-tests against the kernel total; forced-stop results should be labeled partial.
+- Linux uses a fixed 16 MiB BPF ring buffer.
+- Exact macOS Endpoint Security capture uses a 16 MiB owned-record queue.
+- The macOS fallback uses a 16 MiB pending-event budget, including owned argv
+  capacity.
 
-## Priority findings
+These limits protect Flamez from unbounded producer memory during a fork/exec
+burst. They are correctness boundaries as well as performance bounds: overflow
+is reported rather than hidden.
 
-| Priority | Finding | Scaling shape | First action |
-|---|---|---|---|
-| High | CPU maps are fully snapshotted, sorted, merged, and dispatched once per UI frame | `O(F * (P log P + T log P))` | Decouple sampling from rendering; choose cadence from a precision/error budget |
-| High | CPU-slice storage is unbounded and visible processes scan every historical slice | memory `O(S)`, frame work `O(visible S)` | Binary-search the visible time range and aggregate to pixel columns |
-| High | Process-tree/layout rebuilds are broad and packed-lane assignment can become quadratic | rebuild `O(N + sum(J * lanes))` | Split revision reasons and use an interval-partition heap |
-| High | Secondary features can consume resources or perturb the target without improving the primary graph | workload-dependent | Remove them when they breach UX or accuracy budgets; do not optimize by default |
-| High | Recovery and capture-boundary values can appear as precise as observed lifecycle data | correctness/interpretation | Track provenance or cull inferred values; mark the session incomplete after loss |
-| Medium | The UI keeps many parallel arrays, including four that are never read | at least 50 unused bytes/process before spare capacity | Delete write-only arrays; stop pre-growing local scratch to `N` |
-| Medium | Metadata and selected-detail storage duplicate potentially large argv/path content | `O(total exec metadata)` | Avoid identical CWD writes; grow clipboard only on copy |
-| Medium | raylib API calls are internally batched, but shapes and three font atlases are interleaved | many render groups and possible batch flushes | Count actual render groups, then stage compatible shape/text passes |
-| Medium | `by_pid` retains finished PIDs although lookups mostly need live processes | `O(distinct historical PID)` | Make the primary index live-only; keep a small duplicate-exit policy if required |
-| Measure | Three 65,536-entry kernel hashes plus a 16 MiB ring are fixed startup memory, and the scheduler hook runs system-wide | fixed memory plus work per context switch | Measure target slowdown and map memory before changing correctness-oriented sizing |
+## Linux-specific collector optimizations
 
-`F` is CPU snapshot frequency, `P` is the number of live processes, `T` is the
-number of currently running tracked threads, `S` is stored slices, `N` is all
-captured processes, and `J` is a sibling job group.
+### Lifecycle filtering and CPU accounting stay in the kernel
 
-The no-loss natural-exit path is designed to preserve lifecycle and final CPU
-totals. The recovery and forced-boundary paths need provenance before their
-values should be described as equally exact. Elsewhere, “High” means the item
-is a likely scaling limit under the workloads Flamez is designed to observe.
+`src/flamez.bpf.c` admits a child synchronously when its tracked parent forks.
+Unrelated fork, exec, and exit activity is rejected before ring-buffer
+reservation. The scheduler tracepoint emits no userspace event. It records
+schedule-in state per tracked thread and atomically accumulates completed
+intervals per process on schedule-out.
 
-## Memory allocations and ownership
+This avoids sending system-wide context-switch traffic to Flamez. The remaining
+Linux observer cost is the raw `sched_switch` hook itself: every system context
+switch executes its cheap outgoing-thread lookup and incoming-process
+membership check even when neither side belongs to the target.
 
-### What is already good
+The BPF object preallocates the hot maps so tracepoint execution does not depend
+on kernel allocation under load:
 
-`Session`, `App`, and the C snapshot bridge consistently retain capacity. Clay
-gets one arena at startup. View labels and hover storage are stack-backed. The
-C bridge grows `cpu_totals` geometrically and reuses it. These choices avoid a
-general-purpose allocation storm on every frame.
-
-The session metadata arena is also a good fit for ownership: process records
-store offsets, so growing the arena cannot invalidate them, and a fork can copy
-three offset/length pairs rather than duplicate argv, executable, and CWD bytes.
-
-### CPU-slice ownership is the main long-run allocation risk
-
-Each `Process` owns an `ArrayList(CpuSlice)` (`src/tracer/Process.zig:24`). A
-new allocation/growth occurs whenever activity cannot merge with the last
-quarter-core band (`src/tracer/Process.zig:129-150`). Idle snapshots are free
-and equal neighboring bands merge, which is valuable, but alternating bands
-can still create one slice per sample.
-
-On the current x86-64 Zig 0.16 build, compile-time sizes are:
-
-| Type | Size |
+| Object | Bound |
 |---|---:|
-| `Process` | 216 bytes |
-| empty `ArrayList` header inside each process | 24 bytes |
-| `CpuSlice` | 32 bytes |
-| `App.GraphRow` | 56 bytes |
-| `?usize` | 16 bytes |
+| lifecycle ring | 16 MiB |
+| tracked processes | 65,536 |
+| process CPU totals | 65,536 |
+| running threads | 65,536 |
 
-At 60 snapshots/second, a continuously busy process whose band alternates can
-add 1,920 bytes/second of slice payload before allocator spare capacity. This
-is a worst case, not a prediction, but it demonstrates that coalescing does not
-provide a hard bound.
+These are fixed startup costs chosen to avoid admission failure during capture.
 
-Recommended response:
+### CPU map snapshots are batched and reuse scratch storage
 
-- Measure total slice count, total capacity, median/p95/max slices per process,
-  coalescing rate, and bytes per captured second.
-- Do not lower the CPU sampling rate solely to save memory. First define and
-  test the temporal-resolution contract. Cumulative accounting and exact
-  final-exit totals preserve total CPU, but a lower rate still reduces the
-  precision of activity timing.
-- If most processes have one or two slices, compare a small inline prefix or a
-  session-owned slab against the current one-allocation-per-active-process
-  shape. Do not add a large inline array blindly: it would inflate all 216-byte
-  records, including processes with no CPU slice.
-- Define an explicit long-capture policy. Prefer retaining canonical slices and
-  building a multiresolution render index beside them. If canonical history
-  must be bounded, end/segment the capture or declare the older interval
-  coarsened; never silently replace precise samples with buckets while
-  presenting the session as lossless.
+`src/ebpf_shim.c` reads `process_cpu` and `running_threads` with
+`bpf_map_lookup_batch` in batches of 256. Its `cpu_totals` array starts at
+256 entries, grows geometrically, and is retained for later snapshots.
 
-### The metadata arena retains superseded and duplicate bytes
+After reading completed totals, the shim rebuilds a reusable open-addressed
+index with a power-of-two capacity and a maximum load factor of one half.
+Still-running thread intervals are then merged into the owning TGID with
+expected constant-time lookup. This replaced the earlier sort plus repeated
+binary searches.
 
-The append-only arena is simple and makes inherited metadata sharing cheap,
-but an exec clears the record's argv/executable offsets and appends replacements
-(`src/tracer/Session.zig:544-579`). Old bytes remain because a forked child may
-still reference them. Some old bytes will have no remaining reference, but the
-arena cannot reclaim them.
+The completed array, count, and one snapshot timestamp cross into Zig once.
+`capture/linux.zig` iterates the borrowed array directly; there is no
+per-process C callback and no copy into a second Zig snapshot buffer. Lifecycle
+polling uses `ring_buffer__poll(..., 0)`, so an empty poll never blocks the UI.
 
-There is also a concrete avoidable duplicate: every exec calls `refreshCwd`,
-which appends CWD bytes even when the process inherited and retained the exact
-same CWD. Large builds commonly run thousands of children from one directory.
+## macOS-specific collector optimizations
 
-Recommended response:
+macOS lifecycle capture has two runtime modes. Both use
+`proc_pid_rusage` for cumulative self CPU, but their lifecycle producers are
+different.
 
-- Before `setCwd`, compare against the current stored CWD and retain the old
-  offset when equal. Apply the same compare-before-append rule to paths where it
-  is cheap.
-- Track total metadata bytes, reachable bytes, bytes by argv/exe/CWD, and the
-  duplicate-CWD hit rate.
-- Decide whether complete historical argv belongs to the canonical dataset. It
-  is the dominant legitimate payload and can be up to the 6 MiB exec bound. If
-  it is canonical, preserve it and cull optional consumers/copies first. If it
-  is not, remove it from the schema intentionally and expose the resulting
-  identity boundary; do not silently truncate a field that claims completeness.
-- Consider compaction only at a quiet boundary, such as capture completion.
-  Rebuilding the arena while events are arriving adds complexity and copies
-  exactly when the UI is busiest.
+### Exact Endpoint Security mode
 
-### Selected-process detail storage is too eager
+`src/macos_es_shim.c` copies every borrowed ES message before the framework
+callback returns. One allocation holds the fixed queue record and its variable
+name, argv, executable, and CWD bytes. The callback appends that record to a
+mutex-protected linked queue with a 16 MiB byte budget.
 
-Selecting a process sizes four retained buffers. `detailCapacity` estimates one
-line per eight argument bytes and includes a clipboard buffer large enough for
-the complete text (`src/main.zig:1737-1747`, `2308-2314`). For a pathological
-multi-megabyte argv this can reserve tens of MiB in `TooltipLine` entries plus a
-second large byte buffer before the user copies anything.
+Polling detaches the complete linked list and resets its byte count while
+holding the mutex, then invokes Zig callbacks and frees records after releasing
+the lock. Endpoint Security's producer queue therefore never mutates
+`Session`, and the main thread does not hold the queue mutex while consuming
+events.
 
-Recommended response:
+Global ES sequence gaps and allocation/budget failures contribute to the same
+loss count. At root reap, `es_sync_client` places a queue barrier before the
+final drain so normal frame timing cannot strand already-enqueued events.
 
-- Let the existing geometric overflow/retry loop size display storage from the
-  actual wrapping result instead of preallocating the eight-byte worst case.
-- Allocate/grow clipboard staging only on Ctrl+C. It need not mirror selected
-  detail capacity for the lifetime of the app.
-- Longer term, avoid materializing a second space-joined copy of all argv for
-  display. A wrapped iterator over NUL-separated metadata can preserve empty
-  arguments without duplicating the complete block.
+### kqueue/libproc fallback mode
 
-### Fixed kernel memory is intentional but should be visible
+`src/tracer/capture/macos.zig` runs fallback discovery on a dedicated worker
+instead of the render thread. The worker blocks in `kevent` with a 4 ms
+recovery timeout and reads up to 256 events at once.
 
-The collector creates a 16 MiB ring and three 65,536-entry hash maps with flags
-zero (`src/flamez.bpf.c:47-90`). The signal-safe userspace PID table is another
-fixed 65,536 atomic entries (`src/tracer/signals.zig:31-40`). This avoids
-allocation and admission surprises in hot tracepoint paths, so it is a valid
-speed/correctness tradeoff, not automatically waste.
+Fork bursts are handled in two stages:
 
-Expose or document the kernel-memory footprint. Only reduce map sizes or use
-non-preallocated hashes after measuring peak live processes/threads and loss
-behavior; allocation failure inside a scheduler tracepoint is worse than a few
-idle MiB for Flamez's correctness.
+1. Cheap recursive PPID and process-group discovery admits and registers live
+   PIDs before metadata enrichment.
+2. A tracked fork hint triggers up to eight additional kqueue drains with a
+   250 microsecond quiet window, followed by one coalesced all-PID immutable-
+   parent scan for children that already escaped ordinary discovery.
 
-## Rendering and work dispatch
+This ordering prioritizes kqueue registration during churn and avoids an
+all-system PID scan on every 4 ms recovery pass.
 
-### Vertical culling is good, temporal culling is incomplete
+libproc PID lists reuse one `pid_snapshot` buffer. The collector adds sixteen
+slots to the sizing result and treats a completely full fill as possibly
+truncated. It doubles capacity for at most four attempts; a persistently full
+snapshot is rejected and counted as loss rather than consumed as complete.
 
-`renderTimeline` draws only the visible row interval
-(`src/main.zig:1451-1452`). That is the right first-level cull. A visible row,
-however, calls `paintCpuSlices`, which starts at slice zero and scans the entire
-history (`src/main.zig:994-1015`). Slices are already time ordered, so a lower
-bound on `end_ns` can jump directly to the first possibly visible slice and stop
-when `start_ns` passes the window.
+The worker owns `pending_events`; the main thread owns `delivery_events`.
+`pollEvents` swaps the two lists and their byte accounting under the mutex,
+then delivers and destroys records after unlocking. Both lists retain their
+allocation capacity for the next batch.
 
-Time culling alone is not enough for a long full-run view. Hundreds of slices
-may map to the same horizontal pixel. Convert visible slices into at most one
-or a small fixed number of primitives per pixel column, preserving a defined
-signal such as maximum band, CPU-weighted occupancy, or total CPU. Hover should
-query the original range only for the pointed column.
+Fallback CPU sampling also minimizes lock duration around slow system calls.
+The main thread copies PID identity and collector generation into a reusable
+`cpu_targets` list under the mutex, releases the lock for
+`proc_pid_rusage`, timestamps each PID immediately after its read, verifies
+the process identity, and briefly locks again before publishing the sample.
+This prevents a slow fan-out scan from projecting every total back to one early
+timestamp and prevents PID reuse from corrupting another record.
 
-Packed rows have a second escape hatch around vertical culling: one visible
-slot walks every linked member (`src/main.zig:1564-1599`). A lane containing
-thousands of non-overlapping jobs can therefore make one visible row expensive.
-Store packed members in start-time order and range-query the visible window, or
-maintain a compact interval index for each packed row.
+### Shared macOS conversion path
 
-### The detail graph redraws all history
+`src/macos_shim.c` caches `mach_timebase_info` with `pthread_once`.
+Endpoint Security Mach timestamps and `proc_pid_rusage` task-recount totals
+share the same conversion function. A 128-bit intermediate avoids overflow
+during scaling. This removes a timebase query from every event and CPU sample
+while preserving the non-1:1 Apple-silicon conversion.
 
-Every visible detail graph scans all slices once to find its core scale and
-again to emit a rectangle and several line primitives per slice
-(`src/main.zig:1757-1763`, `1872-1924`). Cache the scale or maintain it while
-recording samples, and build a width-dependent decimated series. The graph is
-about one thousand pixels wide; drawing more than roughly that order of data
-cannot add horizontal information.
+The fallback worker performs discovery and metadata inspection while holding
+its collector mutex. That serializes worker state safely, but a large libproc
+scan can delay a main-thread queue swap or CPU-target snapshot. Exact Endpoint
+Security mode does not perform those discovery scans.
 
-### raylib batches calls, but current ordering fragments the batch
+## Tree layout and retained UI state
 
-It would be inaccurate to treat each `drawRectangle*`, `drawLine*`, or
-`drawText*` call as an immediate GPU dispatch. raylib queues geometry in rlgl.
-However, texture or primitive-mode changes create new internal draw groups, and
-the bundled raylib flushes after 256 draw groups. Shapes use the shapes texture;
-text uses one of three font atlases. The current row order is commonly:
+### Rebuilds are revision-gated
 
-1. bar shape and outline;
-2. row-font text;
-3. CPU rectangles/lines;
-4. repeat for the next process.
+`Session` maintains separate topology, interval, and label revisions.
 
-That repeatedly switches shape → font → shape. Clay chrome also emits commands
-in painter order and moves among UI, row, and footer fonts.
+- Adding a process changes topology and rebuilds the tree.
+- Exec and metadata changes update process/label revisions but do not rebuild
+  tree geometry.
+- Finishing a process changes interval state. While capture is live, existing
+  lane assignments remain stable; intervals are repacked once capture is
+  complete.
+- Collapse changes have their own UI revision and rebuild only the row model.
 
-Recommended response:
+The row model and scratch arrays retain capacity. Structural arrays and the
+row-head scratch reserve for the retained process count. Job, height,
+occupied-lane, free-lane, and lane-offset scratch buffers reserve only for the
+local job or lane count instead of all being pre-grown to the total process
+count.
 
-- Instrument rlgl draw-group count, vertex count, automatic flush count, and
-  time in `endDrawing` before creating a custom renderer.
-- Within the timeline scissor, stage compatible passes where painter order
-  permits: backgrounds/bars, CPU overlays/outlines, then labels and controls.
-  Drawing labels last also prevents tall CPU overlays from obscuring them.
-- Keep the number of scissor transitions small because render-state changes can
-  force synchronization. The current top-level timeline/detail/tooltip regions
-  are reasonable; avoid introducing one scissor per row.
-- Cache static label summaries or their clipped prefix by process revision and
-  width bucket if text measurement appears in profiles. `name_revision` was
-  apparently intended for such a cache but is currently never read.
-- Treat rounded rectangles, four-times MSAA, and high-DPI fill cost as
-  conditional quality knobs. Cull them immediately if GPU timing or battery
-  use shows pressure; they are not part of the profiler's core value.
+### Packed sibling lanes use interval partitioning
 
-### Rendering and CPU sampling should not share one frequency
+`process_tree.layoutJobLanes` sorts sibling jobs by start time. One min-heap
+tracks occupied lanes by end time and another tracks reusable lane IDs. Lane
+assignment is therefore `O(J log J)` after sorting instead of scanning every
+existing lane for every job. Reusing the smallest available lane keeps the
+layout deterministic.
 
-The app snapshots CPU immediately before every rendered frame
-(`src/main.zig:209-230`, `src/tracer/Session.zig:176-187`). The C bridge batch-
-reads every live process total, sorts by TGID, binary-searches that array for
-each running thread, and makes one C-to-Zig callback per process
-(`src/ebpf_shim.c:675-799`). At 60 FPS this is usually far more temporal detail
-than a process flamegraph can display.
+Packed-row members are flattened into contiguous ranges and sorted by start
+time. Rendering binary-searches the first member that can overlap the visible
+window and stops once member start time reaches the window end. Very narrow
+packed bars are reduced to one selected process per pixel column using reusable
+column and touched-column buffers.
 
-Keep lifecycle ring polling frequent and schedule cumulative CPU snapshots on
-an independent fixed cadence. Compare candidate cadences against a
-higher-frequency reference, including short bursts and parallel occupancy, then
-choose the lowest rate that satisfies the documented temporal error/resolution
-budget. A 20 Hz experiment is useful, but it is not an acceptable default merely
-because it is cheaper. If 60 Hz is needed for precision, cull optional UI work
-and optimize snapshot transport instead.
+The row model still stores parallel arrays for traversal-friendly fields such
+as first-child, next-sibling, slot, subrow, and lane height. Previously
+write-only visual-parent, pack-root, pack-job, and slot-count arrays are no
+longer retained.
 
-Pass the snapshot array across the C/Zig boundary once instead of invoking one
-callback per TGID. If snapshot profiles remain material, replace the per-frame
-`qsort` plus binary searches with a reusable flat hash/index. These changes
-preserve the collected values and should precede any reduction in cadence.
+## Rendering-specific optimizations
 
-The zero-timeout ring poll can also consume a large burst on the render thread.
-Count events and poll duration per frame. If bursts cause frame misses, cull
-render/detail work or move ingestion to a collector thread before imposing a
-drain budget that could overflow the ring and lose lifecycle records. Any
-bounded queue must surface overflow and mark the capture incomplete rather than
-quietly continue with an inaccurate tree. The threaded option is a later step
-because it changes ownership and teardown.
+### Timeline work is bounded by the viewport
 
-### Static captures should not require a permanent 60 FPS loop
+`renderTimeline` visits only the vertically visible row range plus one
+partially visible row. Lifetime bars outside the visible time window return
+before drawing.
 
-After the target exits, most of the screen is static. Continue at 60 FPS while
-dragging, scrolling, hovering, or animating, but otherwise redraw on input,
-resize, exposure, or a low-rate idle tick. This is primarily an energy and
-laptop-thermals win; it can also make completed large captures feel lighter.
-If reliable event-driven redraw is awkward, a low idle frame rate is preferable
-to preserving 60 FPS for a static screen.
+CPU slices are time ordered. `Process.firstVisibleSlice` binary-searches the
+first slice whose end can overlap the window, and the draw loop stops when a
+slice starts beyond the window. Slices wide enough to display are drawn
+directly. Subpixel slices are merged into reusable per-pixel columns; only
+touched columns are cleared and emitted.
 
-## Data structures and retained data
+This keeps full-history CPU slices canonical while bounding the number of
+timeline primitives by visible rows and horizontal resolution. Performance
+telemetry records slices scanned versus primitives drawn.
 
-### Remove known write-only state first
+Bar-label measurement caches the process name width and a name hash. Labels are
+omitted when the name cannot fit, avoiding both unreadable output and work for
+the longer summary label on narrow bars.
 
-The following fields are allocated, initialized, and written but never read by
-production code:
+### The detail pane caches expensive derived views
 
-- `App.visual_parent`;
-- `App.pack_root`;
-- `App.pack_job`;
-- `App.slot_count`;
-- `Process.name_revision`;
-- `Process.args_source`, `exe_source`, and `cwd_source` outside tests.
+Selected-process detail text is rebuilt only when the selected process
+revision, selection, or wrapping width changes. Heap-backed text, line, and
+line-height buffers are retained and grow geometrically if the builder
+overflows. The initial reservation is estimated from retained exec metadata,
+so selecting a process with a very large argv can still cause a correspondingly
+large one-time allocation.
 
-The four UI arrays alone consume 50 bytes per process on x86-64 before
-`ArrayList` spare capacity: three `?usize` arrays at 16 bytes each plus one
-`u16` array. Removing them also removes four allocations and four full-array
-initialization passes.
+Clipboard staging is separate and remains empty until the user copies selected
+text. Hover tooltips use fixed-capacity text/line storage and cache by process
+revision and width.
 
-Separately, `rebuildProcessTree` pre-grows `jobs_scratch`, `heights_scratch`,
-`free_at_scratch`, and `lane_offsets_scratch` to all `N` processes
-(`src/main.zig:550-553`). Their consumers already ensure capacity for the
-actual job/lane count (`src/main.zig:733-749`, `836-839`). Delete the global
-`N` pre-growth. Keep `roots_scratch` bounded by actual root count as well.
+The full-lifetime CPU detail graph is reduced to one value per plot pixel. Its
+column buffer is cached by process, process revision, lifetime range, and plot
+width. Consecutive equal columns render as one run, so unchanged frames do not
+rescan or redraw one primitive per canonical slice.
 
-These changes are low risk and should precede a container redesign.
+### Static captures skip unchanged frames
 
-When removing a field, leave a concise comment at the place where the value is
-still produced or can be derived. The comment should say that Flamez
-intentionally does not retain it and name the recovery source so a future
-revision does not have to rediscover the data path. For example:
+Live and interactive frames use vsync with no software FPS cap. Screenshot mode
+disables vsync and uses a fixed 60 FPS clock for deterministic capture.
 
-```zig
-// Parent PID is derived from parent_index; fork events still provide it if
-// direct storage is needed again.
+After the target exits, the main loop skips Clay layout, timeline work, detail
+rendering, and buffer presentation until input, resize, mouse movement, or the
+optional FPS display requires a redraw. It sleeps and polls input every 32 ms
+while idle. This reduces completed-capture CPU and GPU use without changing
+the retained session.
 
-// Metadata provenance is intentionally not retained; the setter/ingestion path
-// identifies whether the bytes came from launch, the kernel, or procfs.
+Clay receives one fixed arena at startup. Most per-frame display strings use
+stack buffers, and `App` retains viewport, tree, detail, and aggregation
+buffers. The first frame at a new capture size, selection, or viewport width
+may grow those buffers; stable frames reuse them.
+
+4x MSAA and high-DPI rendering remain enabled by default. The build option
+`-Dmsaa=false` disables MSAA when GPU fill or memory bandwidth matters more
+than edge quality.
+
+## Verification of performance-sensitive behavior
+
+Tests protect the semantics behind the optimizations, rather than asserting
+machine-specific timing thresholds:
+
+- `Process.zig` covers same-band coalescing, idle gaps, final-total correction,
+  and the visible-slice lower bound.
+- `process_tree.zig` covers non-overlapping packed descendants; UI tests cover
+  collapse state surviving rebuilds and packed-row collapse behavior.
+- Detail-graph tests cover full-lifetime range and bounded core scaling.
+- macOS collector tests cover queue overflow, PID-snapshot growth and bounded
+  truncation, FIFO ownership, PID-generation rejection, per-PID CPU timestamps,
+  and parallel-thread cumulative CPU.
+
+These tests keep storage and culling changes from altering capture semantics.
+They are not throughput benchmarks and do not establish a target-slowdown or
+frame-time budget.
+
+## Performance telemetry
+
+Build with:
+
+```sh
+zig build -Dperf-telemetry=true
 ```
 
-Prefer one comment at the relevant ingestion or type boundary over a graveyard
-of deleted field names. The purpose is to preserve the design decision and the
-route back to the data, not to keep dead declarations in memory.
+`src/perf.zig` compiles to no-op branches when disabled. When enabled, it
+emits at most one scoped log line per second and one final session summary.
 
-### Consolidate the per-process UI index
+Timed phases are:
 
-After dead fields are removed, the remaining parallel arrays form a clear
-per-process layout index: first child, next sibling, visual depth, packed slot,
-slot link, lane offset, and collapsed state. A `MultiArrayList`-style structure
-would use one allocation while retaining structure-of-arrays traversal. It also
-makes it harder for lengths to diverge.
+- lifecycle/ring polling;
+- CPU snapshots;
+- process-tree rebuilds;
+- Clay layout and command playback;
+- timeline rendering;
+- detail rendering; and
+- `endDrawing`.
 
-Indexes currently use `usize` and `?usize`; the optional form is 16 bytes here.
-If the session adopts an explicit maximum process-record count, a `u32` index
-with a sentinel can reduce these arrays substantially. Do not narrow indexes
-without a stated bound: the 65,536 kernel limit is for simultaneously tracked
-entries, not total historical processes in a long session.
+The emitted counters record process, metadata, and CPU-slice counts;
+packed-lane rebuild operations; lifecycle events; CPU samples; and timeline
+slices scanned versus drawn. Periodic frame summaries include p50/p95/max over
+up to 64 retained samples. The final summary's count and maximum cover the
+session, while its p50/p95/p99 values come from the rolling 64 stored samples.
 
-There is also duplicated identity/shape state worth resolving:
+`perf.zig` also defines new-versus-coalesced slice counters, but the production
+recording path does not currently call `noteSliceGrowth`; those two values in
+the final summary remain zero. The internal `rebuild_jobs` total is likewise
+not included in the emitted log line. `main.zig` passes
+`collector.last_cpu_samples` to telemetry every live frame, while collectors
+update that field only when a cadence-triggered snapshot runs, so `cpu_n` is
+not currently an exact count of delivered samples. Phase durations in the
+periodic line are from the frame that triggered the log; only overall frame
+times have percentile histograms.
 
-- `Process` stores both `parent_pid` and stable `parent_index`; the PID can
-  normally be derived from the indexed parent.
-- `Process.depth` and `App.visual_depth` describe the same current tree in the
-  normal path.
+Telemetry is shared across collectors. On Linux, lifecycle counts come from the
+ring poll and CPU counts from the borrowed batch snapshot. On macOS, they come
+from the ES queue or fallback worker and the per-PID rusage scan.
 
-Choose one source of truth for each invariant. Keep duplication only if lost-
-event recovery requires different semantics, and document that difference.
+`-Dfps-counter=true` is separate presentation telemetry. It can force an
+occasional completed-capture redraw so the displayed value remains current.
 
-### Narrow tree invalidation
+## Current scaling bounds
 
-`tree_revision` changes on process add, process finish, and exec
-(`src/tracer/Session.zig:215-247`, `265-272`, `544-553`). An exec changes a
-label/metadata but not topology. A finish changes an interval but not parentage.
-During process churn these invalidations make the full revision-gated cache
-rebuild nearly every frame.
+The code avoids many history-dependent frame costs, but it intentionally does
+not impose a lossy session-history limit.
 
-Split at least topology, interval/packing, and label revisions. Additions must
-update topology. Exec should not rebuild tree geometry. Finished intervals can
-leave a valid, possibly non-minimal lane assignment in place during capture and
-be compacted later, or packing can be debounced. Stable lanes are also easier
-for users to follow visually than continuous optimal repacking.
+| Cost | Current shape and bound |
+|---|---|
+| Process and exec history | Grows for the full capture |
+| Canonical CPU slices | Grows when active occupancy changes band; idle and adjacent equal bands are free |
+| Metadata | Grows during capture, then compacts to reachable shared ranges |
+| Tree rebuild | Visits retained processes when topology/collapse changes and once for final interval packing |
+| Timeline draw | Visible rows, visible time ranges, and pixel-resolution aggregates |
+| Detail graph | Canonical history scan only when its process/range/width cache is stale; drawing is width-decimated |
+| Linux CPU snapshot | Batched reads over live process totals and running tracked threads |
+| macOS CPU snapshot | One rusage and identity validation sequence per tracked PID |
+| macOS fallback recovery | Recursive live-PID inspection every recovery wake plus event-triggered escaped-child scans |
+| Producer memory | 16 MiB lifecycle queue/ring per active backend |
+| Linux kernel memory | Fixed ring plus three 65,536-entry hashes |
+| Signal-safe teardown | Fixed 65,536-entry atomic PID table; exact-slot removal during normal exits |
+| Metadata compaction peak | Old store plus a replacement reserved to the old size and an offset-remap table |
 
-### Use an interval-partition structure for packed lanes
-
-`assignJobSlots` sorts jobs by start and then linearly scans all existing lanes
-for a free one (`src/main.zig:827-864`). When many sibling jobs overlap, this is
-quadratic. Use the standard interval-partition approach with a min-heap keyed by
-lane end time, optionally paired with a free-lane-ID heap for stable small lane
-numbers. That gives `O(J log J)` after sorting and directly models the decision
-being made.
-
-### Keep the PID hash live-only
-
-`Session.by_pid` maps to the latest record but is not removed in
-`finishProcess`. It therefore grows with distinct historical PIDs even though
-`liveIndex` is its hot use. Remove an entry at finish only when it still points
-to that generation. If duplicate-exit suppression is important, retain a small
-recent-finished set or make duplicate exits harmless without preserving the
-entire live lookup table.
-
-### Measure the global scheduler-hook tax
-
-Every system context switch executes the Flamez raw tracepoint. The fast path
-still performs a running-thread lookup for the outgoing TID and a tracked-TGID
-lookup for the incoming thread (`src/flamez.bpf.c:128-178`, `425-437`). This is
-far better than emitting each switch, but it is work imposed system-wide and is
-not represented by Flamez's own frame time.
-
-Benchmark target wall time and system CPU with Flamez attached versus the same
-command without Flamez. This overhead may be acceptable, but it needs an
-explicit budget because the profiler must not materially distort the build it
-is observing.
-
-## Measurement plan
-
-Add a compile-time performance telemetry mode with one summary line per second
-and a final session summary. Avoid logging every event.
-
-Record:
-
-- frame CPU time and p50/p95/p99/max, split into ring poll, CPU snapshot, tree
-  rebuild, Clay layout, Clay playback, timeline, detail, and `endDrawing`;
-- allocations/reallocations and requested bytes by process records, metadata,
-  slices, UI tree caches, and detail buffers;
-- live/total processes and threads, metadata live/arena bytes, slice
-  count/capacity, new-versus-coalesced slice ratio, and maximum slices/process;
-- tree rebuild count/reasons, processes visited, jobs sorted, lanes scanned,
-  visible rows, visible packed members, slices scanned, slices drawn, and
-  primitives after pixel aggregation;
-- CPU snapshot entry count, batch syscall count, sort time, C-to-Zig callback
-  count, ring events drained, and ring-poll duration;
-- lifecycle loss/recovery count, snapshot timestamp skew, temporal error against
-  a higher-cadence reference, and final self-CPU error against an independent
-  process-accounting reference;
-- rlgl vertices, render groups, batch flushes, and font/shape texture switches;
-- process RSS/peak RSS and BPF map/ring memory;
-- observed target wall-time slowdown with tracing enabled.
-
-Use at least these workloads:
-
-1. high churn: tens of thousands of very short fork/exec/exit processes;
-2. high parallelism: a real `ninja -jN`, `make -jN`, or Zig build;
-3. long CPU history: several minutes with occupancy deliberately changing
-   between bands;
-4. metadata stress: large argv and many children sharing one CWD;
-5. completed-capture interaction: zoom, pan, hover, select, and scroll through
-   a large static session.
-
-Measure an installed ReleaseSafe build, not the development artifact. Establish
-budgets only after the first baseline; useful starting goals are no unexpected
-per-frame allocations after warmup, p95 live frames below the 16.7 ms 60 FPS
-budget, bounded completed-capture redraw cost at a fixed viewport, and an
-explicit maximum acceptable slowdown of the traced command. Accuracy budgets
-belong beside them: no unexplained lifecycle loss, no capture presented as
-complete after overflow, exact final CPU totals within the accounting contract,
-and a stated maximum temporal error for activity slices.
-
-Use those budgets as deletion gates. When a secondary feature breaches one,
-first disable it and measure the experience without it. Restore it only when
-the user benefit is clear and its implementation fits comfortably inside the
-budget. Do not let telemetry work become a reason to retain obvious dead state
-or obviously unreadable detail.
-
-## Proposed implementation sequence
-
-### Phase 0 — product cuts
-
-1. Classify each retained field and rendered feature as core, useful, or
-   optional.
-2. Remove known dead state immediately, leaving a source/derivation comment for
-   values that remain available if the design is revisited.
-3. Define canonical-data and precision contracts. Cull optional fields instead
-   of silently truncating them; bound derived detail-pane and per-pixel render
-   work without changing the source capture.
-4. Disable continuous completed-capture redraw and unreadable narrow-bar labels.
-5. Keep lane positions stable during capture instead of preserving optimal
-   packing at the expense of responsiveness or visual continuity.
-
-### Phase 1 — low-risk cleanup and observability
-
-1. Add the counters/timers above.
-2. Remove write-only arrays/fields and redundant `N`-sized scratch reserves.
-3. Avoid identical CWD appends.
-4. Grow clipboard staging only on copy and remove eager worst-case detail-line
-   allocation.
-5. Stop exec-only metadata changes from invalidating tree geometry.
-
-### Phase 2 — control history-dependent cost
-
-1. Sample cumulative CPU independently from rendering, validate candidate
-   cadences against the precision contract, and batch the snapshot handoff.
-2. Binary-search visible slice ranges.
-3. Pixel-aggregate timeline slices and decimate the detail graph as derived
-   views without discarding canonical samples.
-4. Range-query packed-row members by time.
-5. Define and test the long-capture CPU-history retention policy; any lossy
-   policy must be an explicit dataset boundary, not an invisible optimization.
-
-### Phase 3 — improve scaling structures
-
-1. Replace linear lane scans with interval partitioning.
-2. Consolidate UI arrays and consider bounded compact indexes.
-3. Make `by_pid` live-only.
-4. Consider a pooled slice representation after measuring the one/two-slice
-   distribution.
-5. Compact reachable metadata at capture completion if arena waste is material.
-
-### Phase 4 — conditional rendering/capture work
-
-1. Reorder compatible shape/text passes if rlgl metrics show excessive groups.
-2. Add idle/event-driven rendering for completed captures.
-3. Consider a collector thread only if bounded main-thread polling still misses
-   frame budgets.
-4. Tune BPF map/ring sizes only from observed peaks and loss tests.
-
-The key design principle is to make per-frame work depend on the viewport and
-current activity, not the full duration or total historical process count. The
-current code already applies that principle to rows; extend it to CPU history,
-packed members, snapshots, and retained indexes. Where that is still too
-expensive, reduce the feature. Core capture fidelity matters; secondary
-fidelity and visual polish do not outrank a fast, stable user experience, and
-no optimization outranks truthful data.
+Flamez does not currently truncate canonical CPU history, cap total historical
+process records, impose a per-frame lifecycle drain budget, or shrink Linux BPF
+maps dynamically. Those choices preserve capture fidelity and make any resource
+boundary visible through allocation failure or loss accounting rather than
+silently coarsening recorded data.

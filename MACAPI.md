@@ -1,10 +1,13 @@
 # macOS process capture APIs
 
-Status: research and first implementation, 2026-08-30. The supported macOS target is Apple
-silicon (`aarch64-macos`); Intel macOS is deliberately out of scope. The host used for validation
-runs macOS 26.6.2 with the macOS 26.5 SDK. Flamez needs process lifetimes and self-CPU activity, not
-stack sampling: the Linux reference backend observes descendant fork/exec/final exit, captures exec
-metadata, and periodically snapshots cumulative CPU nanoseconds.
+This document owns the macOS API-specific rationale, contracts, limitations,
+validation evidence, and release gates. The cross-platform component layout,
+collector contract, runtime selection, and data flow live in
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+Status: research and first implementation, 2026-08-30. The supported macOS
+target is Apple silicon (`aarch64-macos`); Intel macOS is deliberately out of
+scope. The host used for validation runs macOS 26.6.2 with the macOS 26.5 SDK.
 
 ## Conclusion
 
@@ -15,52 +18,6 @@ unlike the older `es_new_client`, does not require root or Full Disk Access. It 
 restricted `com.apple.developer.endpoint-security.client` entitlement, must be code signed, and is
 introduced in macOS 27. It is not declared by the installed macOS 26.5 SDK and is absent from the
 macOS 26.6 runtime used for validation.
-
-Flamez now contains a forward-compatible exact path: immediately before spawning, it dynamically
-loads Endpoint Security, resolves `es_new_descendants_client`, creates the descendant client, and
-subscribes to fork/exec/exit. At root termination it uses the new `es_sync_client` queue barrier
-before the final poll. A macOS 27 runtime plus an entitled signature activates that path.
-Missing symbols, entitlement, or initialization permission select the kqueue/libproc fallback
-without making older binaries unloadable.
-
-The foundation implemented in this repository uses APIs available in the current stable SDK:
-
-- public `kqueue` `EVFILT_PROC` hints for `NOTE_FORK`, `NOTE_EXEC`, and `NOTE_EXIT`;
-- private `libproc` enumeration to turn a parent fork hint into child PIDs and recover live
-  descendants recursively, supplemented by a dedicated process-group scan for reparented survivors;
-- a dedicated worker that reacts to kqueue immediately and performs a recovery scan at least every
-  4 ms, independent of GUI frame delivery;
-- Darwin `posix_spawn` with `POSIX_SPAWN_START_SUSPENDED`, so the fallback registers the root before
-  any target code can create descendants;
-- private `proc_pid_rusage(..., RUSAGE_INFO_CURRENT, ...)` for cumulative per-process user plus
-  system CPU, converted from Mach absolute-time units to nanoseconds; and
-- private `libproc`/`KERN_PROCARGS2` inspection for name, argv, executable, and CWD.
-
-This backend works without entitlements or elevated privilege and is useful now. It is not fully
-equivalent to Linux eBPF: kqueue does not include the child PID in a fork event, its automatic
-descendant-tracking flags have been unsupported since macOS 10.5, and snapshots cannot recover a
-whole descendant branch that forks and exits between scans. The Endpoint Security path removes that
-gap when it can activate; `proc_pid_rusage` remains the CPU-accounting provider because ES events do
-not carry CPU usage.
-
-## Required observations
-
-| Flamez datum | Linux source | Best macOS source | Current macOS source |
-|---|---|---|---|
-| child PID and parent PID | `sched_process_fork` raw tracepoint | ES `NOTIFY_FORK` | ES when active; otherwise kqueue + `proc_listchildpids` |
-| exec identity | `sched_process_exec` | ES `NOTIFY_EXEC` | ES when active; otherwise kqueue + inspection |
-| final process exit | `sched_process_exit` with `group_dead` | ES `NOTIFY_EXIT` | ES when active; otherwise kqueue `NOTE_EXIT` |
-| event time | BPF monotonic kernel timestamp | `es_message_t.mach_time` | ES kernel time or fallback observation time |
-| loss detection | BPF reservation/map counter | `global_seq_num` gaps | ES gaps or explicit fallback failures |
-| executable | BPF exec filename | `es_event_exec_t.target->executable` | ES token or fallback `proc_pidpath` |
-| argv | BPF exec argument block | `es_exec_arg_count` / `es_exec_arg` | ES tokens or fallback `KERN_PROCARGS2` |
-| CWD at exec | procfs enrichment | `es_event_exec_t.cwd` | ES token or fallback vnode inspection |
-| cumulative self CPU | BPF scheduler accounting | `proc_pid_rusage` | `proc_pid_rusage` |
-| PID generation | live TGID map and event order | audit-token PID version | BSD start time + local generation |
-
-“Self CPU” means all threads in one process, excluding descendants. Both the current macOS backend
-and the ES design preserve that definition by summing `ri_user_time + ri_system_time` for each PID
-and converting the sum with the platform Mach timebase.
 
 ## 1. Endpoint Security
 
@@ -524,113 +481,7 @@ Audit can record selected exec activity but does not provide a low-latency, self
 fork/exec/exit plus CPU stream. It also depends on global audit configuration and is not scoped to
 one launched tree.
 
-## 6. Implemented foundation
-
-The first macOS backend is integrated through the existing OS-neutral collector contract:
-
-- `src/tracer/capture/macos.zig`
-  - attempts descendant-scoped Endpoint Security before every target spawn;
-  - permits tests to disable ES explicitly while production keeps automatic exact-first selection;
-  - supports a required mode that rejects launch rather than silently falling back;
-  - filters exact events with audit-token PID versions and kernel timestamps;
-  - switches runtime fidelity to `.exact` only after successful ES subscription;
-  - opens one kqueue;
-  - runs lifecycle discovery on a dedicated worker with a 4 ms recovery interval;
-  - registers root and discovered children for fork/exec/exit hints;
-  - recursively snapshots direct children on kqueue wakeup and timeout;
-  - scans the root's dedicated process group for live reparented survivors;
-  - scans immutable original-parent unique IDs after tracked fork hints;
-  - identifies PID generations by unique ID, start time, and kqueue `udata`;
-  - owns copied event metadata until the GUI thread drains normalized events;
-  - bounds pending lifecycle storage at 16 MiB and reports overflow as event loss;
-  - samples cumulative CPU totals; and
-  - records explicit collection failures in `lost_events`.
-- `src/macos_es_shim.c` / `.h`
-  - dynamically resolves the macOS 27 descendant client and all supporting ES/libbsm functions;
-  - copies fork/exec/exit tokens, complete argv, paths, Mach time, and PID versions in the callback;
-  - exposes an `es_sync_client` barrier for the root-exit boundary;
-  - counts `global_seq_num` gaps and allocation failures; and
-  - drains owned records synchronously into Zig without exposing Apple structure layouts there.
-- `src/macos_shim.c` / `.h`
-  - isolates private Darwin structures and constants;
-  - exposes suspended spawn/resume, process identity, CPU totals, executable, CWD, and raw procargs
-    through a small stable project-owned ABI.
-- `src/tracer/process_ops/macos.zig`
-  - spawns the target as a suspended process-group leader and resumes it after collector admission;
-  - parses `KERN_PROCARGS2`;
-  - supplies executable and CWD reads; and
-  - retains public libc wait/signal behavior.
-- `src/tracer/capture.zig` selects the runtime-switching `.macos` backend instead of the inert
-  backend.
-- `build.zig` compiles the shim only for macOS, passes the allocator into every collector, and
-  exposes `-Dmacos-require-endpoint-security=true` for fail-closed validation.
-- `macos.entitlements` is the minimal signing input for an Apple-approved ES client identity.
-
-The test suite contains no deliberate sleeps. Polling loops yield until a concrete condition and
-fail at a monotonic deadline. Targets that must stay inspectable stop themselves or wait behind
-signals; reparented fixture cleanup also waits until the PID disappears so no daemon retains the
-test runner's descriptors. The 32-child burst is signal-gated, and the parallel CPU fixture performs
-a fixed amount of work before its final sample.
-
-Collector tests exercise worker stop/restart, stale kqueue generations, immutable-parent recovery,
-double-fork non-adoption, and cumulative CPU sampling. A suspended-launch fixture proves that target
-code cannot execute before collector registration. Live Session fixtures cover same-PID root exec,
-the signal-gated 32-child burst, forced Stop followed immediately by a second launch, and 24
-immediate root exits. A surviving escaped child verifies its capture-clipped lifetime and CPU slices
-cannot extend past the root boundary. Fallback-specific fixtures disable ES explicitly, so they keep
-exercising recovery on entitled macOS 27 machines. A shebang fixture verifies interpreter identity,
-script argv, and empty arguments; `setsid()` fixtures cover both post-admission tracking and
-immutable `p_puniqueid` recovery. Synthetic ES tests cover root-fork suppression, descendant
-admission, event-time metadata, PID-version advancement at exec, and stale-exit rejection. Required
-mode either activates exact ES or returns `ExactCaptureUnavailable`; it never passes via fallback.
-
-The C bridge also exposes narrow helpers only when compiled with `FLAMEZ_TEST`. They construct an
-in-memory collector without creating an ES client and inject project-owned event fields through the
-same allocation, byte-budget, FIFO queue, poll, and global-sequence accounting used by live
-callbacks. Deterministic tests mutate every source slice after enqueue to prove the bridge owns its
-copy, verify FIFO delivery, force a byte-budget rejection with a tiny test limit, and check that
-message-version-4 sequence gaps contribute the exact loss count while older messages do not. The
-same test bridge also constructs SDK-native `es_message_t`, `es_process_t`, and `es_file_t` fixtures
-and sends version-4 fork, exec, and exit messages through the production `flamez_capture_message`
-extractor. It verifies audit-token PID versions, parentage, Mach timestamps, basename selection,
-complete argv including an empty argument, executable/CWD truncation flags, final CPU, owned
-lifetime after the native fixture returns, and a sequence gap across the three messages. The
-production executable is compiled without these symbols. This materially validates both field
-mapping and the exact-path control plane on macOS 26; receiving genuine kernel messages still
-requires the macOS 27 API and entitlement.
-
-The same harness replaces `es_sync_client` with a deterministic asynchronous marker. A test thread
-enters the production `flamez_macos_es_sync` waiter, while the harness copies the marker block and
-releases it from another thread only after explicit condition-variable handoff. The test proves the
-root-exit barrier does not return before marker completion and separately verifies that an ES
-rejection becomes a nonzero bridge result. This uses synchronization rather than sleeps or timing
-assumptions.
-
-## 7. Current parity and remaining gaps
-
-| Capability | macOS 27 + entitled ES | kqueue fallback |
-|---|---|---|
-| launch and render root lifetime | implemented | implemented |
-| recursively discover live descendants | exact event delivery | PPID, process-group, plus fork-hint unique-parent recovery |
-| direct pre-discovery `setsid()` child | exact event delivery | recovered by immutable original-parent unique ID |
-| pre-discovery double-fork daemon after intermediate vanishes | exact event delivery | deliberately not adopted; no verifiable identity chain remains |
-| fork/exec/exit bars | kernel event timestamps | observation-time timestamps |
-| argv/executable/CWD | exact exec payload | identity-bracketed, best-effort inspection |
-| cumulative self CPU slices | `proc_pid_rusage` | `proc_pid_rusage` |
-| final natural-exit CPU | callback read; partial if already reaped | worker read; partial if already reaped |
-| PID reuse protection | audit-token PID version | unique ID + start time + kqueue generation |
-| measurable event loss | ES global sequence gaps + allocation failures | explicit local failures only |
-| short-lived branches | observable | no completeness guarantee; no duration floor in tests |
-| root spawn race | client armed before spawn; root starts suspended | root starts suspended until kqueue registration |
-| root-exit drain | `es_sync_client`, final poll, boundary CPU sample | final worker pass, queue drain, boundary CPU sample |
-| privileges | entitlement; no root/TCC | none |
-
-The shared collector contract exposes `.exact`, `.snapshot_recovery`, or `.unavailable` fidelity.
-Session records the runtime selection after `armLaunch`; the footer displays `CAPTURE · BEST EFFORT`
-only for fallback launches, independently of explicit dropped-event accounting. A future session
-export should retain that field.
-
-## 8. Completion audit and external validation gates
+## 6. Completion audit and external validation gates
 
 The in-repository implementation has evidence for every Linux-facing collector responsibility:
 
@@ -647,6 +498,32 @@ The in-repository implementation has evidence for every Linux-facing collector r
 | exact root-exit drain | condition-gated asynchronous `es_sync_client` fixture | verified synthetically |
 | genuine descendant-scoped kernel delivery | requires macOS 27 and an Apple-approved restricted entitlement | not verifiable on this host |
 
+### In-repository validation details
+
+Fallback collector tests cover worker restart, stale kqueue generations,
+immutable-parent recovery, deliberate double-fork non-adoption, queue overflow,
+bounded libproc list growth, and cumulative CPU sampling. Live Session fixtures
+cover suspended root admission, same-PID root exec, a signal-gated 32-child
+burst, immediate exits, restart after forced Stop, shebang metadata including an
+empty argument, and both admitted and pre-discovery `setsid()` children.
+Fallback-specific fixtures disable Endpoint Security explicitly so an entitled
+macOS 27 host cannot silently stop exercising snapshot recovery.
+
+The Endpoint Security bridge exposes test-only helpers under `FLAMEZ_TEST`.
+They enqueue project-owned event fields through the production allocation,
+byte-budget, FIFO, polling, and sequence-gap paths without creating an ES
+client. SDK-native `es_message_t`, `es_process_t`, and `es_file_t` fixtures also
+traverse the production fork/exec/exit extractor. These tests verify audit-token
+versions, parentage, complete argv, path truncation, Mach timestamps, final CPU,
+deep-copy ownership, and exact loss accounting; the helpers are absent from the
+application build.
+
+A separate condition-gated harness replaces `es_sync_client` with an
+asynchronous marker. It proves the production root-exit waiter does not return
+before the marker completes and propagates marker rejection. This validates the
+barrier control path without assuming callback timing or requiring the
+restricted entitlement.
+
 The validation host is arm64 macOS 26.6.2 with the macOS 26.5 SDK. A direct dynamic-symbol probe
 finds stable `es_sync_client` but not `es_new_descendants_client`, matching Apple's macOS 27
 availability declaration. The entitlement cannot manufacture that missing runtime API, and the
@@ -654,7 +531,7 @@ restricted entitlement itself must be granted by Apple. Consequently no addition
 change can prove genuine exact delivery on this machine.
 
 The remaining work requires the released OS, released SDK, and an entitled signing identity. The
-release-day procedure and the exact repository changes to make are specified in section 9.
+release-day procedure and the exact repository changes to make are specified in section 7.
 
 Synthetic coverage already verifies that a generation-authenticated exec survives unavailable
 inspection without retaining inherited argv/executable metadata. Scripts/interpreters,
@@ -665,7 +542,7 @@ an unseen intermediate vanishes have live fallback coverage. Planned session exp
 The private inspection calls are intentionally behind one shim and are replaceable field by field.
 The shared `Session`, process tree, CPU-slice model, teardown, and UI require no ES-specific changes.
 
-## 9. macOS 27 GA pickup plan
+## 7. macOS 27 GA pickup plan
 
 This section is the release-day runbook. Do not change the audit row above to “verified live” merely
 because macOS reports version 27 or an SDK compiles the project. Genuine exact capture is accepted
@@ -682,7 +559,7 @@ The permanent product choices remain:
 - Do not replace the descendant client with system-wide `es_new_client` unless Apple removes or
   materially weakens `es_new_descendants_client` at GA.
 
-### 9.1 Release gates
+### 7.1 Release gates
 
 All of these must be true before starting the GA patch:
 
@@ -711,7 +588,7 @@ The expected architecture is `arm64`, and both the runtime and SDK must report 2
 the full macOS build number and Xcode build number in the validation record because ES behavior can
 change in servicing releases without changing the major version.
 
-### 9.2 Update the pinned SDK before evaluating the ABI
+### 7.2 Update the pinned SDK before evaluating the ABI
 
 `build.zig` gets Apple framework headers and stubs from the lazy `xcode_frameworks` dependency, not
 from the SDK printed by `xcrun`. Therefore installing Xcode 27 is not sufficient. Replace the
@@ -778,7 +655,7 @@ typedef es_new_client_result_t (*flamez_new_descendants_client_fn)(
 This is a source-level cleanup, not permission to call the symbol directly. The runtime lookup and
 null check remain necessary for the macOS 26 fallback.
 
-### 9.3 Sign and inspect the exact executable
+### 7.3 Sign and inspect the exact executable
 
 Keep `macos.entitlements` minimal unless Apple's released documentation requires another key. Do
 not add Full Disk Access, debugger, disable-library-validation, or root-only packaging as a
@@ -806,7 +683,7 @@ Notarization and distribution packaging are separate release gates. They should 
 local exact delivery works so a packaging failure is not confused with an ES ABI or event-delivery
 failure.
 
-### 9.4 Add a production-mode live validator
+### 7.4 Add a production-mode live validator
 
 The `FLAMEZ_TEST` bridge proves extraction and queue semantics but intentionally cannot prove kernel
 delivery. For repeatable GA evidence, add a small installed `macos-es-live-test` executable and Zig
@@ -847,7 +724,7 @@ for readiness synchronization. Keep the existing fallback fixtures explicitly se
 `.endpoint_security = .disabled`; they must continue to exercise kqueue recovery on an entitled
 macOS 27 machine.
 
-### 9.5 Positive and negative live checks
+### 7.5 Positive and negative live checks
 
 Run the signed validator and application in required mode first. Acceptance requires all of the
 following:
@@ -876,7 +753,7 @@ Run the existing suites after the live validator:
 git diff --check
 ```
 
-### 9.6 Manual checks that must not become sleep-based tests
+### 7.6 Manual checks that must not become sleep-based tests
 
 Two remaining checks are intentionally manual because automating them would be disruptive or would
 weaken the assertion:
@@ -891,7 +768,7 @@ weaken the assertion:
 Do not add a fixed delay to make either check pass. Record the exact setup and result separately from
 the automated suite.
 
-### 9.7 Failure triage
+### 7.7 Failure triage
 
 | Symptom or diagnostic | First checks |
 |---|---|
@@ -905,7 +782,7 @@ the automated suite.
 | events missing without gaps | audit root admission, `(pid, pidversion)` transitions, scope filtering, final synchronization, and fixture signaling |
 | metadata differs | check the GA message version and truncation fields before considering a `libproc` fallback |
 
-### 9.8 Evidence and completion record
+### 7.8 Evidence and completion record
 
 Attach this matrix to the commit or release issue that enables live exact capture:
 
@@ -923,7 +800,7 @@ Attach this matrix to the commit or release issue that enables live exact captur
 | manual validation | set-ID and suspend/resume results |
 | event integrity | controlled-run loss count and short-double-fork result |
 
-Only after every acceptance item passes should section 8 change genuine kernel delivery from “not
+Only after every acceptance item passes should section 6 change genuine kernel delivery from “not
 verifiable” to “verified live,” the document status move from research/first implementation to
 validated macOS 27 support, and release notes claim Linux-equivalent lifecycle completeness. Keep
 the fallback limitation language: snapshot recovery remains best effort even when the same binary
