@@ -25,6 +25,8 @@ pub const cpu_sample_period_ns = Session.cpu_sample_period_ns;
 pub const Collector = capture.Collector;
 /// Compile-time capture backend selected for the target operating system.
 pub const capture_backend = capture.backend;
+/// Lifecycle fidelity shown before the collector arms its first launch.
+pub const default_capture_fidelity = capture.default_fidelity;
 
 pub const installFatalSignalHandlers = signals.installFatalSignalHandlers;
 

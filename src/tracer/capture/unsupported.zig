@@ -16,7 +16,7 @@ pub const Collector = struct {
     diagnostic_len: usize = 0,
 
     /// Records that this target has no capture implementation.
-    pub fn init() Collector {
+    pub fn init(_: std.mem.Allocator) Collector {
         var self = Collector{};
         const message = std.fmt.bufPrint(
             &self.diagnostic_buffer,
@@ -45,6 +45,11 @@ pub const Collector = struct {
         return self.diagnostic_buffer[0..self.diagnostic_len];
     }
 
+    /// No lifecycle guarantee exists without a collector implementation.
+    pub fn fidelity(_: *const Collector) capture.Fidelity {
+        return .unavailable;
+    }
+
     /// Preserves the common collector contract without arming a launch.
     pub fn armLaunch(
         _: *Collector,
@@ -62,6 +67,9 @@ pub const Collector = struct {
 
     /// Produces no lifecycle events.
     pub fn pollEvents(_: *Collector, _: capture.Sink) void {}
+
+    /// Produces no final lifecycle events.
+    pub fn flushEvents(_: *Collector, _: capture.Sink) void {}
 
     /// Produces no CPU samples.
     pub fn snapshotCpu(_: *Collector, _: capture.Sink) void {}

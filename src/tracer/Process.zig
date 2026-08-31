@@ -24,6 +24,8 @@ origin: Origin = .observed,
 end_kind: EndKind = .open,
 /// Cumulative on-CPU time for every thread in this process, excluding descendants.
 cpu_time_ns: u64 = 0,
+/// True only when a natural-exit observation supplied the final cumulative total.
+cpu_final: bool = false,
 cpu_snapshot_at_ns: u64 = 0,
 cpu_snapshot_initialized: bool = false,
 /// Peak average-core occupancy across retained slices; maintained while recording.
@@ -64,6 +66,7 @@ pub const MetadataSource = enum {
     launch,
     kernel,
     procfs,
+    process_inspection,
 };
 
 /// How a process record was created. Recovered rows keep a visible tree, but
@@ -119,6 +122,28 @@ pub const Named = struct {
         if (trimmed.len == 0) return .{ .text = "process", .kind = .other };
         return .{ .text = trimmed, .kind = .other };
     }
+};
+
+pub const ArgIter = struct {
+    bytes: []const u8,
+    remaining: usize,
+    pos: usize = 0,
+
+    pub fn next(self: *ArgIter) ?[]const u8 {
+        if (self.remaining == 0) return null;
+        const start = self.pos;
+        while (self.pos < self.bytes.len and self.bytes[self.pos] != 0) self.pos += 1;
+        const slice = self.bytes[start..self.pos];
+        if (self.pos < self.bytes.len) self.pos += 1;
+        self.remaining -= 1;
+        return slice;
+    }
+};
+
+const StoredPath = struct {
+    offset: usize,
+    len: u16,
+    truncated: bool,
 };
 
 /// Releases CPU activity storage owned by this process and invalidates it.
@@ -250,22 +275,6 @@ fn cpuBand(cpu_ns: u64, duration_ns: u64) u8 {
     const band = (numerator + duration_ns - 1) / duration_ns;
     return @intCast(@min(band, 64));
 }
-
-pub const ArgIter = struct {
-    bytes: []const u8,
-    remaining: usize,
-    pos: usize = 0,
-
-    pub fn next(self: *ArgIter) ?[]const u8 {
-        if (self.remaining == 0) return null;
-        const start = self.pos;
-        while (self.pos < self.bytes.len and self.bytes[self.pos] != 0) self.pos += 1;
-        const slice = self.bytes[start..self.pos];
-        if (self.pos < self.bytes.len) self.pos += 1;
-        self.remaining -= 1;
-        return slice;
-    }
-};
 
 /// Returns the process-owned display-name bytes.
 pub fn nameSlice(self: *const Process) []const u8 {
@@ -477,6 +486,16 @@ pub fn setArgsFromCmdline(
     try self.setArgs(store, gpa, raw, .procfs);
 }
 
+/// Copies a NUL-separated argument list obtained from a platform process-inspection API.
+pub fn setArgsFromProcessInspection(
+    self: *Process,
+    store: *MetadataStore,
+    gpa: Allocator,
+    raw: []const u8,
+) Allocator.Error!void {
+    try self.setArgs(store, gpa, raw, .process_inspection);
+}
+
 /// Copies argv captured synchronously by the exec tracepoint.
 pub fn setArgsFromKernel(
     self: *Process,
@@ -514,12 +533,6 @@ pub fn setArgsFromArgv(
     self.revision +%= 1;
 }
 
-const StoredPath = struct {
-    offset: usize,
-    len: u16,
-    truncated: bool,
-};
-
 fn storePath(
     store: *MetadataStore,
     gpa: Allocator,
@@ -529,7 +542,11 @@ fn storePath(
     const n = @min(trimmed.len, max_path_len);
     const offset = store.items.len;
     try store.appendSlice(gpa, trimmed[0..n]);
-    return .{ .offset = offset, .len = @intCast(n), .truncated = trimmed.len >= max_path_len };
+    return .{
+        .offset = offset,
+        .len = @intCast(n),
+        .truncated = trimmed.len >= max_path_len,
+    };
 }
 
 fn pathUnchanged(current: []const u8, value: []const u8, truncated: bool) bool {
@@ -553,6 +570,26 @@ pub fn setExe(
     self.exe_len = stored.len;
     self.exe_truncated = stored.truncated;
     self.exe_source = .procfs;
+    self.revision +%= 1;
+}
+
+/// Stores a bounded executable path obtained from a platform process-inspection API.
+pub fn setExeFromProcessInspection(
+    self: *Process,
+    store: *MetadataStore,
+    gpa: Allocator,
+    value: []const u8,
+) Allocator.Error!void {
+    if (pathUnchanged(self.exeSlice(store.items), value, self.exe_truncated) and
+        self.exe_source == .process_inspection)
+    {
+        return;
+    }
+    const stored = try storePath(store, gpa, value);
+    self.exe_offset = stored.offset;
+    self.exe_len = stored.len;
+    self.exe_truncated = stored.truncated;
+    self.exe_source = .process_inspection;
     self.revision +%= 1;
 }
 
@@ -592,6 +629,49 @@ pub fn setCwd(
     self.cwd_len = stored.len;
     self.cwd_truncated = stored.truncated;
     self.cwd_source = .procfs;
+    self.revision +%= 1;
+}
+
+/// Stores a bounded working directory obtained from a platform process-inspection API.
+pub fn setCwdFromProcessInspection(
+    self: *Process,
+    store: *MetadataStore,
+    gpa: Allocator,
+    value: []const u8,
+) Allocator.Error!void {
+    if (pathUnchanged(self.cwdSlice(store.items), value, self.cwd_truncated) and
+        self.cwd_source == .process_inspection)
+    {
+        return;
+    }
+    const stored = try storePath(store, gpa, value);
+    self.cwd_offset = stored.offset;
+    self.cwd_len = stored.len;
+    self.cwd_truncated = stored.truncated;
+    self.cwd_source = .process_inspection;
+    self.revision +%= 1;
+}
+
+/// Stores a working directory captured with a kernel exec event.
+pub fn setCwdFromKernel(
+    self: *Process,
+    store: *MetadataStore,
+    gpa: Allocator,
+    value: []const u8,
+    truncated: bool,
+) Allocator.Error!void {
+    const will_truncate = truncated or
+        std.mem.trim(u8, value, " \t\r\n").len >= max_path_len;
+    if (pathUnchanged(self.cwdSlice(store.items), value, will_truncate) and
+        self.cwd_source == .kernel)
+    {
+        return;
+    }
+    const stored = try storePath(store, gpa, value);
+    self.cwd_offset = stored.offset;
+    self.cwd_len = stored.len;
+    self.cwd_truncated = truncated or stored.truncated;
+    self.cwd_source = .kernel;
     self.revision +%= 1;
 }
 
@@ -815,7 +895,11 @@ test "fork inheritance survives exec metadata replacement" {
     var metadata = MetadataStore.empty;
     defer metadata.deinit(std.testing.allocator);
     var parent = Process{ .pid = 1 };
-    try parent.setArgsFromArgv(&metadata, std.testing.allocator, &.{ "sh", "-c", "true" });
+    try parent.setArgsFromArgv(&metadata, std.testing.allocator, &.{
+        "sh",
+        "-c",
+        "true",
+    });
     try parent.setExe(&metadata, std.testing.allocator, "/usr/bin/sh");
     try parent.setCwd(&metadata, std.testing.allocator, "/tmp/build");
     const inherited_store_len = metadata.items.len;
@@ -869,7 +953,12 @@ test "argv storage preserves empty arguments" {
     defer metadata.deinit(gpa);
     var process = Process{ .pid = 1 };
 
-    try process.setArgsFromArgv(&metadata, gpa, &.{ "tool", "", "value", "" });
+    try process.setArgsFromArgv(&metadata, gpa, &.{
+        "tool",
+        "",
+        "value",
+        "",
+    });
 
     var args = process.argsIter(metadata.items);
     try testing.expectEqualStrings("tool", args.next().?);
@@ -905,10 +994,30 @@ test "identical CWD and exe paths reuse the stored offset" {
 
 test "first visible slice is the lower bound on end time" {
     const slices = [_]CpuSlice{
-        .{ .start_ns = 0, .end_ns = 10, .cpu_ns = 1, .band = 1 },
-        .{ .start_ns = 10, .end_ns = 20, .cpu_ns = 1, .band = 1 },
-        .{ .start_ns = 20, .end_ns = 30, .cpu_ns = 1, .band = 1 },
-        .{ .start_ns = 40, .end_ns = 50, .cpu_ns = 1, .band = 1 },
+        .{
+            .start_ns = 0,
+            .end_ns = 10,
+            .cpu_ns = 1,
+            .band = 1,
+        },
+        .{
+            .start_ns = 10,
+            .end_ns = 20,
+            .cpu_ns = 1,
+            .band = 1,
+        },
+        .{
+            .start_ns = 20,
+            .end_ns = 30,
+            .cpu_ns = 1,
+            .band = 1,
+        },
+        .{
+            .start_ns = 40,
+            .end_ns = 50,
+            .cpu_ns = 1,
+            .band = 1,
+        },
     };
     try std.testing.expectEqual(@as(usize, 1), firstVisibleSlice(&slices, 10, 25));
     try std.testing.expectEqual(@as(usize, 2), firstVisibleSlice(&slices, 20, 45));
@@ -948,7 +1057,11 @@ test "arg summary extracts rustc crate and compiler sources" {
     try rustc.setArgsFromArgv(
         &metadata,
         std.testing.allocator,
-        &.{ "rustc", "--crate-name=anyhow", "src/lib.rs" },
+        &.{
+            "rustc",
+            "--crate-name=anyhow",
+            "src/lib.rs",
+        },
     );
     try std.testing.expectEqualStrings("anyhow", rustc.argSummary(metadata.items, &buf));
 
@@ -957,7 +1070,13 @@ test "arg summary extracts rustc crate and compiler sources" {
     try clang.setArgsFromArgv(
         &metadata,
         std.testing.allocator,
-        &.{ "cc1plus", "-quiet", "-o", "/tmp/foo.s", "/src/engine.cpp" },
+        &.{
+            "cc1plus",
+            "-quiet",
+            "-o",
+            "/tmp/foo.s",
+            "/src/engine.cpp",
+        },
     );
     try std.testing.expectEqualStrings("engine.cpp", clang.argSummary(metadata.items, &buf));
 
@@ -966,7 +1085,13 @@ test "arg summary extracts rustc crate and compiler sources" {
     try cargo.setArgsFromArgv(
         &metadata,
         std.testing.allocator,
-        &.{ "cargo", "build", "--release", "-p", "serde" },
+        &.{
+            "cargo",
+            "build",
+            "--release",
+            "-p",
+            "serde",
+        },
     );
     try std.testing.expectEqualStrings("build serde", cargo.argSummary(metadata.items, &buf));
 
@@ -975,7 +1100,13 @@ test "arg summary extracts rustc crate and compiler sources" {
     try ld.setArgsFromArgv(
         &metadata,
         std.testing.allocator,
-        &.{ "collect2", "-o", "/build/bin/llama", "a.o", "b.o" },
+        &.{
+            "collect2",
+            "-o",
+            "/build/bin/llama",
+            "a.o",
+            "b.o",
+        },
     );
     try std.testing.expectEqualStrings("llama", ld.argSummary(metadata.items, &buf));
 }

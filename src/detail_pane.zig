@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.detail_pane);
 
 const clay = @import("zclay");
 const rl = @import("raylib");
@@ -430,7 +431,12 @@ pub fn renderTooltip(
     if (y + box_h + 8 > screen_h) y = @max(8, screen_h - box_h - 8);
     const tooltip = rl.Rectangle.init(x, y, box_w, box_h);
     const roundness = rectangleRoundness(
-        .{ .x = x, .y = y, .width = box_w, .height = box_h },
+        .{
+            .x = x,
+            .y = y,
+            .width = box_w,
+            .height = box_h,
+        },
         tooltip_corner_radius,
     );
     rl.drawRectangleRounded(tooltip, roundness, 4, toRaylibColor(panel_raised));
@@ -723,7 +729,12 @@ pub fn render(
     rl.drawRectangleRec(
         .init(box.x, box.y - 1, box.width, 2),
         toRaylibColor(if (app.detail_resize_dragging or over_resize_handle)
-            .{ 92, 151, 255, 255 }
+            .{
+                92,
+                151,
+                255,
+                255,
+            }
         else
             border),
     );
@@ -961,14 +972,34 @@ pub fn render(
             .init(track.x, track.y, track.width, track.height),
             0.5,
             4,
-            toRaylibColor(.{ 12, 18, 32, 255 }),
+            toRaylibColor(.{
+                12,
+                18,
+                32,
+                255,
+            }),
         );
         const thumb_color: clay.Color = if (app.detail_dragging)
-            .{ 92, 151, 255, 255 }
+            .{
+                92,
+                151,
+                255,
+                255,
+            }
         else if (over_track)
-            .{ 86, 110, 145, 255 }
+            .{
+                86,
+                110,
+                145,
+                255,
+            }
         else
-            .{ 61, 80, 110, 255 };
+            .{
+                61,
+                80,
+                110,
+                255,
+            };
         const thumb_y = track.y + thumbOffset(thumb_travel, max_scroll, app.detail_scroll_px);
         rl.drawRectangleRounded(
             .init(track.x, thumb_y, track.width, thumb_height),

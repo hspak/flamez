@@ -3,6 +3,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
+const log = std.log.scoped(.layout);
+
 const clay = @import("zclay");
 const rl = @import("raylib");
 const App = @import("App.zig");
@@ -93,7 +95,11 @@ pub fn makeViewText(session: *const tracer.Session) ViewText {
     ) catch "0";
     view_text.active_count_len = active_count.len;
     if (session.lost_events > 0) {
-        const dropped = std.fmt.bufPrint(&view_text.dropped, "{d}", .{session.lost_events}) catch "1";
+        const dropped = std.fmt.bufPrint(
+            &view_text.dropped,
+            "{d}",
+            .{session.lost_events},
+        ) catch "1";
         view_text.dropped_len = dropped.len;
     }
     return view_text;
@@ -168,16 +174,11 @@ pub fn create(
                 .letter_spacing = 1,
             });
             if (comptime build_options.fps_counter) {
-                clay.UI()(.{ .layout = .{
-                    .sizing = .{ .w = .fixed(54), .h = .fit },
-                    .child_alignment = .{ .x = .left, .y = .center },
-                } })({
-                    clay.text(view_text.fpsSlice(), .{
-                        .font_id = footer_font_id,
-                        .font_size = 12,
-                        .color = theme.fps_green,
-                        .wrap_mode = .none,
-                    });
+                clay.text(view_text.fpsSlice(), .{
+                    .font_id = footer_font_id,
+                    .font_size = 12,
+                    .color = theme.fps_green,
+                    .wrap_mode = .none,
                 });
             }
             clay.UI()(.{
@@ -202,6 +203,9 @@ pub fn create(
             stat("PROCESSES", view_text.processCount(), theme.blue);
             stat("ACTIVE", view_text.activeCount(), theme.danger);
             stat("", view_text.statusSlice(), theme.muted);
+            if (session.capture_fidelity == .snapshot_recovery) {
+                stat("CAPTURE", "BEST EFFORT", theme.yellow);
+            }
             if (view_text.dropped_len > 0) stat("DROPPED", view_text.droppedSlice(), theme.danger);
             if (session.running) {
                 clay.UI()(.{
@@ -210,7 +214,12 @@ pub fn create(
                         .sizing = .{ .w = .fixed(54), .h = .fixed(22) },
                         .child_alignment = .center,
                     },
-                    .background_color = if (clay.hovered()) .{ 255, 132, 145, 255 } else theme.danger,
+                    .background_color = if (clay.hovered()) .{
+                        255,
+                        132,
+                        145,
+                        255,
+                    } else theme.danger,
                     .corner_radius = .all(5),
                 })({
                     clay.text("STOP", .{
@@ -227,15 +236,58 @@ pub fn create(
 }
 
 fn stat(label: []const u8, value: []const u8, value_color: clay.Color) void {
-    clay.UI()(.{ .layout = .{ .child_gap = 4, .child_alignment = .{ .x = .left, .y = .center } } })({
-        clay.text(label, .{ .font_id = footer_font_id, .font_size = 12, .color = theme.muted, .wrap_mode = .none, .letter_spacing = 1 });
-        clay.text(value, .{ .font_id = footer_font_id, .font_size = 12, .color = value_color, .wrap_mode = .none });
+    clay.UI()(.{
+        .layout = .{
+            .child_gap = 4,
+            .child_alignment = .{ .x = .left, .y = .center },
+        },
+    })({
+        clay.text(label, .{
+            .font_id = footer_font_id,
+            .font_size = 12,
+            .color = theme.muted,
+            .wrap_mode = .none,
+            .letter_spacing = 1,
+        });
+        clay.text(value, .{
+            .font_id = footer_font_id,
+            .font_size = 12,
+            .color = value_color,
+            .wrap_mode = .none,
+        });
     });
 }
 
 fn legendItem(label: []const u8, color: clay.Color) void {
-    clay.UI()(.{ .layout = .{ .child_gap = 5, .child_alignment = .{ .x = .left, .y = .center } } })({
-        clay.UI()(.{ .layout = .{ .sizing = .{ .w = .fixed(10), .h = .fixed(10) } }, .background_color = color })({});
-        clay.text(label, .{ .font_id = footer_font_id, .font_size = 12, .color = theme.muted, .wrap_mode = .none });
+    clay.UI()(.{
+        .layout = .{
+            .child_gap = 5,
+            .child_alignment = .{ .x = .left, .y = .center },
+        },
+    })({
+        clay.UI()(.{
+            .layout = .{ .sizing = .{ .w = .fixed(10), .h = .fixed(10) } },
+            .background_color = color,
+        })({});
+        clay.text(label, .{
+            .font_id = footer_font_id,
+            .font_size = 12,
+            .color = theme.muted,
+            .wrap_mode = .none,
+        });
     });
+}
+
+test "FPS counter build option controls footer text" {
+    const testing = std.testing;
+
+    var session = tracer.Session.init(testing.allocator, testing.io);
+    defer session.deinit();
+    const view_text = makeViewText(&session);
+    if (comptime build_options.fps_counter) {
+        try testing.expect(std.mem.endsWith(u8, view_text.fpsSlice(), " FPS"));
+        try testing.expect(view_text.fps_len > " FPS".len);
+    } else {
+        try testing.expectEqual(@as(usize, 0), view_text.fps_len);
+    }
 }

@@ -62,7 +62,11 @@ pub const TooltipBuilder = struct {
             return;
         }
         const stored = self.intern(value) orelse return;
-        self.lines[self.line_count] = .{ .text = stored, .size = size, .color = color };
+        self.lines[self.line_count] = .{
+            .text = stored,
+            .size = size,
+            .color = color,
+        };
         self.line_count += 1;
     }
 
@@ -78,7 +82,11 @@ pub const TooltipBuilder = struct {
             return;
         }
         const stored = self.internFmt(fmt, args) orelse return;
-        self.lines[self.line_count] = .{ .text = stored, .size = size, .color = color };
+        self.lines[self.line_count] = .{
+            .text = stored,
+            .size = size,
+            .color = color,
+        };
         self.line_count += 1;
     }
 
@@ -183,9 +191,9 @@ fn addArguments(
     const remaining = tip.store[tip.store_len..];
     const arguments = if (formatArguments(process, metadata, arg_count, remaining)) |full|
         full
-    else blk: {
+    else partial_arguments: {
         tip.overflowed = true;
-        break :blk formatArgumentsPrefix(process, metadata, arg_count, remaining);
+        break :partial_arguments formatArgumentsPrefix(process, metadata, arg_count, remaining);
     };
     if (arguments.len == 0) {
         tip.overflowed = true;
@@ -273,7 +281,8 @@ pub fn formatTimingLine(
         "unknown"
     else
         text.formatDuration(process.durationNs(now_ns), &duration_buf);
-    const cpu_partial = process.end_kind == .capture_clipped;
+    const cpu_partial = process.end_kind == .capture_clipped or
+        (process.end_kind == .observed_exit and !process.cpu_final);
     const cpu = text.formatDuration(process.cpu_time_ns, &cpu_buf);
     const average_cores = if (process.durationNs(now_ns) == 0 or inferred_start)
         0
@@ -284,10 +293,10 @@ pub fn formatTimingLine(
         "inferred"
     else
         text.formatDuration(process.start_ns, &start_buf);
-    const end = if (process.end_kind == .capture_clipped) blk: {
+    const end = if (process.end_kind == .capture_clipped) capture_edge: {
         var edge_buf: [32]u8 = undefined;
         const at = process.end_ns orelse now_ns;
-        break :blk std.fmt.bufPrint(&end_buf, "{s} (edge)", .{
+        break :capture_edge std.fmt.bufPrint(&end_buf, "{s} (edge)", .{
             text.formatDuration(at, &edge_buf),
         }) catch "capture edge";
     } else if (process.end_ns) |at|
@@ -298,7 +307,14 @@ pub fn formatTimingLine(
     return std.fmt.bufPrint(
         buffer,
         "START  {s}  ·  END  {s}  ·  WALL  {s}  ·  {s}  {s}  ·  AVG  {d:.2} CORES",
-        .{ start, end, duration, cpu_label, cpu, average_cores },
+        .{
+            start,
+            end,
+            duration,
+            cpu_label,
+            cpu,
+            average_cores,
+        },
     ) catch "START  —  ·  END  —  ·  WALL  —  ·  CPU  —";
 }
 
@@ -316,7 +332,11 @@ pub fn buildProcessInfo(
     if (process.parent_pid) |ppid| {
         tip.addFmt(
             "PID  {d}  ·  PPID  {d}  ·  DEPTH  {d}",
-            .{ process.pid, ppid, process.depth },
+            .{
+                process.pid,
+                ppid,
+                process.depth,
+            },
             sizes.body,
             toRaylibColor(muted),
         );
@@ -431,13 +451,32 @@ test "timing line reports self CPU and average cores" {
     try std.testing.expect(std.mem.indexOf(u8, line, "AVG  2.50 CORES") != null);
 }
 
+test "timing line labels an unavailable final CPU total as partial" {
+    var process = tracer.Process{ .pid = 7, .start_ns = 0 };
+    process.end_ns = 2 * std.time.ns_per_s;
+    process.end_kind = .observed_exit;
+    process.cpu_time_ns = std.time.ns_per_s;
+    var buffer: [192]u8 = undefined;
+
+    const partial = formatTimingLine(&process, process.end_ns.?, &buffer);
+    try std.testing.expect(std.mem.indexOf(u8, partial, "CPU~  1.00 s") != null);
+
+    process.cpu_final = true;
+    const final = formatTimingLine(&process, process.end_ns.?, &buffer);
+    try std.testing.expect(std.mem.indexOf(u8, final, "CPU  1.00 s") != null);
+}
+
 test "argument prefix fills available storage without requiring the full argv" {
     const testing = std.testing;
     const gpa = testing.allocator;
     var metadata = tracer.Process.MetadataStore.empty;
     defer metadata.deinit(gpa);
     var process = tracer.Process{ .pid = 7 };
-    try process.setArgsFromArgv(&metadata, gpa, &.{ "clang", "-c", "source file.c" });
+    try process.setArgsFromArgv(&metadata, gpa, &.{
+        "clang",
+        "-c",
+        "source file.c",
+    });
     var buffer: [24]u8 = undefined;
 
     const row = formatArgumentsPrefix(&process, metadata.items, 2, &buffer);
@@ -451,7 +490,11 @@ test "argument row joins argv with spaces" {
     var metadata = tracer.Process.MetadataStore.empty;
     defer metadata.deinit(gpa);
     var process = tracer.Process{ .pid = 7 };
-    try process.setArgsFromArgv(&metadata, gpa, &.{ "clang", "-c", "source file.c" });
+    try process.setArgsFromArgv(&metadata, gpa, &.{
+        "clang",
+        "-c",
+        "source file.c",
+    });
     var buffer: [128]u8 = undefined;
 
     const row = formatArguments(&process, metadata.items, 2, &buffer).?;

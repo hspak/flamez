@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.process_tree);
 
 const App = @import("App.zig");
 const perf = @import("perf.zig");
@@ -251,7 +252,11 @@ fn appendSubtree(
         var subrow: u16 = 0;
         while (subrow < height) : (subrow += 1) {
             app.row_order.appendAssumeCapacity(.{
-                .slot = .{ .parent = index, .lane = lane, .subrow = subrow },
+                .slot = .{
+                    .parent = index,
+                    .lane = lane,
+                    .subrow = subrow,
+                },
             });
         }
     }
@@ -434,7 +439,7 @@ fn layoutJobLanes(
             siftUpLane(app.free_lanes_scratch.items, app.free_lanes_scratch.items.len - 1);
         }
 
-        const lane: u16 = if (app.free_lanes_scratch.items.len > 0) blk: {
+        const lane: u16 = if (app.free_lanes_scratch.items.len > 0) reused_lane: {
             const id = app.free_lanes_scratch.items[0];
             const last = app.free_lanes_scratch.items[app.free_lanes_scratch.items.len - 1];
             app.free_lanes_scratch.items.len -= 1;
@@ -442,12 +447,12 @@ fn layoutJobLanes(
                 app.free_lanes_scratch.items[0] = last;
                 siftDownLane(app.free_lanes_scratch.items, 0);
             }
-            break :blk id;
-        } else blk: {
+            break :reused_lane id;
+        } else new_lane: {
             const id = next_lane;
             next_lane += 1;
             app.heights_scratch.appendAssumeCapacity(0);
-            break :blk id;
+            break :new_lane id;
         };
         if (lane < app.heights_scratch.items.len and
             job.height > app.heights_scratch.items[lane])

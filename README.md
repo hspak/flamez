@@ -69,9 +69,38 @@ the cross-built tests with:
 zig build test-compile -Dtarget=aarch64-macos
 ```
 
-The macOS presentation and shared tracer layers compile, but live capture is
-not implemented yet; launching that build reports the unsupported collector
-before opening a window.
+Apple-silicon macOS (`aarch64-macos`) now has a best-effort live collector using
+a dedicated kqueue worker, 4 ms recursive libproc recovery scans,
+target-process-group recovery, fork-triggered immutable-parent identity scans,
+and cumulative per-process CPU accounting. Its pending lifecycle queue has a
+16 MiB budget and reports overflow as dropped capture data. It requires no
+special entitlement and retains copied metadata for children that exit before
+the next GUI frame.
+Targets start suspended and resume only after the root kqueue filter is
+registered, eliminating the initial spawn race. A whole later branch shorter
+than one worker scan can still be missed;
+[MACAPI.md](MACAPI.md) documents that limitation. On macOS 27, Flamez dynamically
+prefers the exact descendant-scoped Endpoint Security backend when its signed
+binary has Apple's restricted client entitlement; older or unsigned builds fall
+back automatically. The footer labels only the fallback `CAPTURE · BEST EFFORT`,
+even when no explicit local failure was counted. When the root exits, the exact
+path uses an Endpoint Security queue barrier and the fallback joins its worker
+before Flamez performs one final CPU snapshot and closes surviving descendants.
+
+An Apple-approved Endpoint Security identity can validate the exact macOS 27 path without risking
+a silent fallback:
+
+```sh
+zig build -Dtarget=aarch64-macos -Dmacos-require-endpoint-security=true
+codesign --force --options runtime \
+  --entitlements macos.entitlements \
+  --sign "<Apple-approved signing identity>" \
+  zig-out/bin/flamez
+zig-out/bin/flamez /usr/bin/true
+```
+
+The included plist is only a signing input; Apple must grant the restricted entitlement to the
+identity. See [MACAPI.md](MACAPI.md) for runtime and packaging details.
 
 For example:
 
@@ -183,6 +212,11 @@ process-image metadata.
 - `src/ebpf_shim.c` loads/attaches the BPF object, bridges libbpf's ring
   buffer and CPU-map snapshots into Zig, and reports initialization failures
   verbosely.
+- `src/tracer/capture/macos.zig` combines a dedicated kqueue worker with
+  recursive live-child discovery, immutable-parent recovery, owned metadata
+  delivery, and synchronized cumulative CPU snapshots.
+- `src/macos_shim.c` isolates macOS private process-inspection structures used
+  for PID identity, argv, executable, CWD, and CPU totals.
 
 CPU slices answer which process was using cycles and when; they do not yet
 identify hot functions or explain off-CPU delay. Stack sampling, symbolization,

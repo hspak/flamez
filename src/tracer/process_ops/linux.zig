@@ -3,6 +3,11 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.process_ops);
+
+pub const args_source = .procfs;
+
+pub const ResumeError = error{TargetResumeRejected};
 
 /// Result of a nonblocking wait on the target root.
 pub const WaitNowait = union(enum) {
@@ -11,6 +16,24 @@ pub const WaitNowait = union(enum) {
     no_child,
     reaped: u32,
 };
+
+/// Spawns a Linux target normally; eBPF is already armed for the next child.
+pub fn spawnTarget(
+    _: Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) std.process.SpawnError!std.process.Child {
+    return std.process.spawn(io, .{
+        .argv = argv,
+        .pgid = 0,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+}
+
+/// Linux targets are never suspended by `spawnTarget`.
+pub fn resumeTarget(_: std.posix.pid_t) ResumeError!void {}
 
 /// Returns the calling process's PID.
 pub fn currentPid() std.posix.pid_t {

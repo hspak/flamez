@@ -67,7 +67,9 @@ Owns everything that is *not* UI:
 - **`Session`** — the heart of the tracker:
   - `start(collector, argv)` asks the selected collector to arm the launch,
     directly spawns the target in its own process group, inserts it as the first
-    `Process`, and removes the launch marker. On Linux the eBPF fork hook
+    `Process`, and removes the launch marker. On macOS the target starts
+    suspended, and Session resumes it only after exact ES admission or fallback
+    kqueue registration. On Linux the eBPF fork hook
     installs the target pid in `tracked_pids` before it can run, closing the
     launch-to-exec race without a shell wrapper or procfs discovery.
   - `update(collector)` runs once per live frame: advances `elapsed_ns`
@@ -102,20 +104,31 @@ Owns everything that is *not* UI:
     and its userspace timestamp have bounded sampling skew; a natural exit's
     kernel-timestamped final total reconciles any transient overestimate from
     the newest slices.
-  - Root exit is detected with `process_ops.waitNowait()` and ends the session.
-    Any descendant records still open are closed at the target's exit time,
+  - Root exit is detected with `process_ops.waitNowait()`. Before ending the
+    session, Session asks the backend to flush lifecycle work already known to
+    the kernel and forces one final cumulative CPU snapshot. Exact macOS capture
+    uses `es_sync_client`; Linux drains the eBPF ring; macOS fallback joins its
+    worker after a final kqueue/recovery pass. An observed root-exit timestamp
+    becomes the timeline ceiling for the last CPU sample and every surviving
+    descendant. Any records still open are then closed at that target-exit time,
     tracked-pid state is cleared, and the collector is detached. While the
     target is live, teardown can still kill every remembered tgid, not only
-    `-pgid`. Natural process exits carry one final CPU snapshot in the exit
-    record. A user-forced Stop closes bars at the last sampled total because
-    it tears down without waiting for another collector poll; that total is
-    labeled partial (`CPU~`) rather than presented as an exact kernel final.
+    `-pgid`. Natural process exits carry the latest CPU snapshot plus a bit
+    stating whether the backend obtained the final cumulative total. If a
+    macOS descendant was already reaped before `proc_pid_rusage`, Flamez keeps
+    the latest periodic total and labels it partial (`CPU~`). A user-forced
+    Stop likewise closes bars at the last sampled total because it tears down
+    without waiting for another collector poll.
 - **`capture.zig`** — defines the backend-neutral `Event`, callback `Sink`, and
-  compile-time `Collector` selection. `Session` depends only on this contract.
-  Linux selects `capture/linux.zig`; macOS currently selects an inert backend
-  that reports an explicit unsupported diagnostic. A future macOS
-  collector can therefore normalize native lifecycle and CPU observations
-  without changing the session or UI.
+  compile-time `Collector` selection. It also exposes `.exact`,
+  `.snapshot_recovery`, or `.unavailable` lifecycle fidelity so the UI does not
+  equate zero known drops with guaranteed completeness. `Session` depends only
+  on this contract.
+  Linux selects `capture/linux.zig`; macOS selects `capture/macos.zig`, which
+  attempts exact descendant-scoped Endpoint Security before spawn and otherwise
+  combines kqueue lifecycle hints with recursive libproc snapshots. Runtime
+  fidelity is copied into Session so the UI distinguishes the two without
+  changing the event contract. [MACAPI.md](MACAPI.md) documents both paths.
 - **Linux `Collector`** — owns the loaded BPF object via the C shim. `init()`
   attempts load + attach; on any failure it stores a human-readable reason
   (missing capabilities, missing BPF object, failed load/attach) retrievable
@@ -130,12 +143,64 @@ Owns everything that is *not* UI:
   the completed-CPU and running-thread
   maps, merges them through a reusable hash index, and returns the snapshot
   array once for Zig to apply.
+- **macOS `Collector`** — attempts to resolve the macOS 27
+  `es_new_descendants_client` before each target spawn. When its signed binary
+  has the Endpoint Security entitlement, a C callback copies exact fork/exec/
+  exit records into an owned queue. Zig filters the root subtree by audit-token
+  PID version, uses kernel Mach timestamps and exec metadata, reports global
+  sequence gaps, and marks the launch `.exact`. Stable ES and libbsm helpers are
+  also dynamically resolved, keeping macOS 26 builds loadable. At root reap,
+  the new `es_sync_client` marker guarantees all earlier messages have reached
+  the bridge before its final drain.
+
+  The fallback owns a kqueue, capture worker, mutex-protected event queue, and
+  allocator-backed live-PID map. It registers each known PID for
+  fork/exec/exit hints, recursively snapshots direct children on kqueue wakeup
+  and every 4 ms, and scans the root's dedicated process group for live
+  descendants reparented after a missed intermediate process. The worker copies
+  argv, executable, and CWD before a short-lived process disappears; only the
+  GUI thread delivers those owned events into `Session`. Because those fields
+  require separate inspection calls, the worker brackets them with combined
+  process-identity reads and accepts them only if both the immutable lifetime
+  identity and exec-image PID version remain stable. A raced exec or PID reuse
+  discards the partial snapshot and schedules another attempt. A
+  generation-authenticated `NOTE_EXEC` is still delivered when inspection is
+  denied: Session clears inherited argv/executable state, retains only the
+  explicitly inherited CWD, and suppresses unbracketed live-PID enrichment.
+  Recovered group members enter through the inferred-exec path rather than an
+  invented parent edge. A valid tracked `NOTE_FORK` hint also triggers one
+  all-PID identity scan: candidates are admitted only when XNU's immutable
+  original-parent unique ID matches a tracked process unique ID. This safely
+  recovers a direct child that has already reparented and left the process group
+  without continuously inspecting the system. Unique ID plus BSD start time and
+  a kqueue `udata` generation protect PID reuse. `proc_pid_rusage` supplies
+  cumulative self CPU totals on the shared cadence and, when the zombie remains
+  inspectable, a final total at exit. Its
+  task-recount values are Mach absolute-time ticks; the shim applies
+  one `pthread_once`-cached `mach_timebase_info` conversion before exposing
+  nanoseconds, which is essential on Apple silicon where the timebase is not
+  1:1. Exact ES event timestamps use the same conversion.
+  `src/macos_shim.c` confines private libproc structure layouts and
+  `KERN_PROCARGS2` to a small project-owned ABI. The macOS backend intentionally
+  supports only `aarch64-macos`. This deployable fallback has no
+  privilege requirement but cannot observe a descendant branch whose entire
+  lifetime falls between snapshots. It also cannot connect a double-forked
+  daemon after an unobserved intermediate has vanished, because the surviving
+  process's immutable parent edge names that missing process. Private
+  responsible-process and coalition identities were rejected as substitutes
+  because they group the whole launching application, not one Flamez target;
+  using them would adopt unrelated terminal work.
+- **macOS process launch** — `process_ops/macos.zig` uses Darwin `posix_spawnp`
+  with `POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_START_SUSPENDED`. Session creates
+  the root model and arms the selected collector around its concrete PID before
+  sending `SIGCONT`. Target code therefore cannot create an unregistered early
+  branch; the remaining fallback gap begins only after the target is resumed.
 - **`process_ops.zig`** — compile-time-selected process operations used by
   `Session` and signal teardown: current PID, nonblocking wait/status decoding,
   metadata enrichment, best-effort signaling, existence checks, and the short
   termination grace period. Linux raw syscalls and procfs live only in
-  `process_ops/linux.zig`; the macOS implementation uses libc/libproc and does
-  not leak platform calls into the shared session.
+  `process_ops/linux.zig`; the macOS implementation uses libc plus the process
+  inspection shim and does not leak platform calls into the shared session.
 
 Unit tests cover duration clamping, name trimming, CPU-bucket coalescing and
 parallel occupancy, CPU timing formatting, fatal-signal handler installation,
@@ -143,6 +208,34 @@ process-group teardown, session lifecycle across child churn, and — by feeding
 synthesized events directly to `consumeEvent` without kernel privileges —
 the full fork/exec/exit tree-building rules including final CPU attribution,
 live-pid dedup, pid-reuse after exit, and recovery of missing parents/execs/exits.
+A macOS launch fixture additionally proves the suspended target cannot execute
+before collector registration. Fallback-only fixtures explicitly disable ES so
+they keep covering snapshot recovery on entitled macOS 27 hosts. A signal-gated
+fan-out fixture verifies admission and clustered exits for 32 simultaneous
+children without depending on a duration floor. A shebang fixture separates the
+resolved interpreter executable from its script argv and preserves an empty
+argument. Another fixture admits a child before it calls `setsid()` and verifies
+per-PID tracking survives process-group escape. A complementary fixture delays
+ordinary recovery until a direct child has called `setsid()` and reparented,
+then verifies immutable-parent recovery. A third follows a double fork and
+verifies no process is attributed after the unobserved intermediate identity
+has vanished. Test polling uses condition checks, yields, and monotonic failure
+deadlines; targets remain alive through stop or signal handshakes rather than
+timed delays.
+
+Test builds also compile the production TERM grace period out of
+`terminateTargetGroup`, so cleanup sends TERM and KILL immediately instead of sleeping.
+A test-only Endpoint Security bridge constructor injects owned event fields through
+the production queue internals, covering deep-copy lifetime, FIFO order, byte-budget
+loss, and global sequence gaps without needing the restricted entitlement. Native
+SDK message fixtures additionally traverse the production fork/exec/exit extractor,
+including audit-token versions, packed argv, truncation flags, Mach timestamps, and
+final CPU. Those helpers are absent from the application build.
+A condition-gated fake `es_sync_client` also completes a copied queue-marker
+block from another thread, proving the production root-exit waiter blocks until
+the ES barrier fires and propagates marker rejection without sleeps.
+A live calibration brackets converted `mach_absolute_time` with
+`CLOCK_UPTIME_RAW`, proving exact events and Session share the awake clock domain.
 A live attach smoke test loads the compiled BPF object and is skipped without
 tracing privileges (and fails if root still cannot attach).
 
@@ -325,15 +418,37 @@ total. Accounting-map failures are reported in `DROPPED`.
 
 ## Concurrency model
 
-Everything in userspace runs on one thread. The kernel collects lifecycle
-events asynchronously into the BPF ring buffer and atomically adds completed
-run intervals for tracked threads. The system-wide `sched_switch`
-hook does a cheap miss path for unrelated work: one running-TID lookup for the
-outgoing thread and one tracked-TGID lookup for the incoming thread. It emits
-no records. Userspace drains and batch-snapshots once inside `update()` with no
-blocking wait. Capture and rendering require no synchronization with each
-other; the fatal-signal teardown uses its separate atomic PID handoff described
-below.
+`Session`, UI layout, rendering, and normalized event consumption always run on
+the main thread. On Linux, all userspace capture work also runs there: the
+kernel collects lifecycle events asynchronously into the BPF ring buffer and
+atomically adds completed run intervals for tracked threads. The system-wide
+`sched_switch` hook does a cheap miss path for unrelated work: one running-TID
+lookup for the outgoing thread and one tracked-TGID lookup for the incoming
+thread. It emits no records. Userspace drains and batch-snapshots once inside
+`update()` with no blocking wait.
+
+On macOS fallback launches, a dedicated worker blocks in kqueue with a 4 ms
+recovery timeout, owns the live-PID map, and copies process-inspection metadata
+into pending records. During fork bursts it registers every live child before
+performing slower metadata inspection, drains kqueue until a 250 us quiet point,
+or at most eight additional busy batches, then runs one coalesced all-PID
+immutable-parent recovery scan. `pollEvents()` swaps the pending and delivery
+lists and their byte accounting under a pthread mutex, then invokes Session
+callbacks after releasing it. The pending payload budget is 16 MiB, matching
+the Linux ring and exact ES bridge; overflow increments `lost_events` instead
+of allowing worker memory to grow without bound. Every libproc PID snapshot
+adds sizing slack and retries a full result with doubled capacity; four
+consecutive full fills raise `lost_events` rather than feeding a potentially
+truncated snapshot into discovery. Exact launches instead receive
+callbacks on Endpoint Security's serial queue; the C
+bridge copies borrowed messages before returning, and `pollEvents()` drains the
+owned list synchronously on the main thread. CPU sampling in either mode copies
+PID identity and generation under the Zig mutex, performs `proc_pid_rusage`
+without holding the lock, timestamps each PID immediately after its cumulative
+read, and verifies identity again before delivery. Per-PID timestamps prevent
+the tail of a large process scan from being projected back to a single boundary
+captured before the scan began. Neither worker mutates Session or UI state.
+Fatal-signal teardown uses its separate atomic PID handoff described below.
 
 ## Fatal-signal lifecycle
 
@@ -363,8 +478,8 @@ signal — ends with the target group terminated.
 ## Build system
 
 - **Toolchain**: Zig 0.16 (`minimum_zig_version = "0.16.0"`). Linux v7 or newer
-  is the only live-capture runtime today; unsupported targets fail before the
-  GUI opens with the selected backend's diagnostic.
+  uses exact eBPF lifecycle capture. macOS uses best-effort kqueue/libproc
+  capture when the runtime or signature cannot activate Endpoint Security.
 - **Dependencies** (`build.zig.zon`): `zclay` (Clay Zig bindings) and
   `raylib-zig` built with the Wayland GLFW backend to avoid X11 fallback.
 - **eBPF build graph**: on Linux the build graph always:
@@ -384,10 +499,14 @@ signal — ends with the target group terminated.
   The dev
   artifact `zig-out/bin/flamez` intentionally stays unprivileged.
 - **macOS build graph**: Clay, raylib, the application, and both test roots
-  compile for `aarch64-macos`. The pinned framework package is a direct lazy
+  target Apple silicon (`aarch64-macos`); `src/macos_shim.c` is compiled into the
+  application and test roots. The pinned framework package is a direct lazy
   dependency because raylib's static-library framework search paths are not
   transitive in Zig 0.16. `zig build test-compile -Dtarget=aarch64-macos`
   validates the complete graph without trying to execute a cross-built binary.
+  `-Dmacos-require-endpoint-security=true` changes automatic selection to
+  fail-closed exact capture for signed macOS 27 validation; it does not grant
+  the restricted entitlement in `macos.entitlements`.
 
 ## Extension points
 
@@ -395,9 +514,6 @@ The event/data model (`Session`, `Process`, `capture.Event`) is deliberately
 independent of both the UI and the Linux raw-event ABI. The timeline already
 works in a wall-clock domain, so these layers can be added without changing
 the renderer:
-
-- a macOS collector implementing the `capture.Collector` contract and emitting
-  the same normalized lifecycle events and cumulative CPU samples;
 
 - sampled user stacks associated with CPU slices, allowing a busy interval to
   identify hot functions after symbolization;

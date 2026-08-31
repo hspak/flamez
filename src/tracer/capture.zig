@@ -9,18 +9,34 @@ pub const Event = @import("capture/Event.zig");
 /// Capture implementation selected for the compilation target.
 pub const Backend = enum {
     linux_ebpf,
+    macos,
     unsupported,
+};
+
+/// Whether a backend has exact lifecycle delivery or reconstructs snapshots.
+pub const Fidelity = enum {
+    exact,
+    snapshot_recovery,
+    unavailable,
 };
 
 /// Compile-time backend choice for the current target.
 pub const backend: Backend = switch (builtin.os.tag) {
     .linux => .linux_ebpf,
-    .macos => .unsupported,
+    .macos => .macos,
     else => @compileError("capture selection is implemented only for Linux and macOS"),
+};
+
+/// Fidelity shown before a runtime-selecting collector arms its first launch.
+pub const default_fidelity: Fidelity = switch (backend) {
+    .linux_ebpf => .exact,
+    .macos => .snapshot_recovery,
+    .unsupported => .unavailable,
 };
 
 const implementation = switch (backend) {
     .linux_ebpf => @import("capture/linux.zig"),
+    .macos => @import("capture/macos.zig"),
     .unsupported => @import("capture/unsupported.zig"),
 };
 
@@ -60,7 +76,7 @@ test {
 
 test "unsupported collector reports the target operating system" {
     if (backend != .unsupported) return error.SkipZigTest;
-    var collector = Collector.init();
+    var collector = Collector.init(std.testing.allocator);
     defer collector.deinit();
     try std.testing.expect(!collector.available());
     try std.testing.expect(std.mem.indexOf(

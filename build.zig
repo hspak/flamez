@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     const raylib_artifact = raylib_dep.artifact("raylib");
     if (target.result.os.tag == .linux) moveRaylibLinuxLibraries(raylib_artifact, raylib);
 
-    // eBPF is the only capture backend; other targets compile an inert collector.
+    // Linux embeds its eBPF loader; macOS uses a small libproc ABI bridge.
     const enable_ebpf = target.result.os.tag == .linux;
     const enable_fps_counter = b.option(
         bool,
@@ -51,11 +51,27 @@ pub fn build(b: *std.Build) void {
         "msaa",
         "Enable 4x multisample anti-aliasing",
     ) orelse true;
+    const require_macos_endpoint_security = b.option(
+        bool,
+        "macos-require-endpoint-security",
+        "Reject macOS launch unless exact Endpoint Security capture activates",
+    ) orelse false;
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Run tests whose names contain this substring",
+    );
+    const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
     const build_options = b.addOptions();
     build_options.addOption(bool, "ebpf", enable_ebpf);
     build_options.addOption(bool, "fps_counter", enable_fps_counter);
     build_options.addOption(bool, "perf_telemetry", enable_perf_telemetry);
     build_options.addOption(bool, "msaa", enable_msaa);
+    build_options.addOption(
+        bool,
+        "macos_require_endpoint_security",
+        require_macos_endpoint_security,
+    );
     const footer_font_files = b.addWriteFiles();
     const footer_font_source = footer_font_files.add(
         "footer_font.zig",
@@ -88,8 +104,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("footer_font", footer_font);
     exe.root_module.addOptions("build_options", build_options);
     if (target.result.os.tag == .macos) {
-        addRaylibMacosPaths(b, main_module);
-        addRaylibMacosPaths(b, exe.root_module);
+        addMacosSdkPaths(b, main_module);
+        addMacosSdkPaths(b, exe.root_module);
+        addMacosProcessShim(b, main_module, true);
+        addMacosProcessShim(b, exe.root_module, false);
     }
 
     var bpf_object: ?std.Build.LazyPath = null;
@@ -114,7 +132,12 @@ pub fn build(b: *std.Build) void {
 
         exe.root_module.addCSourceFile(.{
             .file = b.path("src/ebpf_shim.c"),
-            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+            .flags = &.{
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            },
         });
         exe.root_module.linkSystemLibrary("bpf", .{});
         exe.root_module.link_libc = true;
@@ -123,7 +146,12 @@ pub fn build(b: *std.Build) void {
         // shared process-info helpers, so this root needs the same bridge.
         main_module.addCSourceFile(.{
             .file = b.path("src/ebpf_shim.c"),
-            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+            .flags = &.{
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            },
         });
         main_module.linkSystemLibrary("bpf", .{});
         main_module.link_libc = true;
@@ -139,7 +167,10 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
 
     // Zig collects tests from one root source, so main and tracer need separate artifacts.
-    const main_tests = b.addTest(.{ .root_module = main_module });
+    const main_tests = b.addTest(.{
+        .root_module = main_module,
+        .filters = test_filters,
+    });
     const run_main_tests = b.addRunArtifact(main_tests);
 
     const tracer_options = b.addOptions();
@@ -147,6 +178,11 @@ pub fn build(b: *std.Build) void {
     tracer_options.addOption(bool, "fps_counter", enable_fps_counter);
     tracer_options.addOption(bool, "perf_telemetry", enable_perf_telemetry);
     tracer_options.addOption(bool, "msaa", enable_msaa);
+    tracer_options.addOption(
+        bool,
+        "macos_require_endpoint_security",
+        require_macos_endpoint_security,
+    );
     if (bpf_object) |path| {
         tracer_options.addOptionPath("bpf_object", path);
     } else {
@@ -159,13 +195,22 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+        .filters = test_filters,
     });
     tracer_tests.root_module.addOptions("build_options", tracer_options);
-    if (target.result.os.tag == .macos) tracer_tests.root_module.link_libc = true;
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, tracer_tests.root_module);
+        addMacosProcessShim(b, tracer_tests.root_module, true);
+    }
     if (enable_ebpf) {
         tracer_tests.root_module.addCSourceFile(.{
             .file = b.path("src/ebpf_shim.c"),
-            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+            .flags = &.{
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            },
         });
         tracer_tests.root_module.linkSystemLibrary("bpf", .{});
         tracer_tests.root_module.link_libc = true;
@@ -181,9 +226,47 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tracer_tests.step);
 }
 
-// raylib's framework search paths live on its static-library module and are
-// not transitive in Zig 0.16. Copy them to each macOS root that links raylib.
-fn addRaylibMacosPaths(b: *std.Build, module: *std.Build.Module) void {
+fn addMacosProcessShim(
+    b: *std.Build,
+    module: *std.Build.Module,
+    test_build: bool,
+) void {
+    module.addCSourceFile(.{
+        .file = b.path("src/macos_shim.c"),
+        .flags = &.{
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+        },
+    });
+    module.addCSourceFile(.{
+        .file = b.path("src/macos_es_shim.c"),
+        .flags = if (test_build)
+            &.{
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-fblocks",
+                "-DFLAMEZ_TEST=1",
+            }
+        else
+            &.{
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-fblocks",
+            },
+    });
+    module.addIncludePath(b.path("src"));
+    module.link_libc = true;
+}
+
+// Zig's bundled Darwin headers omit newer platform frameworks. The pinned
+// Xcode package also supplies raylib's non-transitive framework paths.
+fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module) void {
     const frameworks = b.lazyDependency("xcode_frameworks", .{}) orelse return;
     module.addSystemFrameworkPath(frameworks.path("Frameworks"));
     module.addSystemIncludePath(frameworks.path("include"));

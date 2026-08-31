@@ -10,6 +10,12 @@ const implementation = switch (builtin.os.tag) {
 
 /// Result of a nonblocking root-process wait.
 pub const WaitNowait = implementation.WaitNowait;
+/// Failure to resume a target after capture has been armed around its PID.
+pub const ResumeError = implementation.ResumeError;
+/// Spawns the target in a dedicated process group. macOS returns it suspended.
+pub const spawnTarget = implementation.spawnTarget;
+/// Lets a platform-suspended target begin executing after root registration.
+pub const resumeTarget = implementation.resumeTarget;
 /// Returns the calling process's PID.
 pub const currentPid = implementation.currentPid;
 /// Observes `pid` without blocking and preserves interruption as a normal result.
@@ -23,6 +29,8 @@ pub const readName = implementation.readName;
 /// Returns an owned NUL-separated argv list, or null when unavailable.
 /// The caller must deinitialize a returned list with the allocator passed in.
 pub const readArgs = implementation.readArgs;
+/// Describes the platform fallback used by `readArgs`.
+pub const args_source = implementation.args_source;
 /// Borrows `buffer` for a best-effort executable path; the result aliases that buffer.
 pub const readExecutable = implementation.readExecutable;
 /// Borrows `buffer` for a best-effort working directory; the result aliases that buffer.

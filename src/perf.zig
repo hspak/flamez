@@ -167,7 +167,9 @@ fn maybeLog(frame_ns: u64) void {
     last_log_ns +|= frame_ns;
     if (last_log_ns < std.time.ns_per_s) return;
     log.info(
-        "frame p50={d}us p95={d}us max={d}us ring={d}us cpu={d}us tree={d}us clay={d}us play={d}us tl={d}us det={d}us draw={d}us procs={d} slices={d} meta={d}B rebuilds={d} ring_ev={d} cpu_n={d} scanned={d} drawn={d}",
+        "frame p50={d}us p95={d}us max={d}us ring={d}us cpu={d}us tree={d}us " ++
+            "clay={d}us play={d}us tl={d}us det={d}us draw={d}us procs={d} " ++
+            "slices={d} meta={d}B rebuilds={d} ring_ev={d} cpu_n={d} scanned={d} drawn={d}",
         .{
             second_hist.percentile(0.50) / 1000,
             second_hist.percentile(0.95) / 1000,
@@ -204,7 +206,8 @@ pub fn sessionSummary() void {
     if (comptime !enabled) return;
     leave();
     log.info(
-        "session frames={d} p50={d}us p95={d}us p99={d}us max={d}us procs={d} slices={d} meta={d}B new_slices={d} coalesced={d}",
+        "session frames={d} p50={d}us p95={d}us p99={d}us max={d}us procs={d} " ++
+            "slices={d} meta={d}B new_slices={d} coalesced={d}",
         .{
             frame_hist.count,
             frame_hist.percentile(0.50) / 1000,

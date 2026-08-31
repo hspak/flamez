@@ -114,17 +114,10 @@ pub fn pidAlive(pid: std.posix.pid_t) bool {
 /// Hits the root process group **and** every remembered tgid/group, because
 /// ninja's compile/link jobs live in their own process groups.
 pub fn terminateTargetGroup(pgid: std.posix.pid_t) void {
-    if (pgid > 1) {
-        process_ops.safeKill(-pgid, .TERM);
-        process_ops.safeKill(pgid, .TERM);
-    }
-    killTracked(.TERM);
-    process_ops.sleepTerminationGrace();
-    if (pgid > 1) {
-        process_ops.safeKill(-pgid, .KILL);
-        process_ops.safeKill(pgid, .KILL);
-    }
-    killTracked(.KILL);
+    termTargetTree(pgid);
+    // Test teardown must be deterministic and must not add a wall-clock delay.
+    if (comptime !builtin.is_test) process_ops.sleepTerminationGrace();
+    killTargetTree(pgid);
 }
 
 fn terminateLiveTargets() void {
@@ -158,7 +151,12 @@ pub fn installFatalSignalHandlers() void {
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
-    inline for (.{ std.posix.SIG.INT, .TERM, .HUP, .QUIT }) |sig| {
+    inline for (.{
+        std.posix.SIG.INT,
+        .TERM,
+        .HUP,
+        .QUIT,
+    }) |sig| {
         std.posix.sigaction(sig, &act, null);
     }
     // A closed pty must not turn a stray stdout write into instant death.

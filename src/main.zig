@@ -49,6 +49,10 @@ const window_width = 1180;
 const window_height = 760;
 /// Software cap used when vsync is off (screenshot clock). `0` means no CPU wait.
 const screenshot_fps = 60;
+/// Completed captures poll for input without rebuilding or presenting unchanged frames.
+const idle_poll_interval_ms: i64 = 32;
+/// FPS-enabled idle captures present only often enough to keep the diagnostic visibly live.
+const idle_fps_refresh_polls: usize = @intCast(@divTrunc(1000, idle_poll_interval_ms));
 const ui_font_id: u16 = 0;
 const footer_font_id: u16 = 1;
 
@@ -131,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Live capture is mandatory: fail fast with backend diagnostics before any
     // window is opened. Session-file import can bypass this when implemented.
-    var collector = tracer.Collector.init();
+    var collector = tracer.Collector.init(init.gpa);
     if (!collector.available()) {
         std.debug.print(
             \\flamez: cannot start — process-event capture is required.
@@ -167,7 +171,18 @@ pub fn main(init: std.process.Init) !void {
     defer app.deinit();
     const host_cpu_count = @max(std.Thread.getCpuCount() catch 1, 1);
     if (start_error) |err| {
-        app.setMessage("Could not start target: {s}", .{@errorName(err)});
+        if (comptime tracer.capture_backend == .macos) {
+            if (err == error.ExactCaptureUnavailable) {
+                app.setMessage(
+                    "Exact macOS capture unavailable: {s}",
+                    .{collector.exactDiagnosticSlice()},
+                );
+            } else {
+                app.setMessage("Could not start target: {s}", .{@errorName(err)});
+            }
+        } else {
+            app.setMessage("Could not start target: {s}", .{@errorName(err)});
+        }
     }
 
     const screenshot_path: ?[:0]const u8 = if (std.c.getenv("FLAMEZ_SCREENSHOT")) |path|
@@ -211,16 +226,20 @@ pub fn main(init: std.process.Init) !void {
 
     var frame_number: usize = 0;
     var trackpad_gestures: TrackpadGestures = .{};
+    var last_drawn_mouse = rl.getMousePosition();
+    var idle_polls_since_draw: usize = 0;
     perf.beginSession(init.io);
 
     while (!rl.windowShouldClose()) {
-        perf.beginFrame();
         const frame_time = rl.getFrameTime();
         const mouse = rl.getMousePosition();
         const wheel = rl.getMouseWheelMoveV();
         const tapped = rl.isGestureDetected(.{ .tap = true }) or
             rl.isGestureDetected(.{ .doubletap = true });
         const clicked = rl.isMouseButtonPressed(.left) or tapped;
+        const pointer_active = clicked or
+            rl.isMouseButtonDown(.left) or
+            rl.isMouseButtonReleased(.left);
         const pinch_zoom = trackpad_gestures.samplePinch();
         const width = rl.getScreenWidth();
         const height = rl.getScreenHeight();
@@ -233,6 +252,33 @@ pub fn main(init: std.process.Init) !void {
             fps_cap = wanted_fps;
             rl.setTargetFPS(fps_cap);
         }
+
+        const mouse_moved = mouse.x != last_drawn_mouse.x or mouse.y != last_drawn_mouse.y;
+        const input_changed = mouse_moved or
+            wheel.x != 0 or
+            wheel.y != 0 or
+            pointer_active or
+            trackpad_gestures.pinch_distance != null or
+            hasKeyboardActivity() or
+            rl.isWindowResized();
+        const fps_refresh_due = if (comptime build_options.fps_counter)
+            idle_polls_since_draw >= idle_fps_refresh_polls
+        else
+            false;
+        const redraw = session.running or
+            screenshot_path != null or
+            frame_number == 0 or
+            input_changed or
+            fps_refresh_due;
+        if (!redraw) {
+            init.io.sleep(.fromMilliseconds(idle_poll_interval_ms), .awake) catch {};
+            // EndDrawing normally polls events; idle frames deliberately skip it.
+            rl.pollInputEvents();
+            idle_polls_since_draw +|= 1;
+            continue;
+        }
+        idle_polls_since_draw = 0;
+        perf.beginFrame();
 
         clay.setLayoutDimensions(.{
             .w = @floatFromInt(width),
@@ -307,6 +353,7 @@ pub fn main(init: std.process.Init) !void {
         rl.endDrawing();
         perf.leave();
         perf.endFrame();
+        last_drawn_mouse = mouse;
         frame_number += 1;
         if (screenshot_path) |path| {
             if (frame_number == 40) {
@@ -316,6 +363,27 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     perf.sessionSummary();
+}
+
+fn hasKeyboardActivity() bool {
+    return rl.isKeyPressed(.f5) or
+        rl.isKeyPressed(.zero) or
+        rl.isKeyPressed(.kp_0) or
+        rl.isKeyPressed(.minus) or
+        rl.isKeyPressed(.kp_subtract) or
+        rl.isKeyPressed(.equal) or
+        rl.isKeyPressed(.kp_equal) or
+        rl.isKeyPressed(.kp_add) or
+        rl.isKeyPressed(.up) or
+        rl.isKeyPressed(.down) or
+        rl.isKeyPressed(.page_up) or
+        rl.isKeyPressed(.page_down) or
+        rl.isKeyPressed(.home) or
+        rl.isKeyPressed(.end) or
+        rl.isKeyPressed(.left) or
+        rl.isKeyPressed(.right) or
+        rl.isKeyPressed(.a) or
+        rl.isKeyPressed(.c);
 }
 
 fn countSlices(session: *const tracer.Session) usize {
@@ -552,6 +620,7 @@ fn pointInRect(point: rl.Vector2, rect: rl.Rectangle) bool {
 const BarLook = struct {
     color: rl.Color,
     font: rl.Font,
+    ink: rl.Color,
     rounded: bool,
 };
 
@@ -742,29 +811,11 @@ fn paintBarLabel(
         .y = @round(bar.y + (bar.height - label_height) / 2),
     };
     const max_width = bar.width - bar_label_inset - bar_label_right_padding;
-    const outline_offsets = [_]rl.Vector2{
-        .{ .x = -1, .y = 0 },
-        .{ .x = 1, .y = 0 },
-        .{ .x = 0, .y = -1 },
-        .{ .x = 0, .y = 1 },
-    };
-    for (outline_offsets) |offset| {
-        drawTextSliceClipped(bar_label, .{
-            .font = look.font,
-            .position = .{
-                .x = label_position.x + offset.x,
-                .y = label_position.y + offset.y,
-            },
-            .size = bar_label_size,
-            .color = rl.Color.black,
-            .max_width = max_width,
-        });
-    }
     drawTextSliceClipped(bar_label, .{
         .font = look.font,
         .position = label_position,
         .size = bar_label_size,
-        .color = barNameInk(process.name_kind),
+        .color = look.ink,
         .max_width = max_width,
     });
 }
@@ -1050,7 +1101,12 @@ fn renderTimeline(
                 if (visible_index % 2 == 1) {
                     rl.drawRectangleRec(
                         .init(row_box.x, row_box.y, row_box.width, row_box.height),
-                        toRaylibColor(.{ 14, 21, 38, 255 }),
+                        toRaylibColor(.{
+                            14,
+                            21,
+                            38,
+                            255,
+                        }),
                     );
                 }
                 const process = &session.processes.items[index];
@@ -1076,7 +1132,12 @@ fn renderTimeline(
                 if (over_row) {
                     rl.drawRectangleRec(
                         .init(row_box.x, row_box.y, row_box.width, row_box.height),
-                        toRaylibColor(.{ 30, 42, 66, 255 }),
+                        toRaylibColor(.{
+                            30,
+                            42,
+                            66,
+                            255,
+                        }),
                     );
                 }
                 if (over_button) {
@@ -1095,6 +1156,7 @@ fn renderTimeline(
                     const look = BarLook{
                         .color = color,
                         .font = row_font,
+                        .ink = barNameInk(process.name_kind, has_children),
                         .rounded = b.width >= 8,
                     };
                     paintLifetimeBar(app, process, index, b, look);
@@ -1121,9 +1183,19 @@ fn renderTimeline(
                 const lane_h = process_tree.laneHeight(app, parent, slot.lane);
                 const multi = lane_h > 1;
                 const slot_bg: clay.Color = if (slot.lane % 2 == 1)
-                    .{ 14, 21, 38, 255 }
+                    .{
+                        14,
+                        21,
+                        38,
+                        255,
+                    }
                 else
-                    .{ 20, 28, 48, 255 };
+                    .{
+                        20,
+                        28,
+                        48,
+                        255,
+                    };
                 const slot_top = y - @as(f32, @floatFromInt(slot.subrow)) * row_height;
                 const slot_h = @as(f32, @floatFromInt(lane_h)) * row_height;
                 const over_slot = !app.scrollbar_dragging and !app.hscroll_dragging and
@@ -1132,7 +1204,12 @@ fn renderTimeline(
                     mouse.y >= slot_top and mouse.y < slot_top + slot_h;
                 rl.drawRectangleRec(
                     .init(row_box.x, row_box.y, row_box.width, row_box.height),
-                    toRaylibColor(if (over_slot) .{ 30, 42, 66, 255 } else slot_bg),
+                    toRaylibColor(if (over_slot) .{
+                        30,
+                        42,
+                        66,
+                        255,
+                    } else slot_bg),
                 );
                 var hit_index: ?usize = null;
                 for (app.packed_touched_columns.items) |px| {
@@ -1188,6 +1265,7 @@ fn renderTimeline(
                         const look = BarLook{
                             .color = processColor(has_kids),
                             .font = row_font,
+                            .ink = barNameInk(process.name_kind, has_kids),
                             .rounded = !multi and b.width >= 8,
                         };
                         paintLifetimeBar(app, process, index, b, look);
@@ -1263,14 +1341,34 @@ fn renderTimeline(
             .init(h_track.x, h_track.y, h_track.width, h_track.height),
             0.5,
             4,
-            toRaylibColor(.{ 12, 18, 32, 255 }),
+            toRaylibColor(.{
+                12,
+                18,
+                32,
+                255,
+            }),
         );
         const h_color: clay.Color = if (app.hscroll_dragging)
-            .{ 92, 151, 255, 255 }
+            .{
+                92,
+                151,
+                255,
+                255,
+            }
         else if (over_hscroll)
-            .{ 86, 110, 145, 255 }
+            .{
+                86,
+                110,
+                145,
+                255,
+            }
         else
-            .{ 61, 80, 110, 255 };
+            .{
+                61,
+                80,
+                110,
+                255,
+            };
         rl.drawRectangleRounded(
             .init(h_thumb_draw_x, h_thumb.y, h_thumb.width, h_thumb.height),
             0.5,
@@ -1283,14 +1381,34 @@ fn renderTimeline(
             .init(track.x, track.y, track.width, track.height),
             0.5,
             4,
-            toRaylibColor(.{ 12, 18, 32, 255 }),
+            toRaylibColor(.{
+                12,
+                18,
+                32,
+                255,
+            }),
         );
         const thumb_color: clay.Color = if (app.scrollbar_dragging)
-            .{ 92, 151, 255, 255 }
+            .{
+                92,
+                151,
+                255,
+                255,
+            }
         else if (over_scrollbar)
-            .{ 86, 110, 145, 255 }
+            .{
+                86,
+                110,
+                145,
+                255,
+            }
         else
-            .{ 61, 80, 110, 255 };
+            .{
+                61,
+                80,
+                110,
+                255,
+            };
         rl.drawRectangleRounded(
             .init(thumb.x, thumb.y, thumb.width, thumb.height),
             0.5,
@@ -1312,11 +1430,10 @@ fn processColor(has_children: bool) rl.Color {
     return toRaylibColor(if (has_children) blue else yellow);
 }
 
-fn barNameInk(kind: tracer.NameKind) rl.Color {
-    return if (kind == .process)
-        toRaylibColor(ink)
-    else
-        rl.Color.init(235, 241, 251, 205);
+fn barNameInk(kind: tracer.NameKind, has_children: bool) rl.Color {
+    var color = toRaylibColor(if (has_children) ink else canvas);
+    if (kind == .other) color.a = 205;
+    return color;
 }
 
 fn pointInBox(point: rl.Vector2, box: clay.BoundingBox) bool {
@@ -1443,8 +1560,8 @@ fn raylibSpacing(_: rl.Font, _: u16, letter_spacing: u16) f32 {
     return @floatFromInt(letter_spacing);
 }
 
-// Inter Regular and Bold, SIL OFL 1.1. UI atlases use 64px for their range of
-// sizes; row labels use a native 12px atlas for FreeType's pixel hinting.
+// Inter Regular and Bold, SIL OFL 1.1. The 64px source atlases keep small text
+// sharp when raylib downsamples it to each UI size.
 const ui_font_ttf = @embedFile("fonts/Inter-Regular.ttf");
 const row_font_ttf = @embedFile("fonts/Inter-Bold.ttf");
 const footer_font_ttf = footer_font.ttf;
@@ -1463,7 +1580,7 @@ const extra_codepoints = [_]i32{
 fn loadFonts() FontBook {
     return .{
         .ui = loadEmbeddedFont(ui_font_ttf, ui_font_atlas_size),
-        .row = loadEmbeddedFont(row_font_ttf, bar_label_size),
+        .row = loadEmbeddedFont(row_font_ttf, ui_font_atlas_size),
         .footer = loadEmbeddedFont(footer_font_ttf, ui_font_atlas_size),
     };
 }
@@ -1507,11 +1624,21 @@ test "rectangleRoundness scales with the shorter side only" {
     const testing = std.testing;
     try testing.expectEqual(
         @as(f32, 0.2),
-        rectangleRoundness(.{ .x = 0, .y = 0, .width = 100, .height = 200 }, 10),
+        rectangleRoundness(.{
+            .x = 0,
+            .y = 0,
+            .width = 100,
+            .height = 200,
+        }, 10),
     );
     try testing.expectEqual(
         @as(f32, 0),
-        rectangleRoundness(.{ .x = 0, .y = 0, .width = 40, .height = 0 }, 10),
+        rectangleRoundness(.{
+            .x = 0,
+            .y = 0,
+            .width = 40,
+            .height = 0,
+        }, 10),
     );
 }
 

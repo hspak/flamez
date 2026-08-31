@@ -33,8 +33,21 @@ pub const Exec = struct {
     exe: ?[]const u8 = null,
     /// NUL-separated argv, including argv[0], when captured by the backend.
     args: ?[]const u8 = null,
+    /// Working directory observed with this image when the backend captured one.
+    cwd: ?[]const u8 = null,
     /// Whether `exe` is a known prefix rather than the complete path.
     exe_truncated: bool = false,
+    /// Whether `cwd` is a known prefix rather than the complete path.
+    cwd_truncated: bool = false,
+    /// Provenance of exec metadata carried in this event.
+    metadata_source: MetadataSource = .kernel,
+    /// Whether Session may fill absent fields by inspecting the live PID.
+    inspect_missing: bool = true,
+};
+
+pub const MetadataSource = enum {
+    kernel,
+    process_inspection,
 };
 
 /// Final exit of a tracked process thread group.
@@ -42,6 +55,8 @@ pub const Exit = struct {
     pid: std.posix.pid_t,
     /// Kernel process name, borrowed for the delivery callback.
     name: []const u8,
-    /// Final cumulative self CPU for the process and all of its threads.
+    /// Latest cumulative self CPU for the process and all of its threads.
     cpu_ns: u64,
+    /// Whether `cpu_ns` is the final total observed at natural process exit.
+    cpu_final: bool = true,
 };

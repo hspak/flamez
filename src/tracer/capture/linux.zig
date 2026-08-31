@@ -130,7 +130,7 @@ pub const Collector = struct {
 
     /// Loads the BPF object. On failure `available()` returns false and
     /// `diagnosticSlice()` explains why; callers are expected to abort startup.
-    pub fn init() Collector {
+    pub fn init(_: std.mem.Allocator) Collector {
         var self = Collector{};
         if (comptime !supported()) {
             self.setDiagnostic("the Linux eBPF collector is not included in this build");
@@ -175,6 +175,11 @@ pub const Collector = struct {
     /// Returns collector-owned initialization diagnostics.
     pub fn diagnosticSlice(self: *const Collector) []const u8 {
         return self.diagnostic_buffer[0..self.diagnostic_len];
+    }
+
+    /// Linux eBPF delivers every admitted lifecycle transition or reports loss.
+    pub fn fidelity(_: *const Collector) capture.Fidelity {
+        return .exact;
     }
 
     /// Ensures the spawned root belongs to this capture.
@@ -229,6 +234,11 @@ pub const Collector = struct {
         }
     }
 
+    /// Drains lifecycle records enqueued before the root was observed reaped.
+    pub fn flushEvents(self: *Collector, sink: capture.Sink) void {
+        self.pollEvents(sink);
+    }
+
     /// Reads cumulative process CPU totals once and delivers them to `sink`.
     pub fn snapshotCpu(self: *Collector, sink: capture.Sink) void {
         if (comptime !supported()) return;
@@ -278,6 +288,7 @@ pub const Collector = struct {
                 .pid = raw.pid,
                 .name = name,
                 .cpu_ns = raw.cpu_ns,
+                .cpu_final = true,
             } },
         };
         sink.event(.{ .timestamp_ns = raw.timestamp_ns, .payload = payload });
@@ -298,7 +309,7 @@ pub const Collector = struct {
 
 test "collector attaches when privileges and object are present" {
     if (!supported()) return error.SkipZigTest;
-    var collector = Collector.init();
+    var collector = Collector.init(std.testing.allocator);
     defer collector.deinit();
     if (collector.available()) return;
     if (std.mem.startsWith(
