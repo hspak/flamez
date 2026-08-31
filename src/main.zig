@@ -640,6 +640,7 @@ const TimelineClick = union(enum) {
 const bar_label_inset: f32 = 5;
 const bar_label_right_padding: f32 = 5;
 const bar_label_size: u16 = 12;
+const selected_bar_border_width: f32 = 3;
 const collapse_button_size: f32 = 20;
 const collapse_button_hit_width: f32 = 28;
 const collapse_button_padding: f32 = 8;
@@ -752,23 +753,21 @@ fn applyTimelineClick(app: *App, target: TimelineClick) void {
     }
 }
 
-fn paintLifetimeBar(
+fn paintLifetimeBar(bar: rl.Rectangle, look: BarLook) void {
+    if (look.rounded) {
+        rl.drawRectangleRounded(bar, 0.22, 4, look.color);
+    } else {
+        rl.drawRectangleRec(bar, look.color);
+    }
+}
+
+fn paintSelectedBarBorder(
     app: *const App,
     index: usize,
     bar: rl.Rectangle,
-    look: BarLook,
 ) void {
-    if (look.rounded) {
-        rl.drawRectangleRounded(bar, 0.22, 4, look.color);
-        if (app.selected_process == index) {
-            rl.drawRectangleRoundedLinesEx(bar, 0.22, 4, 2, rl.Color.white);
-        }
-    } else {
-        rl.drawRectangleRec(bar, look.color);
-        if (app.selected_process == index) {
-            rl.drawRectangleLinesEx(bar, 2, rl.Color.white);
-        }
-    }
+    if (app.selected_process != index) return;
+    rl.drawRectangleLinesEx(bar, selected_bar_border_width, rl.Color.white);
 }
 
 fn paintBarLabel(
@@ -1157,7 +1156,7 @@ fn renderTimeline(
                         .ink = barNameInk(process.rowNameKind(), has_children),
                         .rounded = b.width >= 8,
                     };
-                    paintLifetimeBar(app, index, b, look);
+                    paintLifetimeBar(b, look);
                     try paintCpuSlices(app, process, .{
                         .window = window,
                         .view_span = view_span,
@@ -1167,6 +1166,7 @@ fn renderTimeline(
                         .row_height = row_height,
                     }, input.host_cpu_count);
                     paintBarLabel(app, process, index, session.metadataBytes(), b, look);
+                    paintSelectedBarBorder(app, index, b);
                 }
                 if (button) |control| {
                     paintCollapseButton(
@@ -1266,7 +1266,7 @@ fn renderTimeline(
                             .ink = barNameInk(process.rowNameKind(), has_kids),
                             .rounded = !multi and b.width >= 8,
                         };
-                        paintLifetimeBar(app, index, b, look);
+                        paintLifetimeBar(b, look);
                         try paintCpuSlices(app, process, .{
                             .window = window,
                             .view_span = view_span,
@@ -1276,6 +1276,7 @@ fn renderTimeline(
                             .row_height = row_height,
                         }, input.host_cpu_count);
                         paintBarLabel(app, process, index, session.metadataBytes(), b, look);
+                        paintSelectedBarBorder(app, index, b);
                         if (over_slot and pointInRect(mouse, b)) {
                             hit_index = index;
                         }
