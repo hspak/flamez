@@ -38,7 +38,7 @@ pub const Collector = struct {
     }
 
     /// Preserves the common collector contract without changing privileges.
-    pub fn dropPrivileges(_: *const Collector) error{PrivilegeDropRejected}!void {}
+    pub fn dropPrivileges(_: *const Collector) capture.DropPrivilegesError!void {}
 
     /// Returns collector-owned storage valid until `deinit`.
     pub fn diagnosticSlice(self: *const Collector) []const u8 {
@@ -54,7 +54,7 @@ pub const Collector = struct {
     pub fn armLaunch(
         _: *Collector,
         _: std.posix.pid_t,
-    ) error{LaunchTrackingRejected}!void {}
+    ) capture.ArmLaunchError!void {}
 
     /// Preserves the common collector contract without changing tracked pids.
     pub fn untrack(_: *Collector, _: std.posix.pid_t) void {}
@@ -63,7 +63,7 @@ pub const Collector = struct {
     pub fn trackRoot(
         _: *Collector,
         _: std.posix.pid_t,
-    ) error{LaunchTrackingRejected}!void {}
+    ) capture.TrackRootError!void {}
 
     /// Produces no lifecycle events.
     pub fn pollEvents(_: *Collector, _: capture.Sink) void {}

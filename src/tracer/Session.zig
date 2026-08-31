@@ -64,11 +64,9 @@ pub const StartError =
     std.process.SpawnError ||
     process_ops.ResumeError ||
     Allocator.Error ||
-    error{
-        ExactCaptureUnavailable,
-        MissingTarget,
-        LaunchTrackingRejected,
-    };
+    capture.ArmLaunchError ||
+    capture.TrackRootError ||
+    error{MissingTarget};
 
 const ProcessSpec = struct {
     pid: std.posix.pid_t,
@@ -982,7 +980,7 @@ fn waitForProcessExit(pid: std.posix.pid_t, io: std.Io) !void {
 }
 
 test "terminateTargetGroup tears down the whole spawned group" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const testing = std.testing;
     var temporary = testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -1015,7 +1013,7 @@ test "terminateTargetGroup tears down the whole spawned group" {
 }
 
 test "stop reaps a job-control-stopped target" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const testing = std.testing;
     var temporary = testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -1046,7 +1044,7 @@ test "stop reaps a job-control-stopped target" {
 }
 
 test "session stops when the root exits while a descendant is still running" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
@@ -1066,7 +1064,7 @@ test "session stops when the root exits while a descendant is still running" {
 }
 
 test "session ends cleanly across a build-like churn of children" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var collector = capture.Collector{};
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
@@ -1413,7 +1411,7 @@ test "exit without a fork recovers a zero-duration process" {
 }
 
 test "kernel fork events reach a live collector" {
-    if (capture.backend != .linux_ebpf) return error.SkipZigTest;
+    if (comptime capture.backend != .linux_ebpf) return error.SkipZigTest;
     var collector = capture.Collector.init(std.testing.allocator);
     defer collector.deinit();
     if (!collector.available()) {
@@ -1439,7 +1437,7 @@ test "kernel fork events reach a live collector" {
 }
 
 test "macOS collector captures descendant lifecycle and metadata" {
-    if (capture.backend != .macos) return error.SkipZigTest;
+    if (comptime capture.backend != .macos) return error.SkipZigTest;
     const testing = std.testing;
     var collector = capture.Collector.initWithOptions(testing.allocator, .{
         .endpoint_security = .disabled,
@@ -1474,7 +1472,7 @@ test "macOS collector captures descendant lifecycle and metadata" {
 }
 
 test "macOS fallback preserves shebang interpreter metadata" {
-    if (capture.backend != .macos) return error.SkipZigTest;
+    if (comptime capture.backend != .macos) return error.SkipZigTest;
     const testing = std.testing;
     var temporary = testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -1530,7 +1528,7 @@ test "macOS fallback preserves shebang interpreter metadata" {
 }
 
 test "macOS fallback retains an admitted descendant after setsid" {
-    if (capture.backend != .macos) return error.SkipZigTest;
+    if (comptime capture.backend != .macos) return error.SkipZigTest;
     const testing = std.testing;
     var collector = capture.Collector.initWithOptions(testing.allocator, .{
         .endpoint_security = .disabled,
@@ -1563,7 +1561,7 @@ test "macOS fallback retains an admitted descendant after setsid" {
 }
 
 test "macOS fallback recovers a reparented setsid child by original parent" {
-    if (capture.backend != .macos) return error.SkipZigTest;
+    if (comptime capture.backend != .macos) return error.SkipZigTest;
     const testing = std.testing;
     const daemon_script =
         \\import os,signal
@@ -1603,7 +1601,7 @@ test "macOS fallback recovers a reparented setsid child by original parent" {
 }
 
 test "macOS collector updates one root record across exec" {
-    if (capture.backend != .macos) return error.SkipZigTest;
+    if (comptime capture.backend != .macos) return error.SkipZigTest;
     const testing = std.testing;
     var collector = capture.Collector.init(testing.allocator);
     defer collector.deinit();
@@ -1646,7 +1644,7 @@ test "macOS collector updates one root record across exec" {
 }
 
 test "macOS final flush preserves immediate root exits" {
-    if (capture.backend != .macos) return error.SkipZigTest;
+    if (comptime capture.backend != .macos) return error.SkipZigTest;
     const testing = std.testing;
     var collector = capture.Collector.initWithOptions(testing.allocator, .{
         .endpoint_security = .disabled,
@@ -1676,7 +1674,7 @@ test "macOS final flush preserves immediate root exits" {
 }
 
 test "macOS root exit clips surviving descendants to the event boundary" {
-    if (capture.backend != .macos) return error.SkipZigTest;
+    if (comptime capture.backend != .macos) return error.SkipZigTest;
     const testing = std.testing;
     var collector = capture.Collector.initWithOptions(testing.allocator, .{
         .endpoint_security = .disabled,
@@ -1714,7 +1712,7 @@ test "macOS root exit clips surviving descendants to the event boundary" {
 }
 
 test "macOS fallback tracks a concurrent descendant burst" {
-    if (capture.backend != .macos) return error.SkipZigTest;
+    if (comptime capture.backend != .macos) return error.SkipZigTest;
     const testing = std.testing;
     var collector = capture.Collector.initWithOptions(testing.allocator, .{
         .endpoint_security = .disabled,
@@ -1745,7 +1743,7 @@ test "macOS fallback tracks a concurrent descendant burst" {
 }
 
 test "macOS collector restarts immediately after forced Stop" {
-    if (capture.backend != .macos) return error.SkipZigTest;
+    if (comptime capture.backend != .macos) return error.SkipZigTest;
     const testing = std.testing;
     var collector = capture.Collector.init(testing.allocator);
     defer collector.deinit();
@@ -1846,7 +1844,7 @@ test "metadata compaction keeps reachable argv and drops superseded bytes" {
 }
 
 test "root label matches the process when argv basename equals comm" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var comm_buf: [max_name_len]u8 = undefined;
     const self_pid = process_ops.currentPid();
     const comm = process_ops.readName(self_pid, &comm_buf) orelse return;
@@ -1858,7 +1856,7 @@ test "root label matches the process when argv basename equals comm" {
 }
 
 test "root label is other when argv basename does not match comm" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var comm_buf: [max_name_len]u8 = undefined;
     const named = Session.rootLabel(1, "build.sh", &comm_buf);
     try std.testing.expectEqual(NameKind.other, named.kind);

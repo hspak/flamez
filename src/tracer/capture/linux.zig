@@ -165,7 +165,7 @@ pub const Collector = struct {
 
     /// Clears the process's effective, permitted, and inheritable capability
     /// sets after the programs attach and before the target is spawned.
-    pub fn dropPrivileges(self: *const Collector) error{PrivilegeDropRejected}!void {
+    pub fn dropPrivileges(self: *const Collector) capture.DropPrivilegesError!void {
         if (comptime supported()) {
             if (self.handle != null and flamez_ebpf_drop_capabilities() != 0)
                 return error.PrivilegeDropRejected;
@@ -183,7 +183,7 @@ pub const Collector = struct {
     }
 
     /// Ensures the spawned root belongs to this capture.
-    pub fn trackRoot(self: *Collector, pid: std.posix.pid_t) error{LaunchTrackingRejected}!void {
+    pub fn trackRoot(self: *Collector, pid: std.posix.pid_t) capture.TrackRootError!void {
         if (comptime supported()) {
             if (self.handle) |handle| {
                 if (flamez_ebpf_track_pid(handle, pid) != 0)
@@ -193,7 +193,7 @@ pub const Collector = struct {
     }
 
     /// Arms exactly the next process spawned by `pid` as a tracked root.
-    pub fn armLaunch(self: *Collector, pid: std.posix.pid_t) error{LaunchTrackingRejected}!void {
+    pub fn armLaunch(self: *Collector, pid: std.posix.pid_t) capture.ArmLaunchError!void {
         if (comptime supported()) {
             if (self.handle) |handle| {
                 if (flamez_ebpf_seed_parent(handle, pid) != 0)

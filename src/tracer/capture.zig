@@ -20,6 +20,18 @@ pub const Fidelity = enum {
     unavailable,
 };
 
+/// Failure to remove capture privileges after attaching.
+pub const DropPrivilegesError = error{PrivilegeDropRejected};
+
+/// Failure to arm capture around a pending launch.
+pub const ArmLaunchError = error{
+    ExactCaptureUnavailable,
+    LaunchTrackingRejected,
+};
+
+/// Failure to register a spawned root with the active backend.
+pub const TrackRootError = error{LaunchTrackingRejected};
+
 /// Compile-time backend choice for the current target.
 pub const backend: Backend = switch (builtin.os.tag) {
     .linux => .linux_ebpf,
@@ -75,7 +87,7 @@ test {
 }
 
 test "unsupported collector reports the target operating system" {
-    if (backend != .unsupported) return error.SkipZigTest;
+    if (comptime backend != .unsupported) return error.SkipZigTest;
     var collector = Collector.init(std.testing.allocator);
     defer collector.deinit();
     try std.testing.expect(!collector.available());

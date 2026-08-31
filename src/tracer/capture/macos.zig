@@ -475,7 +475,7 @@ pub const Collector = struct {
     }
 
     /// macOS process inspection does not require a post-attach privilege drop.
-    pub fn dropPrivileges(_: *const Collector) error{PrivilegeDropRejected}!void {}
+    pub fn dropPrivileges(_: *const Collector) capture.DropPrivilegesError!void {}
 
     /// Returns collector-owned initialization diagnostics.
     pub fn diagnosticSlice(self: *const Collector) []const u8 {
@@ -498,7 +498,7 @@ pub const Collector = struct {
     pub fn armLaunch(
         self: *Collector,
         launcher_pid: std.posix.pid_t,
-    ) error{ LaunchTrackingRejected, ExactCaptureUnavailable }!void {
+    ) capture.ArmLaunchError!void {
         self.stopWorker();
         self.closeEs();
         self.lock();
@@ -551,7 +551,7 @@ pub const Collector = struct {
     pub fn trackRoot(
         self: *Collector,
         pid: std.posix.pid_t,
-    ) error{LaunchTrackingRejected}!void {
+    ) capture.TrackRootError!void {
         if (self.kqueue_fd < 0) return;
         self.lock();
         defer self.unlock();
