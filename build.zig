@@ -32,7 +32,15 @@ pub fn build(b: *std.Build) void {
         });
     const raylib = raylib_dep.module("raylib");
     const raylib_artifact = raylib_dep.artifact("raylib");
-    if (target.result.os.tag == .linux) moveRaylibLinuxLibraries(raylib_artifact, raylib);
+    if (target.result.os.tag == .linux) {
+        // Upstream hack: raylib doesn't expose a way for us to set the wayland
+        // app_id because it runs `glfwDefaultWindowHints()` which wipes the
+        // user defined value. There's also no entrypoint for the user to set
+        // it before raylib creates a window. Could upstream this one day, but
+        // not in its current state.
+        raylib_artifact.root_module.addCMacro("RAYLIB_WAYLAND_APP_ID", "\"flamez\"");
+        moveRaylibLinuxLibraries(raylib_artifact, raylib);
+    }
 
     // Linux embeds its eBPF loader; macOS uses a small libproc ABI bridge.
     const enable_ebpf = target.result.os.tag == .linux;

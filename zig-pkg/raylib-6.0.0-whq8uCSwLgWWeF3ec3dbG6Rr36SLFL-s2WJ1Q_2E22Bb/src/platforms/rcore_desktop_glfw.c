@@ -1459,6 +1459,9 @@ int InitPlatform(void)
     // Initialize graphic device: display/window and graphic context
     //----------------------------------------------------------------------------
     glfwDefaultWindowHints();                       // Set default windows hints
+#if defined(_GLFW_WAYLAND) && defined(RAYLIB_WAYLAND_APP_ID)
+    glfwWindowHintString(GLFW_WAYLAND_APP_ID, RAYLIB_WAYLAND_APP_ID);
+#endif
     //glfwWindowHint(GLFW_RED_BITS, 8);             // Framebuffer red color component bits
     //glfwWindowHint(GLFW_GREEN_BITS, 8);           // Framebuffer green color component bits
     //glfwWindowHint(GLFW_BLUE_BITS, 8);            // Framebuffer blue color component bits
