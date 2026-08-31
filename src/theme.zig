@@ -40,10 +40,22 @@ pub const blue: clay.Color = .{
     255,
     255,
 };
+pub const blue_bright: clay.Color = .{
+    143,
+    190,
+    255,
+    255,
+};
 pub const yellow: clay.Color = .{
     255,
     196,
     72,
+    255,
+};
+pub const yellow_bright: clay.Color = .{
+    255,
+    224,
+    137,
     255,
 };
 pub const cpu_hot: clay.Color = .{

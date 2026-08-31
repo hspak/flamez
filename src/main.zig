@@ -22,7 +22,9 @@ const panel_raised = theme.panel_raised;
 const border = theme.border;
 const accent = theme.accent;
 const blue = theme.blue;
+const blue_bright = theme.blue_bright;
 const yellow = theme.yellow;
+const yellow_bright = theme.yellow_bright;
 const cpu_hot = theme.cpu_hot;
 const ink = theme.ink;
 const muted = theme.muted;
@@ -752,7 +754,6 @@ fn applyTimelineClick(app: *App, target: TimelineClick) void {
 
 fn paintLifetimeBar(
     app: *const App,
-    process: *const tracer.Process,
     index: usize,
     bar: rl.Rectangle,
     look: BarLook,
@@ -761,15 +762,11 @@ fn paintLifetimeBar(
         rl.drawRectangleRounded(bar, 0.22, 4, look.color);
         if (app.selected_process == index) {
             rl.drawRectangleRoundedLinesEx(bar, 0.22, 4, 2, rl.Color.white);
-        } else if (process.end_ns == null) {
-            rl.drawRectangleRoundedLinesEx(bar, 0.22, 4, 1, toRaylibColor(accent));
         }
     } else {
         rl.drawRectangleRec(bar, look.color);
         if (app.selected_process == index) {
             rl.drawRectangleLinesEx(bar, 2, rl.Color.white);
-        } else if (process.end_ns == null) {
-            rl.drawRectangleLinesEx(bar, 1, toRaylibColor(accent));
         }
     }
 }
@@ -1112,7 +1109,7 @@ fn renderTimeline(
                 }
                 const process = &session.processes.items[index];
                 const has_children = process_tree.hasChildren(app, index);
-                const color = processColor(has_children);
+                const color = processColor(has_children, process.end_ns == null);
                 const bar = lifetimeBar(process, now_ns, .{
                     .window = window,
                     .view_span = view_span,
@@ -1160,7 +1157,7 @@ fn renderTimeline(
                         .ink = barNameInk(process.rowNameKind(), has_children),
                         .rounded = b.width >= 8,
                     };
-                    paintLifetimeBar(app, process, index, b, look);
+                    paintLifetimeBar(app, index, b, look);
                     try paintCpuSlices(app, process, .{
                         .window = window,
                         .view_span = view_span,
@@ -1264,12 +1261,12 @@ fn renderTimeline(
                             continue;
                         }
                         const look = BarLook{
-                            .color = processColor(has_kids),
+                            .color = processColor(has_kids, process.end_ns == null),
                             .font = row_font,
                             .ink = barNameInk(process.rowNameKind(), has_kids),
                             .rounded = !multi and b.width >= 8,
                         };
-                        paintLifetimeBar(app, process, index, b, look);
+                        paintLifetimeBar(app, index, b, look);
                         try paintCpuSlices(app, process, .{
                             .window = window,
                             .view_span = view_span,
@@ -1293,7 +1290,10 @@ fn renderTimeline(
                             1,
                             row_height - process_row_gap,
                         ),
-                        processColor(process_tree.hasChildren(app, index)),
+                        processColor(
+                            process_tree.hasChildren(app, index),
+                            session.processes.items[index].end_ns == null,
+                        ),
                     );
                 }
 
@@ -1427,8 +1427,13 @@ const tooltip_max_width: f32 = 560;
 // enough to swallow the first and last text rows.
 const tooltip_corner_radius: f32 = 4;
 // `numerator / denominator` as f32 for scrollbar geometry; 0 when empty.
-fn processColor(has_children: bool) rl.Color {
-    return toRaylibColor(if (has_children) blue else yellow);
+fn processColor(has_children: bool, active: bool) rl.Color {
+    return toRaylibColor(if (has_children)
+        if (active) blue_bright else blue
+    else if (active)
+        yellow_bright
+    else
+        yellow);
 }
 
 fn barNameInk(kind: tracer.NameKind, has_children: bool) rl.Color {
