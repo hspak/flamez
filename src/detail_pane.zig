@@ -89,11 +89,17 @@ pub const CpuGraphRange = struct {
 };
 
 fn detailCapacity(process: *const tracer.Process, metadata: []const u8) DetailCapacity {
-    const path_bytes = process.exeSlice(metadata).len +| process.cwdSlice(metadata).len;
-    const store = process.args_len +| process.args_count +| path_bytes +| 1024;
-    const wrapped_args = process.args_len / detail_min_line_glyphs;
-    const wrapped_paths = path_bytes / detail_min_line_glyphs;
-    const lines = 64 +| wrapped_args +| process.args_count +| wrapped_paths;
+    var store: usize = 1024;
+    var lines: usize = 64;
+    for (0..process.execCount()) |index| {
+        const exec = process.execAt(index);
+        const path_bytes = exec.cwdSlice(metadata).len;
+        store +|= exec.args_len +| exec.args_count +| path_bytes +| 256;
+        lines +|= 4 +|
+            exec.args_len / detail_min_line_glyphs +|
+            exec.args_count +|
+            path_bytes / detail_min_line_glyphs;
+    }
     return .{
         .store = store,
         .lines = lines,
@@ -402,6 +408,7 @@ pub fn renderTooltip(
             session,
             index,
             tooltip_sizes,
+            .{},
         );
         app.tooltip_line_count = tip.line_count;
         app.tooltip_overflowed = tip.overflowed;
@@ -910,7 +917,13 @@ pub fn render(
                 .store = app.detail_store,
                 .lines = app.detail_lines,
             };
-            const layout = buildProcessInfo(&tip, session, index, detail_sizes);
+            const layout = buildProcessInfo(
+                &tip,
+                session,
+                index,
+                detail_sizes,
+                .{ .include_exec_history = true },
+            );
             if (!tip.overflowed) {
                 app.detail_line_count = tip.line_count;
                 app.detail_timing_line = layout.timing_line;

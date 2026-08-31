@@ -782,7 +782,7 @@ fn paintBarLabel(
     bar: rl.Rectangle,
     look: BarLook,
 ) void {
-    const name = process.nameSlice();
+    const name = process.rowNameSlice();
     const name_hash = std.hash.Wyhash.hash(name.len, name);
     if (app.bar_name_widths.items[process_index] < 0 or
         app.bar_name_hashes.items[process_index] != name_hash)
@@ -797,7 +797,7 @@ fn paintBarLabel(
     const name_width = app.bar_name_widths.items[process_index];
     if (bar.width < name_width + bar_label_inset * 2) return;
     var summary_buf: [64]u8 = undefined;
-    const summary = process.argSummary(metadata, &summary_buf);
+    const summary = process.rowArgSummary(metadata, &summary_buf);
     var bar_label_buf: [96]u8 = undefined;
     const bar_label = if (summary.len == 0) name else std.fmt.bufPrint(
         &bar_label_buf,
@@ -1157,7 +1157,7 @@ fn renderTimeline(
                     const look = BarLook{
                         .color = color,
                         .font = row_font,
-                        .ink = barNameInk(process.name_kind, has_children),
+                        .ink = barNameInk(process.rowNameKind(), has_children),
                         .rounded = b.width >= 8,
                     };
                     paintLifetimeBar(app, process, index, b, look);
@@ -1266,7 +1266,7 @@ fn renderTimeline(
                         const look = BarLook{
                             .color = processColor(has_kids),
                             .font = row_font,
-                            .ink = barNameInk(process.name_kind, has_kids),
+                            .ink = barNameInk(process.rowNameKind(), has_kids),
                             .rounded = !multi and b.width >= 8,
                         };
                         paintLifetimeBar(app, process, index, b, look);

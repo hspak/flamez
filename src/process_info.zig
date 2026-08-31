@@ -1,5 +1,4 @@
-//! Builds the styled key/value info block for one process. Shared verbatim
-//! by the hover tooltip and the bottom detail pane; only font sizes differ.
+//! Builds styled process information for the hover tooltip and detail pane.
 
 const std = @import("std");
 const rl = @import("raylib");
@@ -220,7 +219,7 @@ fn wrapPrefix(font: rl.Font, input: []const u8, size: f32, max_width: f32) usize
 
 fn addArguments(
     tip: *TooltipBuilder,
-    process: *const tracer.Process,
+    exec: *const tracer.Process.Exec,
     metadata: []const u8,
     arg_count: usize,
     size: f32,
@@ -231,11 +230,11 @@ fn addArguments(
         return;
     }
     const remaining = tip.store[tip.store_len..];
-    const arguments = if (formatArguments(process, metadata, arg_count, remaining)) |full|
+    const arguments = if (formatArguments(exec, metadata, arg_count, remaining)) |full|
         full
     else partial_arguments: {
         tip.overflowed = true;
-        break :partial_arguments formatArgumentsPrefix(process, metadata, arg_count, remaining);
+        break :partial_arguments formatArgumentsPrefix(exec, metadata, arg_count, remaining);
     };
     if (arguments.len == 0) {
         tip.overflowed = true;
@@ -246,7 +245,7 @@ fn addArguments(
     var prefix_buf: [64]u8 = undefined;
     const prefix = std.fmt.bufPrint(&prefix_buf, "Command (args: {d}): ", .{arg_count}) catch
         unreachable;
-    const argv0_end = prefix.len +| process.argv0(metadata).len;
+    const argv0_end = prefix.len +| exec.argv0(metadata).len;
     tip.addStoredWrappedStyled(tip.store[start..tip.store_len], size, color, .{
         .bold = .{ .start = 0, .end = "Command".len },
         .accent = .{ .start = prefix.len, .end = argv0_end },
@@ -254,7 +253,7 @@ fn addArguments(
 }
 
 fn formatArguments(
-    process: *const tracer.Process,
+    exec: *const tracer.Process.Exec,
     metadata: []const u8,
     arg_count: usize,
     output: []u8,
@@ -262,18 +261,18 @@ fn formatArguments(
     var prefix_buf: [64]u8 = undefined;
     const prefix = std.fmt.bufPrint(&prefix_buf, "Command (args: {d}): ", .{arg_count}) catch
         unreachable;
-    const required = std.math.add(usize, prefix.len, process.args_len) catch return null;
+    const required = std.math.add(usize, prefix.len, exec.args_len) catch return null;
     if (required > output.len) return null;
     @memcpy(output[0..prefix.len], prefix);
-    const arguments = process.copyCmdline(
+    const arguments = exec.copyCmdline(
         metadata,
-        output[prefix.len..][0..process.args_len],
+        output[prefix.len..][0..exec.args_len],
     );
     return output[0 .. prefix.len + arguments.len];
 }
 
 fn formatArgumentsPrefix(
-    process: *const tracer.Process,
+    exec: *const tracer.Process.Exec,
     metadata: []const u8,
     arg_count: usize,
     output: []u8,
@@ -284,7 +283,7 @@ fn formatArgumentsPrefix(
     if (output.len <= prefix.len) return output[0..0];
     @memcpy(output[0..prefix.len], prefix);
     var len = prefix.len;
-    var args = process.argsIter(metadata);
+    var args = exec.argsIter(metadata);
     var argument_index: usize = 0;
     while (args.next()) |arg| {
         if (argument_index > 0) {
@@ -306,6 +305,10 @@ fn formatArgumentsPrefix(
 pub const InfoSizes = struct {
     title: f32,
     body: f32,
+};
+
+pub const BuildOptions = struct {
+    include_exec_history: bool = false,
 };
 
 pub const InfoLayout = struct {
@@ -366,13 +369,95 @@ pub fn formatTimingLine(
     ) catch "START  —  ·  END  —  ·  WALL  —  ·  CPU  —";
 }
 
-/// Fills `tip` with the styled lines describing `session.processes.items[index]`.
-/// Shared verbatim by the hover tooltip and the bottom detail pane.
+fn addExecFields(
+    tip: *TooltipBuilder,
+    exec: *const tracer.Process.Exec,
+    metadata: []const u8,
+    size: f32,
+) void {
+    var wide_buf: [tracer.max_path_len + 128]u8 = undefined;
+    if (exec.cwdSlice(metadata).len > 0) {
+        const cwd_line = std.fmt.bufPrint(
+            &wide_buf,
+            "Directory{s}: {s}",
+            .{
+                if (exec.cwd_truncated) "  (TRUNCATED)" else "",
+                exec.cwdSlice(metadata),
+            },
+        ) catch unreachable;
+        tip.addWrappedStyled(cwd_line, size, toRaylibColor(ink), .{
+            .bold = .{ .start = 0, .end = "Directory".len },
+        });
+    }
+
+    // The displayed argument count excludes the program name, but the command
+    // itself includes argv[0] so it can be copied and run as shown.
+    const arg_count = exec.args_count -| 1;
+    if (exec.args_count > 0) {
+        addArguments(
+            tip,
+            exec,
+            metadata,
+            arg_count,
+            size,
+            toRaylibColor(ink),
+        );
+    }
+}
+
+fn addExecHeader(
+    tip: *TooltipBuilder,
+    exec: *const tracer.Process.Exec,
+    ordinal: usize,
+    size: f32,
+) void {
+    var start_buf: [32]u8 = undefined;
+    var end_buf: [32]u8 = undefined;
+    var label_buf: [32]u8 = undefined;
+    const start = text.formatDuration(exec.start_ns, &start_buf);
+    const end = if (exec.end_ns) |end_ns|
+        text.formatDuration(end_ns, &end_buf)
+    else
+        "running";
+    const label = std.fmt.bufPrint(&label_buf, "EXEC {d}", .{ordinal}) catch unreachable;
+    var header_buf: [128]u8 = undefined;
+    const header = std.fmt.bufPrint(
+        &header_buf,
+        "{s}  ·  START {s}  ·  END {s}",
+        .{ label, start, end },
+    ) catch unreachable;
+    tip.addWrappedStyled(header, size, toRaylibColor(muted), .{
+        .bold = .{ .start = 0, .end = label.len },
+    });
+}
+
+fn addExecHistory(
+    tip: *TooltipBuilder,
+    process: *const tracer.Process,
+    metadata: []const u8,
+    sizes: InfoSizes,
+) void {
+    tip.addWrappedStyled(
+        "EXECUTION HISTORY",
+        sizes.title,
+        toRaylibColor(ink),
+        .{ .bold = .{ .start = 0, .end = "EXECUTION HISTORY".len } },
+    );
+    for (0..process.execCount()) |index| {
+        const exec = process.execAt(index);
+        addExecHeader(tip, &exec, index + 1, sizes.body);
+        addExecFields(tip, &exec, metadata, sizes.body);
+    }
+}
+
+/// Fills `tip` with styled process information. Detailed callers may include
+/// every exec; compact callers receive only the current exec.
 pub fn buildProcessInfo(
     tip: *TooltipBuilder,
     session: *const tracer.Session,
     index: usize,
     sizes: InfoSizes,
+    options: BuildOptions,
 ) InfoLayout {
     const process = &session.processes.items[index];
     const metadata = session.metadataBytes();
@@ -426,35 +511,11 @@ pub fn buildProcessInfo(
     tip.add(timing, sizes.body, toRaylibColor(muted));
     if (tip.line_count > timing_index) layout.timing_line = timing_index;
 
-    // Process fields are fixed-capacity; the extra bytes cover every inline
-    // label and delimiter, so the following formatting cannot overflow.
-    var wide_buf: [tracer.max_path_len + 128]u8 = undefined;
-    if (process.cwdSlice(metadata).len > 0) {
-        const cwd_line = std.fmt.bufPrint(
-            &wide_buf,
-            "Directory{s}: {s}",
-            .{
-                if (process.cwd_truncated) "  (TRUNCATED)" else "",
-                process.cwdSlice(metadata),
-            },
-        ) catch unreachable;
-        tip.addWrappedStyled(cwd_line, sizes.body, toRaylibColor(ink), .{
-            .bold = .{ .start = 0, .end = "Directory".len },
-        });
-    }
-
-    // The displayed argument count excludes the program name, but the command
-    // itself includes argv[0] so it can be copied and run as shown.
-    const arg_count = process.args_count -| 1;
-    if (process.args_count > 0) {
-        addArguments(
-            tip,
-            process,
-            metadata,
-            arg_count,
-            sizes.body,
-            toRaylibColor(ink),
-        );
+    if (options.include_exec_history) {
+        addExecHistory(tip, process, metadata, sizes);
+    } else {
+        const exec = process.currentExec();
+        addExecFields(tip, &exec, metadata, sizes.body);
     }
     return layout;
 }
@@ -542,9 +603,10 @@ test "argument prefix fills available storage without requiring the full argv" {
         "-c",
         "source file.c",
     });
+    const exec = process.currentExec();
     var buffer: [24]u8 = undefined;
 
-    const row = formatArgumentsPrefix(&process, metadata.items, 2, &buffer);
+    const row = formatArgumentsPrefix(&exec, metadata.items, 2, &buffer);
     try testing.expect(std.mem.startsWith(u8, row, "Command (args: 2): "));
     try testing.expect(row.len == buffer.len);
 }
@@ -560,9 +622,10 @@ test "argument row joins argv with spaces" {
         "-c",
         "source file.c",
     });
+    const exec = process.currentExec();
     var buffer: [128]u8 = undefined;
 
-    const row = formatArguments(&process, metadata.items, 2, &buffer).?;
+    const row = formatArguments(&exec, metadata.items, 2, &buffer).?;
 
     try testing.expectEqualStrings("Command (args: 2): clang -c source file.c", row);
 }
