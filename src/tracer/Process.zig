@@ -276,6 +276,15 @@ pub fn recordCpuSnapshot(
     );
 }
 
+/// Recomputes CPU slice bands and peak occupancy from canonical slice triples.
+pub fn rebuildCpuCaches(self: *Process) void {
+    self.cpu_peak_cores = 0;
+    for (self.cpu_slices.items) |*slice| {
+        slice.band = cpuBand(slice.cpu_ns, slice.durationNs());
+        self.cpu_peak_cores = @max(self.cpu_peak_cores, slice.averageCores());
+    }
+}
+
 /// First index of a time-ordered slice list that can overlap `[window_start, window_end)`.
 /// Returns `slices.len` when nothing in the list is visible.
 pub fn firstVisibleSlice(slices: []const CpuSlice, window_start_ns: u64, window_end_ns: u64) usize {
@@ -338,6 +347,31 @@ fn coalesceLastCpuSlices(self: *Process) void {
     previous.end_ns = last.end_ns;
     previous.cpu_ns +|= last.cpu_ns;
     self.cpu_slices.items.len -= 1;
+}
+
+fn clipCpuSlices(self: *Process, end_ns: u64) void {
+    if (self.cpu_snapshot_initialized) {
+        self.cpu_snapshot_at_ns = @min(self.cpu_snapshot_at_ns, end_ns);
+    }
+    if (self.cpu_slices.items.len == 0 or
+        self.cpu_slices.items[self.cpu_slices.items.len - 1].end_ns <= end_ns)
+    {
+        return;
+    }
+    for (self.cpu_slices.items, 0..) |*slice, index| {
+        if (slice.start_ns >= end_ns) {
+            self.cpu_slices.items.len = index;
+            break;
+        }
+        if (slice.end_ns > end_ns) {
+            slice.end_ns = end_ns;
+            self.cpu_slices.items.len = index + 1;
+            break;
+        }
+    }
+    self.rebuildCpuCaches();
+    coalesceLastCpuSlices(self);
+    self.rebuildCpuCaches();
 }
 
 fn cpuBand(cpu_ns: u64, duration_ns: u64) u8 {
@@ -731,23 +765,21 @@ fn storePath(
     gpa: Allocator,
     value: []const u8,
 ) Allocator.Error!StoredPath {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    const n = @min(trimmed.len, max_path_len);
+    const n = @min(value.len, max_path_len);
     const offset = store.items.len;
-    try store.appendSlice(gpa, trimmed[0..n]);
+    try store.appendSlice(gpa, value[0..n]);
     return .{
         .offset = offset,
         .len = @intCast(n),
-        .truncated = trimmed.len >= max_path_len,
+        .truncated = value.len > max_path_len,
     };
 }
 
 fn pathUnchanged(current: []const u8, value: []const u8, truncated: bool) bool {
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    const n = @min(trimmed.len, max_path_len);
+    const n = @min(value.len, max_path_len);
     return current.len == n and
-        truncated == (trimmed.len >= max_path_len) and
-        std.mem.eql(u8, current, trimmed[0..n]);
+        truncated == (value.len > max_path_len) and
+        std.mem.eql(u8, current, value[0..n]);
 }
 
 /// Stores a bounded executable path in this record.
@@ -794,8 +826,7 @@ pub fn setExeFromKernel(
     value: []const u8,
     truncated: bool,
 ) Allocator.Error!void {
-    const will_truncate = truncated or
-        std.mem.trim(u8, value, " \t\r\n").len >= max_path_len;
+    const will_truncate = truncated or value.len > max_path_len;
     if (pathUnchanged(self.exeSlice(store.items), value, will_truncate) and
         self.exe_source == .kernel)
     {
@@ -853,8 +884,7 @@ pub fn setCwdFromKernel(
     value: []const u8,
     truncated: bool,
 ) Allocator.Error!void {
-    const will_truncate = truncated or
-        std.mem.trim(u8, value, " \t\r\n").len >= max_path_len;
+    const will_truncate = truncated or value.len > max_path_len;
     if (pathUnchanged(self.cwdSlice(store.items), value, will_truncate) and
         self.cwd_source == .kernel)
     {
@@ -909,6 +939,7 @@ pub fn finish(self: *Process, at_ns: u64, kind: EndKind) bool {
     if (self.end_ns != null) return false;
     self.end_ns = @max(at_ns, self.start_ns);
     self.end_kind = kind;
+    self.clipCpuSlices(self.end_ns.?);
     self.revision +%= 1;
     return true;
 }
@@ -1069,6 +1100,21 @@ test "final CPU snapshot reconciles map sampling skew" {
     );
 }
 
+test "finishing clips delayed CPU samples to the process lifetime" {
+    const testing = std.testing;
+    var process = Process{ .pid = 7 };
+    defer process.deinit(testing.allocator);
+
+    try process.recordCpuSnapshot(testing.allocator, 80, 20);
+    try process.recordCpuSnapshot(testing.allocator, 120, 60);
+    try testing.expect(process.finish(100, .observed_exit));
+
+    try testing.expectEqual(@as(usize, 2), process.cpu_slices.items.len);
+    try testing.expectEqual(@as(u64, 100), process.cpu_slices.items[1].end_ns);
+    try testing.expectEqual(@as(u8, 8), process.cpu_slices.items[1].band);
+    try testing.expectApproxEqAbs(@as(f64, 2), process.cpu_peak_cores, 0.0001);
+}
+
 test "process names are trimmed and bounded" {
     var process = Process{ .pid = 7, .parent_pid = null, .depth = 0, .start_ns = 0 };
     process.setName("  compiler\n", .process);
@@ -1185,6 +1231,31 @@ test "identical CWD and exe paths reuse the stored offset" {
     try testing.expectEqual(exe_store_len, metadata.items.len);
 }
 
+test "paths preserve bytes and report only over-cap truncation" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var metadata = MetadataStore.empty;
+    defer metadata.deinit(gpa);
+    var process = Process{ .pid = 1 };
+
+    const spaced_path = " /tmp/build\t";
+    try process.setCwd(&metadata, gpa, spaced_path);
+    try testing.expectEqualStrings(spaced_path, process.cwdSlice(metadata.items));
+    try testing.expect(!process.cwd_truncated);
+
+    var exact_path: [max_path_len]u8 = undefined;
+    @memset(&exact_path, 'x');
+    try process.setExe(&metadata, gpa, &exact_path);
+    try testing.expectEqual(@as(usize, max_path_len), process.exeSlice(metadata.items).len);
+    try testing.expect(!process.exe_truncated);
+
+    var long_path: [max_path_len + 1]u8 = undefined;
+    @memset(&long_path, 'y');
+    try process.setCwd(&metadata, gpa, &long_path);
+    try testing.expectEqual(@as(usize, max_path_len), process.cwdSlice(metadata.items).len);
+    try testing.expect(process.cwd_truncated);
+}
+
 test "exec history retains replaced metadata" {
     const testing = std.testing;
     const gpa = testing.allocator;
@@ -1270,6 +1341,24 @@ test "first visible slice is the lower bound on end time" {
     try std.testing.expectEqual(@as(usize, 2), firstVisibleSlice(&slices, 20, 45));
     try std.testing.expectEqual(@as(usize, 4), firstVisibleSlice(&slices, 50, 60));
     try std.testing.expectEqual(@as(usize, 0), firstVisibleSlice(&slices, 0, 5));
+}
+
+test "rebuild CPU caches derives bands and peak from slices" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var process = Process{ .pid = 1 };
+    defer process.deinit(gpa);
+    try process.cpu_slices.appendSlice(gpa, &.{
+        .{ .start_ns = 0, .end_ns = 100, .cpu_ns = 25, .band = 64 },
+        .{ .start_ns = 100, .end_ns = 200, .cpu_ns = 200, .band = 1 },
+    });
+    process.cpu_peak_cores = 99;
+
+    process.rebuildCpuCaches();
+
+    try testing.expectEqual(@as(u8, 1), process.cpu_slices.items[0].band);
+    try testing.expectEqual(@as(u8, 8), process.cpu_slices.items[1].band);
+    try testing.expectApproxEqAbs(@as(f64, 2), process.cpu_peak_cores, 0.0001);
 }
 
 test "process records keep bulk metadata out of the hot array" {

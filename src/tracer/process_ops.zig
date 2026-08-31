@@ -12,6 +12,10 @@ const implementation = switch (builtin.os.tag) {
 pub const WaitNowait = implementation.WaitNowait;
 /// Failure to resume a target after capture has been armed around its PID.
 pub const ResumeError = implementation.ResumeError;
+/// Target stdout destination selected at spawn time.
+pub const TargetStdout = implementation.TargetStdout;
+/// Process spawn behavior independent of capture backend selection.
+pub const SpawnOptions = implementation.SpawnOptions;
 /// Spawns the target in a dedicated process group. macOS returns it suspended.
 pub const spawnTarget = implementation.spawnTarget;
 /// Lets a platform-suspended target begin executing after root registration.

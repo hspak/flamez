@@ -1,7 +1,5 @@
-//! Process-group teardown policy: fatal-signal handlers plus the atomic pid
-//! bookkeeping that lets flamez kill the whole target tree (ninja's
-//! posix_spawn'd jobs live in groups of their own) from an async-signal-safe
-//! handler.
+//! Cooperative termination-signal handling plus the atomic pid bookkeeping
+//! used to sweep the whole target tree from an async-signal-safe handler.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -28,6 +26,7 @@ pub fn armedTargetPgid() std.posix.pid_t {
 // only `-pgid` leaves the linker running. `tracked_pids` is the signal-safe
 // list of every tgid we have seen, so teardown can kill those extra groups.
 var live_target_pgid: std.atomic.Value(std.posix.pid_t) = .init(0);
+var stop_requested: std.atomic.Value(bool) = .init(false);
 
 pub const TrackedSlot = u16;
 // Same cap as the kernel `tracked_pids` map so Stop/Ctrl+C can signal
@@ -40,7 +39,7 @@ var tracked_pids: [max_tracked_pids]std.atomic.Value(std.posix.pid_t) =
     [_]std.atomic.Value(std.posix.pid_t){.init(0)} ** max_tracked_pids;
 var next_tracked_slot: usize = 0;
 
-/// Disables fatal-signal teardown for the completed target group.
+/// Disables signal-handler teardown for the completed target group.
 pub fn disarmTargetGroup() void {
     live_target_pgid.store(0, .release);
 }
@@ -110,7 +109,7 @@ pub fn pidAlive(pid: std.posix.pid_t) bool {
     return process_ops.pidAlive(pid);
 }
 
-/// TERM, short grace, then KILL. Async-signal-safe: used from handleFatalSignal.
+/// TERM, short grace, then KILL. Safe for the termination-signal handler.
 /// Hits the root process group **and** every remembered tgid/group, because
 /// ninja's compile/link jobs live in their own process groups.
 pub fn terminateTargetGroup(pgid: std.posix.pid_t) void {
@@ -124,11 +123,18 @@ fn terminateLiveTargets() void {
     terminateTargetGroup(live_target_pgid.load(.acquire));
 }
 
-fn handleFatalSignal(sig: std.posix.SIG) callconv(.c) void {
-    terminateLiveTargets();
+fn claimStopRequest() bool {
+    return stop_requested.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
+}
 
-    // Restore the default disposition and re-raise so flamez dies from the
-    // signal it received, exactly as it would have without handlers installed.
+/// Returns whether a termination signal requested an orderly stop.
+pub fn stopRequested() bool {
+    return stop_requested.load(.acquire);
+}
+
+fn abortFromSignal(sig: std.posix.SIG) noreturn {
+    // The cooperative stop is already in progress. Restore the default
+    // disposition and re-raise so another signal remains an escape hatch.
     var dfl = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.DFL },
         .mask = std.posix.sigemptyset(),
@@ -136,18 +142,27 @@ fn handleFatalSignal(sig: std.posix.SIG) callconv(.c) void {
     };
     std.posix.sigaction(sig, &dfl, null);
     process_ops.safeKill(process_ops.currentPid(), sig);
-    @panic("fatal signal did not terminate the process");
+    @panic("termination signal did not terminate the process");
 }
 
-/// Installs handlers for the terminal-generated and job-control signals that
-/// would otherwise kill flamez instantly and orphan the whole target process
-/// group (the target deliberately lives in its own process group, so Ctrl+C
-/// reaches flamez alone). Idempotent; a no-op on non-POSIX targets.
+fn handleTerminationSignal(sig: std.posix.SIG) callconv(.c) void {
+    if (claimStopRequest()) {
+        terminateLiveTargets();
+        return;
+    }
+
+    abortFromSignal(sig);
+}
+
+/// Installs cooperative handlers for termination signals and ignores SIGPIPE.
+/// The first signal requests an orderly stop and sweeps the target tree; a
+/// second signal restores default fatal behavior. Idempotent; a no-op on
+/// non-POSIX targets.
 pub fn installFatalSignalHandlers() void {
     if (comptime builtin.os.tag == .windows) return;
 
     const act = std.posix.Sigaction{
-        .handler = .{ .handler = handleFatalSignal },
+        .handler = .{ .handler = handleTerminationSignal },
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
@@ -168,9 +183,28 @@ pub fn installFatalSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.PIPE, &ign, null);
 }
 
-test "fatal signal handlers install idempotently" {
+test "termination signal handlers install idempotently" {
     installFatalSignalHandlers();
     installFatalSignalHandlers();
+}
+
+test "only one simultaneous signal claims the cooperative stop" {
+    stop_requested.store(false, .release);
+    defer stop_requested.store(false, .release);
+
+    var winners: std.atomic.Value(usize) = .init(0);
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, countClaim, .{&winners});
+    }
+    for (threads) |thread| thread.join();
+
+    try std.testing.expectEqual(@as(usize, 1), winners.load(.acquire));
+    try std.testing.expect(stopRequested());
+}
+
+fn countClaim(winners: *std.atomic.Value(usize)) void {
+    if (claimStopRequest()) _ = winners.fetchAdd(1, .acq_rel);
 }
 
 test "tracked pid slots are released without a table scan" {

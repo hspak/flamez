@@ -9,6 +9,15 @@ pub const args_source = .procfs;
 
 pub const ResumeError = error{TargetResumeRejected};
 
+pub const TargetStdout = enum {
+    inherit,
+    stderr,
+};
+
+pub const SpawnOptions = struct {
+    target_stdout: TargetStdout = .inherit,
+};
+
 /// Result of a nonblocking wait on the target root.
 pub const WaitNowait = union(enum) {
     still_running,
@@ -22,12 +31,16 @@ pub fn spawnTarget(
     _: Allocator,
     io: std.Io,
     argv: []const []const u8,
+    options: SpawnOptions,
 ) std.process.SpawnError!std.process.Child {
     return std.process.spawn(io, .{
         .argv = argv,
         .pgid = 0,
         .stdin = .ignore,
-        .stdout = .inherit,
+        .stdout = switch (options.target_stdout) {
+            .inherit => .inherit,
+            .stderr => .{ .file = std.Io.File.stderr() },
+        },
         .stderr = .inherit,
     });
 }
@@ -172,5 +185,24 @@ pub fn sleepTerminationGrace() void {
         const rc = std.os.linux.nanosleep(&req, &rest);
         if (rc != @intFromEnum(std.os.linux.E.INTR)) return;
         req = rest;
+    }
+}
+
+test "target stdout can be routed to the inherited stderr destination" {
+    const testing = std.testing;
+    var child = try spawnTarget(
+        testing.allocator,
+        testing.io,
+        &.{
+            "sh",
+            "-c",
+            "test /proc/self/fd/1 -ef /proc/self/fd/2",
+        },
+        .{ .target_stdout = .stderr },
+    );
+    errdefer child.kill(testing.io);
+    switch (try child.wait(testing.io)) {
+        .exited => |code| try testing.expectEqual(@as(u8, 0), code),
+        .signal, .stopped, .unknown => return error.TestUnexpectedResult,
     }
 }

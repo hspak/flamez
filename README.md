@@ -107,10 +107,39 @@ For example:
 ```sh
 /usr/local/bin/flamez zig build -Doptimize=ReleaseFast
 /usr/local/bin/flamez make -j8 all
+/usr/local/bin/flamez -o capture.json -- make -j8 all
+/usr/local/bin/flamez --output=- make -j8 | jq .
+/usr/local/bin/flamez -i capture.json
+/usr/local/bin/flamez -a capture.json
+cat capture.json | /usr/local/bin/flamez -i -
 ```
 
+Flags precede the target, and `--` ends Flamez flag parsing. With no mode flag,
 Flamez opens the GUI and immediately launches the target with the remaining
 arguments unchanged—there is no intermediate shell and no command-entry UI.
+`-o`/`--output` captures without initializing a window, atomically replaces a
+named output after a successful write, and exits 0, 1, 2, 3, or 4 for success,
+Flamez failure, usage error, incomplete capture, or target failure respectively.
+When output is `-`, Flamez writes only session JSON to stdout and routes the
+target's stdout to stderr so pipelines stay valid.
+
+`-i`/`--import` streams a finished session from a path or stdin and opens it in
+the GUI without initializing the platform collector or requiring Linux BPF
+capabilities. Import is always explicit: a bare `capture.json` remains a target
+command. After any capture finishes, or after import, **Ctrl+S** saves to
+a filename derived from the target argv, such as
+`flamez-zig-build-doptimize-releasefast.json`. Filename components are
+lowercase and hyphen-delimited, the target-derived stem is capped at 50
+characters, and the next available numeric suffix is used without replacing an
+existing automatic save.
+
+`-a`/`--analyze` validates a session file and atomically writes a compact
+performance-debugging view beside it as `analyzed-<filename>`. The analysis
+surfaces process dependency chains, CPU and wall-time bottlenecks, bounded
+command previews, subtree CPU totals, and conservative I/O/wait candidates.
+It requires neither a window nor a collector. See [ANALYSIS.md](ANALYSIS.md)
+for the derived format and heuristic definitions.
+
 Press **Stop** to terminate the target process group. F5 toggles Clay's layout
 inspector. Use the arrow button in the timeline header to collapse or expand
 every row, or the matching button in the left gutter to toggle one row. For
@@ -202,6 +231,12 @@ process-image metadata.
   renderer.
 - `src/tracer.zig` owns sessions, process records, spawning, normalized capture
   ingestion, lifetime state, and bucketed CPU slices.
+- `src/session_file.zig` validates and streams the compact versioned JSON
+  session format, including interned metadata and atomic path installation.
+- `src/analysis_file.zig` streams the bounded, dependency- and
+  bottleneck-oriented analysis JSON derived from a validated session.
+- `src/cli.zig` parses the explicit GUI capture, headless output, import, and
+  analysis modes and classifies headless capture results.
 - `src/tracer/capture.zig` selects an operating-system collector at compile
   time and exposes the backend-neutral lifecycle event contract.
 - `src/tracer/process_ops.zig` selects process wait, metadata, and teardown
@@ -218,14 +253,16 @@ process-image metadata.
 - `src/macos_shim.c` isolates macOS private process-inspection structures used
   for PID identity, argv, executable, CWD, and CPU totals.
 
-CPU slices answer which process was using cycles and when; they do not yet
-identify hot functions or explain off-CPU delay. Stack sampling, symbolization,
-wakeup/off-CPU accounting, zoom/pan, export, and explicit thread grouping are
-natural follow-on layers; the event/data model is intentionally separate from
-the UI so those can be added without rewriting capture sessions.
+CPU slices answer which process was using cycles and when; they do not identify
+hot functions or prove why a process was off CPU. Analysis files expose spans
+with neither CPU activity nor a direct child as possible I/O/wait candidates.
+Stack sampling, symbolization, wakeup/off-CPU accounting, and explicit thread
+grouping are natural follow-on layers; the event/data model is intentionally
+separate from the UI so those can be added without rewriting capture sessions.
 
 Session JSON export, import into the GUI, and a headless `-o` mode are
-specified in [HEADLESS.md](HEADLESS.md) and are not implemented yet.
+specified in [HEADLESS.md](HEADLESS.md). The derived agent-oriented analysis
+format is specified in [ANALYSIS.md](ANALYSIS.md).
 
 ## Validation hooks
 

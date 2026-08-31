@@ -2357,6 +2357,7 @@ test "fallback recovers an escaped child by immutable parent identity" {
             daemon_script,
             pid_path,
         },
+        .{},
     );
     errdefer child.kill(testing.io);
     const root_pid = child.id.?;
@@ -2423,6 +2424,7 @@ test "fallback does not adopt a double-fork daemon without an identity chain" {
             daemon_script,
             pid_path,
         },
+        .{},
     );
     errdefer child.kill(testing.io);
     const root_pid = child.id.?;

@@ -56,30 +56,36 @@ pub fn makeViewText(session: *const tracer.Session) ViewText {
         const fps = std.fmt.bufPrint(&view_text.fps, "{d} FPS", .{rl.getFPS()}) catch "0 FPS";
         view_text.fps_len = fps.len;
     }
-    const status = if (session.incomplete and session.running)
+    const incomplete = session.isIncomplete();
+    const status = if (incomplete and session.running)
         "INCOMPLETE"
     else if (session.running)
         "RUNNING"
-    else if (session.incomplete) status: {
-        if (session.exit_code) |code|
-            break :status std.fmt.bufPrint(
-                &view_text.status,
-                "INCOMPLETE · EXIT {d}",
-                .{code},
-            ) catch "INCOMPLETE";
-        if (session.exit_signal) |signal|
-            break :status std.fmt.bufPrint(
-                &view_text.status,
-                "INCOMPLETE · SIGNAL {d}",
-                .{signal},
-            ) catch "INCOMPLETE";
-        break :status "INCOMPLETE";
-    } else if (session.exit_code) |code|
-        std.fmt.bufPrint(&view_text.status, "FINISHED · EXIT {d}", .{code}) catch "FINISHED"
-    else if (session.exit_signal) |signal|
-        std.fmt.bufPrint(&view_text.status, "STOPPED · SIGNAL {d}", .{signal}) catch "STOPPED"
-    else
-        "READY";
+    else if (incomplete) switch (session.root_exit) {
+        .exited => |code| std.fmt.bufPrint(
+            &view_text.status,
+            "INCOMPLETE · EXIT {d}",
+            .{code},
+        ) catch "INCOMPLETE",
+        .signaled => |signal| std.fmt.bufPrint(
+            &view_text.status,
+            "INCOMPLETE · SIGNAL {d}",
+            .{signal},
+        ) catch "INCOMPLETE",
+        .unknown => "INCOMPLETE",
+    } else switch (session.root_exit) {
+        .exited => |code| std.fmt.bufPrint(
+            &view_text.status,
+            "FINISHED · EXIT {d}",
+            .{code},
+        ) catch "FINISHED",
+        .signaled => |signal| std.fmt.bufPrint(
+            &view_text.status,
+            "STOPPED · SIGNAL {d}",
+            .{signal},
+        ) catch "STOPPED",
+        .unknown => if (session.finished) "FINISHED" else "READY",
+    };
     view_text.status_len = status.len;
     view_text.elapsed_len = text.formatDuration(session.timelineNs(), &view_text.elapsed).len;
     const process_count = std.fmt.bufPrint(
@@ -94,11 +100,11 @@ pub fn makeViewText(session: *const tracer.Session) ViewText {
         .{session.activeCount()},
     ) catch "0";
     view_text.active_count_len = active_count.len;
-    if (session.lost_events > 0) {
+    if (session.loss_count > 0) {
         const dropped = std.fmt.bufPrint(
             &view_text.dropped,
             "{d}",
-            .{session.lost_events},
+            .{session.loss_count},
         ) catch "1";
         view_text.dropped_len = dropped.len;
     }
@@ -223,6 +229,28 @@ pub fn create(
                     .corner_radius = .all(5),
                 })({
                     clay.text("STOP", .{
+                        .font_id = footer_font_id,
+                        .font_size = 12,
+                        .color = theme.canvas,
+                        .wrap_mode = .none,
+                    });
+                });
+            } else if (session.finished) {
+                clay.UI()(.{
+                    .id = .ID("ExportButton"),
+                    .layout = .{
+                        .sizing = .{ .w = .fixed(68), .h = .fixed(22) },
+                        .child_alignment = .center,
+                    },
+                    .background_color = if (clay.hovered()) .{
+                        122,
+                        240,
+                        160,
+                        255,
+                    } else theme.fps_green,
+                    .corner_radius = .all(5),
+                })({
+                    clay.text("EXPORT", .{
                         .font_id = footer_font_id,
                         .font_size = 12,
                         .color = theme.canvas,

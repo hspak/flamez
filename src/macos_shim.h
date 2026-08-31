@@ -17,7 +17,9 @@ struct flamez_macos_process_identity {
 
 int flamez_macos_process_identity(int32_t pid,
                                   struct flamez_macos_process_identity *identity);
-int flamez_macos_spawn_suspended(const char *const *argv, int32_t *pid);
+int flamez_macos_spawn_suspended(const char *const *argv,
+                                 int32_t *pid,
+                                 int redirect_stdout_to_stderr);
 int flamez_macos_resume_process(int32_t pid);
 int flamez_macos_abstime_to_nanoseconds(uint64_t abstime, uint64_t *nanoseconds);
 int flamez_macos_cpu_time(int32_t pid, uint64_t *total_ns);

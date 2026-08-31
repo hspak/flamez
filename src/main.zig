@@ -3,6 +3,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
+const cli = @import("cli.zig");
 const clay = @import("zclay");
 const rl = @import("raylib");
 const footer_font = @import("footer_font");
@@ -55,8 +56,34 @@ const screenshot_fps = 60;
 const idle_poll_interval_ms: i64 = 32;
 /// FPS-enabled idle captures present only often enough to keep the diagnostic visibly live.
 const idle_fps_refresh_polls: usize = @intCast(@divTrunc(1000, idle_poll_interval_ms));
+/// Keep presenting while the compositor delivers the initial HiDPI framebuffer configuration.
+const initial_present_frames: usize = 4;
+const max_gui_save_stem_len: usize = 50;
 const ui_font_id: u16 = 0;
 const footer_font_id: u16 = 1;
+
+const WindowMetrics = struct {
+    screen_width: i32 = 0,
+    screen_height: i32 = 0,
+    render_width: i32 = 0,
+    render_height: i32 = 0,
+
+    fn current() WindowMetrics {
+        return .{
+            .screen_width = rl.getScreenWidth(),
+            .screen_height = rl.getScreenHeight(),
+            .render_width = rl.getRenderWidth(),
+            .render_height = rl.getRenderHeight(),
+        };
+    }
+
+    fn eql(a: WindowMetrics, b: WindowMetrics) bool {
+        return a.screen_width == b.screen_width and
+            a.screen_height == b.screen_height and
+            a.render_width == b.render_width and
+            a.render_height == b.render_height;
+    }
+};
 
 const FontBook = struct {
     ui: rl.Font,
@@ -112,66 +139,98 @@ const TrackpadGestures = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    // Must exist before the target can be spawned: without these handlers any
-    // Ctrl+C / terminal close kills flamez alone and orphans the target group,
-    // because the target deliberately runs in its own process group.
     tracer.installFatalSignalHandlers();
 
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
     _ = args.skip();
-    var target_argv: std.ArrayList([]const u8) = .empty;
-    defer target_argv.deinit(init.gpa);
+    var arguments: std.ArrayList([]const u8) = .empty;
+    defer arguments.deinit(init.gpa);
     while (args.next()) |arg| {
         const owned = try init.arena.allocator().dupe(u8, arg);
-        try target_argv.append(init.gpa, owned);
-    }
-    if (target_argv.items.len == 0) {
-        std.debug.print(
-            "Usage: flamez <target> [target args...]\n" ++
-                "Example: flamez zig build -Doptimize=ReleaseFast\n",
-            .{},
-        );
-        return;
+        try arguments.append(init.gpa, owned);
     }
 
-    // Live capture is mandatory: fail fast with backend diagnostics before any
-    // window is opened. Session-file import can bypass this when implemented.
-    var collector = tracer.Collector.init(init.gpa);
-    if (!collector.available()) {
-        std.debug.print(
-            \\flamez: cannot start — process-event capture is required.
-            \\
-            \\Failed because: {s}
-            \\
-            \\
-        , .{collector.diagnosticSlice()});
-        if (comptime tracer.capture_backend == .linux_ebpf) {
-            std.debug.print(
-                \\Fixes:
-                \\  • run ./build.sh to install flamez with
-                \\    cap_bpf,cap_perfmon
-                \\
-            , .{});
-        }
-        std.process.exit(1);
-    }
-    var collector_attached = true;
-    defer if (collector_attached) collector.deinit();
-
-    collector.dropPrivileges() catch {
-        std.debug.print("flamez: could not drop capture privileges after attach\n", .{});
-        std.process.exit(1);
+    const parsed = cli.parse(arguments.items) catch |err| {
+        std.debug.print("flamez: {s}\n\n", .{@errorName(err)});
+        printUsage();
+        std.process.exit(2);
     };
-    var session = tracer.Session.init(init.gpa, init.io);
-    defer session.deinit();
+    if (parsed.mode == .capture_file) {
+        std.process.exit(runHeadless(init, parsed.target, parsed.path.?));
+    }
+    if (parsed.mode == .analyze_file) {
+        std.process.exit(runAnalysis(init, parsed.path.?));
+    }
+
+    var collector: tracer.Collector = undefined;
+    var collector_attached = false;
+    var session: tracer.Session = undefined;
     var start_error: ?tracer.Session.StartError = null;
-    session.start(&collector, target_argv.items) catch |err| {
-        start_error = err;
-    };
+    var window_title: [:0]const u8 = "Flamez";
+
+    switch (parsed.mode) {
+        .capture_gui => {
+            collector = tracer.Collector.init(init.gpa);
+            collector_attached = true;
+            if (!collector.available()) {
+                printCollectorUnavailable(&collector);
+                collector.deinit();
+                std.process.exit(1);
+            }
+            collector.dropPrivileges() catch {
+                std.debug.print(
+                    "flamez: could not drop capture privileges after attach\n",
+                    .{},
+                );
+                collector.deinit();
+                std.process.exit(1);
+            };
+            session = tracer.Session.init(init.gpa, init.io);
+            if (tracer.stopRequested()) {
+                session.deinit();
+                collector.deinit();
+                std.debug.print("flamez: interrupted before target launch\n", .{});
+                std.process.exit(1);
+            }
+            session.start(&collector, parsed.target, .{}) catch |err| {
+                start_error = err;
+            };
+            if (tracer.stopRequested()) {
+                if (session.running) session.stop(&collector);
+                session.deinit();
+                collector.deinit();
+                std.process.exit(1);
+            }
+        },
+        .import_file => {
+            var diagnostics: tracer.session_file.Diagnostics = .{};
+            session = readImportedSession(init, parsed.path.?, &diagnostics) catch |err| {
+                std.debug.print(
+                    "flamez: could not import {s}: {s} at byte {d} ({s})\n",
+                    .{
+                        displayImportPath(parsed.path.?),
+                        @errorName(err),
+                        diagnostics.byte_offset,
+                        @tagName(diagnostics.reason),
+                    },
+                );
+                std.process.exit(1);
+            };
+            window_title = try std.fmt.allocPrintSentinel(
+                init.arena.allocator(),
+                "Flamez — {s}",
+                .{displayImportPath(parsed.path.?)},
+                0,
+            );
+        },
+        .capture_file, .analyze_file => unreachable,
+    }
+
+    defer session.deinit();
+    defer if (collector_attached) collector.deinit();
     var app = try App.init(init.gpa);
     defer app.deinit();
-    const host_cpu_count = @max(std.Thread.getCpuCount() catch 1, 1);
     if (start_error) |err| {
         if (comptime tracer.capture_backend == .macos) {
             if (err == error.ExactCaptureUnavailable) {
@@ -197,12 +256,15 @@ pub fn main(init: std.process.Init) !void {
         .vsync_hint = screenshot_path == null,
         .window_highdpi = screenshot_path == null,
     });
-    rl.initWindow(window_width, window_height, "Flamez");
+    rl.initWindow(window_width, window_height, window_title);
     if (!rl.isWindowReady()) {
         log.err("raylib could not create a window", .{});
-        return;
+        return error.WindowInitializationFailed;
     }
     defer rl.closeWindow();
+    // Raylib normally performs its first event poll after presenting frame one.
+    // Process compositor scale callbacks before that frame reaches the screen.
+    rl.pollInputEvents();
     rl.setGesturesEnabled(.{
         .tap = true,
         .doubletap = true,
@@ -229,10 +291,17 @@ pub fn main(init: std.process.Init) !void {
     var frame_number: usize = 0;
     var trackpad_gestures: TrackpadGestures = .{};
     var last_drawn_mouse = rl.getMousePosition();
+    var last_drawn_window: WindowMetrics = .{};
     var idle_polls_since_draw: usize = 0;
+    var next_save_index: usize = 0;
+    var save_path_buffer: [128]u8 = undefined;
     perf.beginSession(init.io);
 
     while (!rl.windowShouldClose()) {
+        if (tracer.stopRequested()) {
+            if (session.running) session.stop(&collector);
+            break;
+        }
         const frame_time = rl.getFrameTime();
         const mouse = rl.getMousePosition();
         const wheel = rl.getMouseWheelMoveV();
@@ -243,8 +312,9 @@ pub fn main(init: std.process.Init) !void {
             rl.isMouseButtonDown(.left) or
             rl.isMouseButtonReleased(.left);
         const pinch_zoom = trackpad_gestures.samplePinch();
-        const width = rl.getScreenWidth();
-        const height = rl.getScreenHeight();
+        const window = WindowMetrics.current();
+        const width = window.screen_width;
+        const height = window.screen_height;
         const wanted_fps: i32 = if (screenshot_path != null)
             screenshot_fps
         else
@@ -262,14 +332,15 @@ pub fn main(init: std.process.Init) !void {
             pointer_active or
             trackpad_gestures.pinch_distance != null or
             hasKeyboardActivity() or
-            rl.isWindowResized();
+            rl.isWindowResized() or
+            !window.eql(last_drawn_window);
         const fps_refresh_due = if (comptime build_options.fps_counter)
             idle_polls_since_draw >= idle_fps_refresh_polls
         else
             false;
         const redraw = session.running or
             screenshot_path != null or
-            frame_number == 0 or
+            frame_number < initial_present_frames or
             input_changed or
             fps_refresh_due;
         if (!redraw) {
@@ -290,7 +361,7 @@ pub fn main(init: std.process.Init) !void {
         clay.updateScrollContainers(false, .{ .x = wheel.x, .y = wheel.y }, frame_time);
 
         if (clicked and session.running and clay.pointerOver(.ID("StopButton"))) {
-            session.stop();
+            session.stop(&collector);
             app.setMessage("Capture stopped", .{});
         }
         if (clicked and app.selected_process != null and
@@ -299,6 +370,27 @@ pub fn main(init: std.process.Init) !void {
             app.selected_process = null;
         }
         if (rl.isKeyPressed(.f5)) clay.setDebugModeEnabled(!clay.isDebugModeEnabled());
+        const save_shortcut = ctrlHeld() and rl.isKeyPressed(.s);
+        const export_clicked = clicked and session.finished and
+            clay.pointerOver(.ID("ExportButton"));
+        if (save_shortcut or export_clicked) {
+            if (session.finished) {
+                const saved_path: ?[]const u8 = writeNextGuiSave(
+                    init.gpa,
+                    init.io,
+                    &session,
+                    ".",
+                    &next_save_index,
+                    &save_path_buffer,
+                ) catch |err| save_failed: {
+                    app.setMessage("Could not save session: {s}", .{@errorName(err)});
+                    break :save_failed null;
+                };
+                if (saved_path) |path| app.setMessage("Saved {s}", .{path});
+            } else {
+                app.setMessage("Finish the capture before saving", .{});
+            }
+        }
 
         if (session.running) {
             session.update(&collector);
@@ -315,7 +407,7 @@ pub fn main(init: std.process.Init) !void {
             .wheel = wheel.y,
             .pinch_zoom = pinch_zoom,
             .clicked = clicked,
-            .host_cpu_count = host_cpu_count,
+            .host_cpu_count = session.host_cpu_count,
         };
         if (comptime perf.enabled) {
             perf.noteSessionShape(
@@ -357,6 +449,7 @@ pub fn main(init: std.process.Init) !void {
         perf.leave();
         perf.endFrame();
         last_drawn_mouse = mouse;
+        last_drawn_window = window;
         frame_number += 1;
         if (screenshot_path) |path| {
             if (frame_number == 40) {
@@ -365,11 +458,268 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+    if (session.running) session.stop(&collector);
     perf.sessionSummary();
+}
+
+fn runHeadless(
+    init: std.process.Init,
+    target: []const []const u8,
+    output_path: []const u8,
+) u8 {
+    var collector = tracer.Collector.init(init.gpa);
+    var collector_attached = true;
+    defer if (collector_attached) collector.deinit();
+    if (!collector.available()) {
+        printCollectorUnavailable(&collector);
+        return 1;
+    }
+    collector.dropPrivileges() catch {
+        std.debug.print("flamez: could not drop capture privileges after attach\n", .{});
+        return 1;
+    };
+    if (tracer.stopRequested()) {
+        std.debug.print("flamez: interrupted before target launch\n", .{});
+        return 1;
+    }
+
+    var session = tracer.Session.init(init.gpa, init.io);
+    defer session.deinit();
+    session.start(&collector, target, .{
+        .target_stdout = if (std.mem.eql(u8, output_path, "-")) .stderr else .inherit,
+    }) catch |err| {
+        printStartFailure(&collector, err);
+        return 1;
+    };
+
+    while (session.running) {
+        if (tracer.stopRequested()) {
+            session.stop(&collector);
+        } else {
+            session.update(&collector);
+        }
+        if (session.running) {
+            init.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
+
+    collector.deinit();
+    collector_attached = false;
+    if (!session.finished) {
+        std.debug.print("flamez: capture ended without a writable boundary\n", .{});
+        return 1;
+    }
+
+    if (std.mem.eql(u8, output_path, "-")) {
+        var buffer: [16 * 1024]u8 = undefined;
+        var writer = std.Io.File.stdout().writerStreaming(init.io, &buffer);
+        tracer.session_file.write(init.gpa, &session, &writer.interface) catch |err| {
+            std.debug.print("flamez: could not write stdout: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+        writer.flush() catch |err| {
+            std.debug.print("flamez: could not flush stdout: {s}\n", .{@errorName(err)});
+            return 1;
+        };
+    } else {
+        tracer.session_file.writeFile(init.gpa, init.io, &session, output_path, .{
+            .install = .replace,
+        }) catch |err| {
+            std.debug.print(
+                "flamez: could not write {s}: {s}\n",
+                .{ output_path, @errorName(err) },
+            );
+            return 1;
+        };
+    }
+    return cli.captureExitCode(&session);
+}
+
+fn readImportedSession(
+    init: std.process.Init,
+    path: []const u8,
+    diagnostics: *tracer.session_file.Diagnostics,
+) !tracer.Session {
+    if (!std.mem.eql(u8, path, "-")) {
+        return tracer.session_file.readFile(init.gpa, init.io, path, diagnostics);
+    }
+
+    var buffer: [16 * 1024]u8 = undefined;
+    var reader = std.Io.File.stdin().readerStreaming(init.io, &buffer);
+    return tracer.session_file.read(init.gpa, init.io, &reader.interface, diagnostics);
+}
+
+fn runAnalysis(init: std.process.Init, input_path: []const u8) u8 {
+    var diagnostics: tracer.session_file.Diagnostics = .{};
+    var session = tracer.session_file.readFile(
+        init.gpa,
+        init.io,
+        input_path,
+        &diagnostics,
+    ) catch |err| {
+        std.debug.print(
+            "flamez: could not analyze {s}: {s} at byte {d} ({s})\n",
+            .{
+                input_path,
+                @errorName(err),
+                diagnostics.byte_offset,
+                @tagName(diagnostics.reason),
+            },
+        );
+        return 1;
+    };
+    defer session.deinit();
+
+    var output_path_buffer: [std.fs.max_path_bytes + "analyzed-".len]u8 = undefined;
+    const output_path = cli.analysisOutputPath(input_path, &output_path_buffer) catch |err| {
+        std.debug.print(
+            "flamez: could not derive analysis path for {s}: {s}\n",
+            .{ input_path, @errorName(err) },
+        );
+        return 1;
+    };
+    tracer.analysis_file.writeFile(init.gpa, init.io, &session, output_path) catch |err| {
+        std.debug.print(
+            "flamez: could not write {s}: {s}\n",
+            .{ output_path, @errorName(err) },
+        );
+        return 1;
+    };
+    std.debug.print("flamez: wrote {s}\n", .{output_path});
+    return 0;
+}
+
+fn displayImportPath(path: []const u8) []const u8 {
+    return if (std.mem.eql(u8, path, "-")) "stdin" else path;
+}
+
+fn printStartFailure(
+    collector: *const tracer.Collector,
+    err: tracer.Session.StartError,
+) void {
+    if (comptime tracer.capture_backend == .macos) {
+        if (err == error.ExactCaptureUnavailable) {
+            std.debug.print(
+                "flamez: exact macOS capture unavailable: {s}\n",
+                .{collector.exactDiagnosticSlice()},
+            );
+            return;
+        }
+    }
+    std.debug.print("flamez: could not start target: {s}\n", .{@errorName(err)});
+}
+
+fn printCollectorUnavailable(collector: *const tracer.Collector) void {
+    std.debug.print(
+        \\flamez: cannot start — process-event capture is required.
+        \\
+        \\Failed because: {s}
+        \\
+        \\
+    , .{collector.diagnosticSlice()});
+    if (comptime tracer.capture_backend == .linux_ebpf) {
+        std.debug.print(
+            \\Fixes:
+            \\  • run ./build.sh to install flamez with
+            \\    cap_bpf,cap_perfmon
+            \\
+        , .{});
+    }
+}
+
+fn printUsage() void {
+    std.debug.print(
+        \\Usage:
+        \\  flamez [--] <target> [target args...]
+        \\  flamez -o <path|-> [--] <target> [target args...]
+        \\  flamez -i <path|->
+        \\  flamez -a <session.json>
+        \\
+        \\Flags:
+        \\  -o, --output <path>  capture without a window; '-' writes JSON to stdout
+        \\  -i, --import <path>  open a finished session; '-' reads JSON from stdin
+        \\  -a, --analyze <path> write analyzed-<filename> beside a session file
+        \\  --                   end Flamez flag parsing
+        \\
+    , .{});
+}
+
+fn writeNextGuiSave(
+    gpa: Allocator,
+    io: std.Io,
+    session: *const tracer.Session,
+    directory: []const u8,
+    next_index: *usize,
+    path_buffer: []u8,
+) ![]const u8 {
+    var target_args = session.targetArgvIter();
+    var stem_buffer: [max_gui_save_stem_len]u8 = undefined;
+    const stem = targetSaveStem(&target_args, &stem_buffer);
+    var index = next_index.*;
+    while (true) : (index += 1) {
+        const path = try guiSavePath(directory, stem, index, path_buffer);
+        tracer.session_file.writeFile(gpa, io, session, path, .{}) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        next_index.* = index + 1;
+        return path;
+    }
+}
+
+fn targetSaveStem(args: *tracer.Process.ArgIter, buffer: []u8) []const u8 {
+    std.debug.assert(buffer.len >= max_gui_save_stem_len);
+    var len: usize = 0;
+    var pending_hyphen = false;
+    var arg_index: usize = 0;
+    while (args.next()) |argument| : (arg_index += 1) {
+        const name = if (arg_index == 0) std.fs.path.basename(argument) else argument;
+        for (name) |byte| {
+            if (!std.ascii.isAlphanumeric(byte)) {
+                pending_hyphen = len != 0;
+                continue;
+            }
+            const separator_len: usize = @intFromBool(pending_hyphen and len != 0);
+            if (max_gui_save_stem_len - len < separator_len + 1) {
+                return buffer[0..len];
+            }
+            if (separator_len != 0) {
+                buffer[len] = '-';
+                len += 1;
+            }
+            buffer[len] = std.ascii.toLower(byte);
+            len += 1;
+            pending_hyphen = false;
+        }
+        pending_hyphen = len != 0;
+    }
+    if (len != 0) return buffer[0..len];
+    const fallback = "session";
+    @memcpy(buffer[0..fallback.len], fallback);
+    return buffer[0..fallback.len];
+}
+
+fn guiSavePath(
+    directory: []const u8,
+    stem: []const u8,
+    index: usize,
+    buffer: []u8,
+) ![]const u8 {
+    if (std.mem.eql(u8, directory, ".")) {
+        return if (index == 0)
+            std.fmt.bufPrint(buffer, "flamez-{s}.json", .{stem})
+        else
+            std.fmt.bufPrint(buffer, "flamez-{s}-{d}.json", .{ stem, index });
+    }
+    return if (index == 0)
+        std.fmt.bufPrint(buffer, "{s}/flamez-{s}.json", .{ directory, stem })
+    else
+        std.fmt.bufPrint(buffer, "{s}/flamez-{s}-{d}.json", .{ directory, stem, index });
 }
 
 fn hasKeyboardActivity() bool {
     return rl.isKeyPressed(.f5) or
+        rl.isKeyPressed(.s) or
         rl.isKeyPressed(.zero) or
         rl.isKeyPressed(.kp_0) or
         rl.isKeyPressed(.minus) or
@@ -1627,6 +1977,25 @@ fn unloadEmbeddedFont(font: rl.Font) void {
     rl.unloadFont(font);
 }
 
+test "window metrics notice framebuffer-only DPI changes" {
+    const testing = std.testing;
+    const initial = WindowMetrics{
+        .screen_width = 1180,
+        .screen_height = 760,
+        .render_width = 1180,
+        .render_height = 760,
+    };
+    const scaled = WindowMetrics{
+        .screen_width = 1180,
+        .screen_height = 760,
+        .render_width = 2360,
+        .render_height = 1520,
+    };
+
+    try testing.expect(!initial.eql(scaled));
+    try testing.expect(initial.eql(initial));
+}
+
 test "rectangleRoundness scales with the shorter side only" {
     const testing = std.testing;
     try testing.expectEqual(
@@ -1983,6 +2352,100 @@ fn graphRowsContainProcess(app: *const App, target: usize) bool {
         },
     };
     return false;
+}
+
+test "numbered GUI save path borrows the caller buffer" {
+    const testing = std.testing;
+    var buffer: [128]u8 = undefined;
+    const path = try guiSavePath(".", "zig-build", 1, &buffer);
+
+    try testing.expect(path.ptr == buffer[0..].ptr);
+    try testing.expectEqualStrings("flamez-zig-build-1.json", path);
+}
+
+test "GUI save stem uses the target basename and hyphen-delimited arguments" {
+    const testing = std.testing;
+    var args = tracer.Process.ArgIter{
+        .bytes = "/usr/bin/zig\x00build\x00-Doptimize=ReleaseFast\x00",
+        .remaining = 3,
+    };
+    var buffer: [max_gui_save_stem_len]u8 = undefined;
+
+    try testing.expectEqualStrings(
+        "zig-build-doptimize-releasefast",
+        targetSaveStem(&args, &buffer),
+    );
+}
+
+test "GUI save stem truncates long target arguments to fifty characters" {
+    const testing = std.testing;
+    var args = tracer.Process.ArgIter{
+        .bytes = "program\x00abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\x00",
+        .remaining = 2,
+    };
+    var buffer: [max_gui_save_stem_len]u8 = undefined;
+    const stem = targetSaveStem(&args, &buffer);
+
+    try testing.expectEqual(@as(usize, 50), stem.len);
+    try testing.expectEqualStrings(
+        "program-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop",
+        stem,
+    );
+}
+
+test "GUI save skips an existing default without replacing it" {
+    const testing = std.testing;
+    var input: std.Io.Reader = .fixed(@embedFile("testdata/session-v1-minimal.json"));
+    var diagnostics: tracer.session_file.Diagnostics = .{};
+    var session = try tracer.session_file.read(
+        testing.allocator,
+        testing.io,
+        &input,
+        &diagnostics,
+    );
+    defer session.deinit();
+
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(testing.io, .{
+        .sub_path = "flamez-true.json",
+        .data = "existing",
+    });
+    var directory_buffer: [128]u8 = undefined;
+    const directory = try std.fmt.bufPrint(
+        &directory_buffer,
+        ".zig-cache/tmp/{s}",
+        .{temporary.sub_path[0..]},
+    );
+    var path_buffer: [192]u8 = undefined;
+    var next_index: usize = 0;
+    const saved = try writeNextGuiSave(
+        testing.allocator,
+        testing.io,
+        &session,
+        directory,
+        &next_index,
+        &path_buffer,
+    );
+
+    try testing.expect(std.mem.endsWith(u8, saved, "flamez-true-1.json"));
+    try testing.expectEqual(@as(usize, 2), next_index);
+    const existing = try temporary.dir.readFileAlloc(
+        testing.io,
+        "flamez-true.json",
+        testing.allocator,
+        .limited(16),
+    );
+    defer testing.allocator.free(existing);
+    try testing.expectEqualStrings("existing", existing);
+    var imported = try tracer.session_file.readFile(
+        testing.allocator,
+        testing.io,
+        saved,
+        &diagnostics,
+    );
+    defer imported.deinit();
+    try testing.expect(imported.finished);
 }
 
 // Pull child files into this binary so their `test` blocks run here too

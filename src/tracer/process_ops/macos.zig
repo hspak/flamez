@@ -10,9 +10,19 @@ pub const args_source = .process_inspection;
 
 pub const ResumeError = error{TargetResumeRejected};
 
+pub const TargetStdout = enum {
+    inherit,
+    stderr,
+};
+
+pub const SpawnOptions = struct {
+    target_stdout: TargetStdout = .inherit,
+};
+
 extern "c" fn flamez_macos_spawn_suspended(
     argv: [*:null]const ?[*:0]const u8,
     pid: *std.posix.pid_t,
+    redirect_stdout_to_stderr: c_int,
 ) c_int;
 extern "c" fn flamez_macos_resume_process(pid: std.posix.pid_t) c_int;
 
@@ -46,6 +56,7 @@ pub fn spawnTarget(
     gpa: Allocator,
     _: std.Io,
     argv: []const []const u8,
+    options: SpawnOptions,
 ) std.process.SpawnError!std.process.Child {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -57,7 +68,11 @@ pub fn spawnTarget(
     }
 
     var pid: std.posix.pid_t = 0;
-    const result = flamez_macos_spawn_suspended(argv_z.ptr, &pid);
+    const result = flamez_macos_spawn_suspended(
+        argv_z.ptr,
+        &pid,
+        @intFromBool(options.target_stdout == .stderr),
+    );
     if (result != 0) return spawnError(result);
     return .{
         .id = pid,
@@ -261,6 +276,7 @@ test "suspended target cannot execute before collector registration" {
             "-c",
             "exit 37",
         },
+        .{},
     );
     errdefer child.kill(testing.io);
     const pid = child.id.?;

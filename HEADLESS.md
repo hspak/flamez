@@ -1,29 +1,33 @@
 # Session files: export, import, and headless capture
 
-This document is the implementation spec for Flamez session files, replaying
-them in the GUI without a collector, and capturing without a GUI. None of this
-is implemented yet.
+This document specifies Flamez session files, replaying them in the GUI without
+a collector, and capturing without a GUI. Agent-oriented derived output is
+specified separately in [ANALYSIS.md](ANALYSIS.md).
 
 Capture already lives in `Session` / `Process` without a raylib dependency.
 The GUI is a derived view: lane packing, pixel aggregation, zoom, and selection
 do not belong in the file. The file contains the finished process tree,
-metadata snapshots, and canonical CPU slices needed to rebuild that view.
+stable row identities, chronological exec-image history, metadata snapshots,
+and canonical CPU slices needed to rebuild that view.
 
-There are three ways to get the same finished `Session` and one session-file
+There are four ways to get the same finished `Session` and one session-file
 reader/writer:
 
-| Mode | How the session is filled | Window | BPF |
+| Mode | How the session is filled | Window | Collector |
 |---|---|---|---|
-| Capture + GUI | Spawn and update until exit or Stop | yes | required |
-| Capture + file | Same capture loop, then write and exit | no | required |
-| Open file | Read a finished session | yes | no |
+| Capture + GUI | Spawn and update until exit or Stop | yes | platform collector required |
+| Capture + file | Same capture loop, then write and exit | no | platform collector required |
+| Open file | Read a finished session | yes | not initialized |
+| Analyze file | Read a finished session, then write derived analysis | no | not initialized |
 
-Implement the file module and round-trip tests first, then cooperative signals,
-headless `-o`, GUI save, and GUI import.
+Stabilize the finished-session boundary first, then implement the file module
+and round-trip tests, cooperative signals, headless `-o`, GUI save, and GUI
+import.
 
 Related docs: [README.md](README.md) (usage),
 [ARCHITECTURE.md](ARCHITECTURE.md) (session model), [EBPF.md](EBPF.md)
-(collector), and [PERF.md](PERF.md) (canonical vs derived data).
+(Linux collector), [MACAPI.md](MACAPI.md) (macOS collectors), and
+[PERF.md](PERF.md) (canonical vs derived data).
 
 ---
 
@@ -35,10 +39,14 @@ constraints, not implementation suggestions.
 | Earlier decision | Revised decision | Reason |
 |---|---|---|
 | Serialize `id`, `depth`, and `parent_pid` alongside `parent` | Array position is the stable ID; serialize only `parent` | The removed fields are derivable and can disagree. Parent-before-child ordering makes cycles impossible and lets the reader rebuild cached depth and PPID in one pass. |
-| Repeat argv/exe/cwd bytes in every process | Intern argv vectors and paths in top-level tables; processes store references plus provenance | Forked children commonly share metadata. Repeating a large inherited argv can multiply a few MiB into GiB on disk and again in memory after import. |
+| Serialize only the process's final name/metadata snapshot | Serialize the stable row image and every chronological exec image | `Process.execs`, `execAt`, and the detail pane now retain and display the images that occupied a PID. Saving only the scalar current-image fields would discard that history. |
+| Serialize the internal `Exec.row_only` marker | Encode `row` as `first_exec` normally, or as the root's retained launch image | `row_only` is a storage optimization used only to keep the launched root command stable; it is not an execution interval or a portable schema concept. Avoiding a repeated image object on every ordinary process also keeps the file compact. |
+| Repeat argv/exe/cwd bytes in every process image | Intern argv vectors and paths in top-level tables; row/exec images store references plus provenance | Forked children and successive images commonly share metadata. Repeating a large inherited argv can multiply a few MiB into GiB on disk and again in memory after import. |
 | Treat every Linux byte sequence as a JSON string | Use a string-or-base64 `ByteString` | Linux argv, paths, and comm are bytes, not guaranteed UTF-8. The common UTF-8 case remains readable without making invalid JSON or losing bytes. |
 | Serialize `cpu_peak_cores` and slice `band` | Derive both from slice triples | Both are caches. Serializing them creates mismatches, uses floating-point text, and repeats one value per slice. |
+| Infer that every observed exit has an authoritative CPU total | Serialize `cpu_final` beside `cpu_time_ns` | macOS can observe a lifetime exit but lose the final rusage read. The UI already distinguishes `CPU` from partial `CPU~`; `end_kind` cannot carry this independent fact. |
 | Serialize `incomplete` and `recovered_count` | Serialize one canonical `loss_count`; derive recovery count from process origins and derive incomplete status from both | Summary fields are convenient for display but redundant in the file; the boolean should be a query in memory too. |
+| Treat every supported capture as one guarantee | Serialize `capture_fidelity` | macOS selects exact Endpoint Security or best-effort snapshot recovery at runtime. Replay must retain the `CAPTURE BEST EFFORT` qualification even when no explicit loss was counted. |
 | Two nullable fields, `exit_code` and `exit_signal` | One required tagged `root_exit` object, including an explicit `unknown` tag | The root cannot both exit and be signaled. A tagged result makes the invalid state unrepresentable without using null as an implicit third state. |
 | Store an absolute monotonic timestamp | Do not store it in v1 | A monotonic timestamp is boot-local, exceeds JavaScript's exact integer range on long-running hosts, and cannot align traces without a clock identity and boot ID. Add a complete clock-correlation object later if needed. |
 | Load the whole file and optionally build a JSON DOM | Stream the reader directly into session-owned storage | Sessions can contain millions of slices and multi-MiB argv. Import should require only final session memory plus bounded token/table scratch. |
@@ -58,12 +66,13 @@ files, not a second v1 capture model.
 ### Goals
 
 - Preserve every process record Flamez retained, including PID-reuse
-  generations, exact parentage, lifetimes, metadata, CPU totals, and coalesced
-  CPU slices.
-- Preserve observed vs recovered vs capture-clipped provenance.
+  generations, exact parentage, lifetimes, stable row identity, every retained
+  exec image, CPU totals, and coalesced CPU slices.
+- Preserve observed vs recovered vs capture-clipped provenance, exact vs
+  snapshot-recovery fidelity, and final vs partial CPU totals.
 - Represent known collection loss without redundant fields that can disagree.
-- Preserve arbitrary non-NUL Linux bytes in names, argv, executable paths, and
-  working directories.
+- Preserve arbitrary non-NUL bytes retained by capture in names, argv,
+  executable paths, and working directories, including non-UTF-8 Linux bytes.
 - Avoid duplicating shared metadata on disk or after import.
 - Stream both directions; never construct a whole-session JSON value tree.
 - Validate before exposing an imported session to the GUI.
@@ -93,18 +102,24 @@ an end time and no process has `end_kind = open`.
 
 | Input | Result |
 |---|---|
-| Target root exits | `waitpid` in `update` calls `onRootExited`. Remaining open descendants become `capture_clipped`, metadata is compacted, and collection detaches. |
-| GUI Stop | `Session.stop()` terminates the target tree and performs the same close/compact transition. |
-| SIGINT, SIGTERM, or SIGHUP | The signal handler requests a cooperative stop; the main thread reaches the same transition and write epilogue. |
+| Target root exits | `waitNowait` in `Session.update` calls the existing root-finish path. It flushes backend work, takes a boundary CPU snapshot, closes remaining descendants, and compacts metadata. |
+| GUI Stop or window close | A collector-aware `Session.stop(&collector)` terminates and reaps the target, then uses the same flush/snapshot/close/compact finish path. Window close does not save. |
+| SIGINT, SIGTERM, SIGHUP, or SIGQUIT | The signal handler requests a cooperative stop and performs the existing signal-safe target-tree sweep; the main thread reaps and reaches the same finish path. |
 
 After all three:
 
-- `running == false` and `active_count == 0`;
+- `finished == true`, `running == false`, and `active_count == 0`;
 - `processes.len > 0` and process zero is the launched root;
 - every `end_ns` is set and no `end_kind` is `open`;
-- natural exits retain kernel-final CPU totals;
-- capture-clipped records retain the last userspace CPU snapshot;
-- metadata referenced by the target argv or a process has been compacted;
+- every real exec interval has an end time, while the stable `row` snapshot is
+  not mistaken for an exec interval;
+- natural exits retain a final CPU total when the backend obtained one and
+  retain `cpu_final = false` when it did not;
+- capture-clipped records retain the last available CPU snapshot and have
+  `cpu_final = false`;
+- metadata referenced by the target argv, a row image, or an exec image remains
+  valid; finish-time compaction discards unreachable bytes when it succeeds,
+  but its allocation failure does not lose canonical data or prevent export;
 - cached `depth`, `parent_pid`, `cpu_peak_cores`, and slice `band` agree with
   their canonical inputs.
 
@@ -115,12 +130,13 @@ for stdout where output cannot be rolled back.
 ### 3.2 Shared control flow
 
 ```
-session.start(...)
+session.start(&collector, target_argv, start_options)
 while session.running:
-    session.update(collector)
     if stop_requested:
-        session.stop()
-finishCollector(session, collector)
+        session.stop(&collector)
+    else:
+        session.update(&collector)
+collector.deinit()
 if output_path: writeFile(session)
 if headless: exit per section 6.1
 if GUI: browse; Ctrl+S may call the same writeFile again
@@ -134,23 +150,43 @@ initWindow()
 browse(session)
 ```
 
+Natural completion remains inside `Session.update`: `finishRootCapture` already
+flushes and samples before it closes the model. The refactor needed here is to
+make forced Stop call that same internal finish routine instead of the current
+collector-blind `Session.stop()`, which closes at the previous frame timestamp,
+does not flush or sample, and lets `Child.kill` discard the root status.
+`Session.deinit()` uses a separate abort-only cleanup path if startup or the
+caller fails before an orderly finish; abort cleanup is not writable as a v1
+session.
+
 The file's `host_cpu_count` drives CPU visualization. The viewing host's CPU
-count is irrelevant to an imported capture.
+count is irrelevant to an imported capture. `capture_fidelity` likewise comes
+from the capture, not from the reader's platform or currently available
+collector.
 
 ### 3.3 Cooperative signals
 
-The first SIGINT/SIGTERM/SIGHUP must not terminate Flamez before it can write:
+The first SIGINT/SIGTERM/SIGHUP/SIGQUIT must not terminate Flamez before an
+orderly capture boundary can be produced:
 
-1. The async-signal-safe handler atomically records `stop_requested` and
-   terminates the armed target tree using only the existing safe syscall/atomic
-   path. It does not allocate, log, lock, or write JSON.
-2. The main loop observes the flag, calls `session.stop()` if the session is
-   still live, finishes the collector, and enters the normal write epilogue.
-3. A second termination signal restores the previous immediate-abort behavior
-   so a wedged stop or write cannot trap the user.
+1. The async-signal-safe handler atomically claims the first signal, records
+   `stop_requested`, and terminates the armed target tree using the existing
+   fixed PID table and safe syscall path. It does not allocate, log, lock, or
+   write JSON. SIGPIPE remains ignored as it is today.
+2. The main loop observes the flag and calls `session.stop(&collector)` if the
+   session is still live. That call reaps the owned root and runs the normal
+   collector flush and final-snapshot path. Headless mode then writes; GUI mode
+   exits without an implicit save.
+3. A second termination signal restores the existing default-and-reraise
+   immediate-abort behavior so a wedged stop or write cannot trap the user.
 
 The flag/state transition must be atomic: simultaneous signals may not both be
 treated as the first signal.
+
+Check `stop_requested` before launching a target as well as in the live loop.
+If the first signal was already observed before `Session.start` succeeds, do
+not deliberately continue into a new capture; without a finished session,
+headless mode produces no file and returns code 1.
 
 Window close still stops a live target to prevent orphaning it. It does not
 implicitly save in v1.
@@ -184,6 +220,7 @@ rebasing. Zero is target spawn; `elapsed_ns` is the capture horizon.
 |---|---|---|
 | `flamez` | integer | Schema version; exactly `1` for this draft. It must be the first object field so a streaming reader can dispatch before consuming the body. |
 | `loss_count` | integer | Saturating count of known data-loss incidents from kernel collection and userspace admission/storage. Zero means no known loss, not proof that the kernel is omniscient. It never wraps back to zero. |
+| `capture_fidelity` | string | `exact` or `snapshot_recovery`, matching the collector selected for this launch. `unavailable` is not a valid completed capture. |
 | `cpu_sample_period_ns` | integer | Configured cumulative CPU snapshot cadence; positive. Today it is `16000000`. |
 | `host_cpu_count` | integer | Logical CPUs on the tracing host at capture start; at least one. |
 | `target_argv` | integer | Reference into `metadata.argv` for the exact non-empty argv passed to `Session.start`. |
@@ -204,16 +241,17 @@ and no file is written.
 { "kind": "unknown" }
 ```
 
-`code` is in `0...255`. `signal` is a positive signal number that fits the
-platform representation. Fields inappropriate to the selected kind are not
-accepted. `Session.stop()` must reap the root and retain its status instead of
+`code` is in `0...255`. `signal` is in `1...255`, matching `RootExit.signaled`.
+Fields inappropriate to the selected kind are not accepted.
+`Session.stop(&collector)` must reap the root and retain its status instead of
 discarding the result after sending KILL. `unknown` is only for a root whose
 status genuinely could not be obtained; it is not the normal forced-stop
 representation.
 
 ### 4.2 ByteString
 
-Linux metadata is bytes, while a JSON string must be Unicode. Every schema
+Capture metadata is bytes, while a JSON string must be Unicode. Linux in
+particular does not require argv, paths, or comm to be valid UTF-8. Every schema
 field typed `ByteString` uses this tagged representation:
 
 - valid UTF-8 bytes: an ordinary JSON string;
@@ -228,8 +266,8 @@ For example:
 
 The writer always chooses the string form when the bytes are valid UTF-8.
 Base64 is only the lossless fallback; it is not used for compression. The
-reader rejects malformed base64 and decoded NULs where Linux forbids embedded
-NULs. Empty argv elements are valid empty strings.
+reader rejects malformed base64 and decoded NULs where the captured field
+cannot contain them. Empty argv elements are valid empty strings.
 
 String escaping and UTF-8 validation must use standard-library routines.
 Base64 encoding should stream to the output writer rather than allocating a
@@ -241,17 +279,21 @@ second encoded copy of a multi-MiB argument.
 
 | Field | Element type | Meaning |
 |---|---|---|
-| `argv` | array of `ByteString` | Exact argument vectors, including argv[0] and empty arguments. |
-| `paths` | `ByteString` | Executable and working-directory byte paths. |
+| `argv` | array of arrays of `ByteString` | Interned exact argument vectors, including argv[0] and empty arguments. |
+| `paths` | array of `ByteString` | Interned executable and working-directory byte paths. |
 
 Each distinct vector/path is emitted once, in first-reference order.
-`target_argv` and process metadata point into these tables.
+`target_argv` and every row/exec image point into these tables.
 
-The writer first interns by the session arena identity so inherited blocks are
-O(1) lookups. For a newly seen arena block it hashes and compares bytes so
-separately captured equal paths/vectors also share an entry. Hash collisions
-must compare complete bytes. Writer scratch is proportional to the number of
-distinct metadata blocks, never their duplicated payload size.
+The writer first interns by session-arena range identity so inherited blocks
+are O(1) lookups. It traverses `target_argv`, `Process.rowExec()`, and every
+real `Process.execAt()` image. For a newly seen arena range it hashes and
+compares path bytes or logical argv elements so separately captured equal
+paths/vectors also share an entry. Argv comparison uses `args_count` and
+`argsIter`, not the incidental presence of a final NUL in the arena. Hash
+collisions must compare complete bytes and element boundaries. Writer scratch
+is proportional to the number of distinct metadata blocks, never their
+duplicated payload size.
 
 An argv entry's total decoded bytes plus one NUL separator per element must not
 exceed the collector's 6 MiB argv bound. A path contains 1...512 bytes. The
@@ -259,9 +301,10 @@ target argv entry is non-empty.
 
 The table form deliberately mirrors `Process.MetadataStore`: the reader
 appends each distinct table payload once, maps table indices to arena offsets,
-then aliases every process reference. Duplicate table contents from a
+then aliases every row/exec reference. Duplicate table contents from a
 third-party writer may be normalized to one arena block; the Flamez writer
-never emits them. Imported metadata must not be duplicated per process.
+never emits them. Imported metadata must not be duplicated per process or per
+exec interval.
 
 ### 4.4 Process object
 
@@ -273,13 +316,11 @@ never emits them. Imported metadata must not be duplicated per process.
 | `end_ns` | integer | Finished lifetime end in session time. |
 | `origin` | string | `observed`, `recovered_parent`, `recovered_exec`, or `recovered_exit`. |
 | `end_kind` | string | `observed_exit` or `capture_clipped`. |
-| `name` | `ByteString` | Non-empty display name, at most 48 bytes. |
-| `name_kind` | string | `process` for a kernel comm/real name, `other` for a fallback label. |
-| `argv` | object or null | Reference and provenance, or null when unavailable. |
-| `exe` | object or null | Path reference, provenance, and truncation, or null. |
-| `cwd` | object or null | Path reference, provenance, and truncation, or null. |
+| `row` | string or image object | `first_exec` for the normal derived row, or the root's retained launch image; see section 4.5. |
+| `execs` | non-empty array of exec objects | Chronological real process images returned by `execAt`; see section 4.5. |
 | `cpu_time_ns` | integer | Cumulative self-CPU for all threads in the TGID, excluding descendants. |
-| `slices` | array of triples | Canonical coalesced CPU activity; see section 4.6. |
+| `cpu_final` | boolean | Whether `cpu_time_ns` came from an authoritative natural-exit observation. False means best available/partial, even if `end_kind` is `observed_exit`. |
+| `slices` | array of triples | Canonical coalesced CPU activity; see section 4.7. |
 
 Array position replaces a serialized `id`. `depth` and `parent_pid` are rebuilt
 on import:
@@ -294,6 +335,29 @@ The imported UI therefore cannot disagree with the canonical tree. For
 recovered rows the parent link is explicitly inferred by `origin`; the file
 does not pretend an inferred PPID was kernel-observed.
 
+Do not serialize the scalar current-image fields separately. In memory, the
+last `execs` element is stored in `Process.exec_start_ns` plus the scalar
+name/metadata fields; the preceding elements live in `Process.execs`. The
+reader reconstructs that layout. There is one canonical image sequence in the
+file, so those two in-memory representations cannot disagree after import.
+
+Do not serialize UI/live caches: `revision` fields, `signal_slot`,
+`cpu_snapshot_at_ns`, `cpu_snapshot_initialized`, `depth`, `parent_pid`,
+`cpu_peak_cores`, slice `band`, metadata-arena offsets, `by_pid`, or the
+internal `Exec.row_only` marker.
+
+### 4.5 Row and exec images
+
+An image object has these fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | `ByteString` | Non-empty process/display name, at most 48 bytes. |
+| `name_kind` | string | `process` for a captured process name, `other` for a fallback label. |
+| `argv` | object or null | Reference and provenance, or null when unavailable. |
+| `exe` | object or null | Path reference, provenance, and truncation, or null. |
+| `cwd` | object or null | Path reference, provenance, and truncation, or null. |
+
 `argv` is null for unavailable metadata or:
 
 ```json
@@ -301,7 +365,7 @@ does not pretend an inferred PPID was kernel-observed.
 ```
 
 `ref` indexes `metadata.argv`. Valid argv sources are `launch`, `kernel`,
-`procfs`, and `inherited`.
+`procfs`, `process_inspection`, and `inherited`.
 
 `exe` and `cwd` are null or:
 
@@ -310,22 +374,47 @@ does not pretend an inferred PPID was kernel-observed.
 ```
 
 Their `ref` indexes `metadata.paths`. Valid path sources are `kernel`,
-`procfs`, and `inherited`. Null is the only representation of unavailable
-metadata; `source = unavailable` is not serialized. This avoids contradictory
-states such as a null value claiming to come from procfs.
+`procfs`, `process_inspection`, and `inherited`. Null is the only
+representation of unavailable metadata; `source = unavailable` is not
+serialized. This avoids contradictory states such as a null value claiming to
+come from process inspection.
 
 Path bytes are exact. Capture must not trim leading/trailing ASCII whitespace:
 those bytes are legal in Linux paths. `truncated` means capture hit its cap and
 the bytes may be a prefix; conservative true is safe when the source API
-cannot distinguish an exact fit. Procfs `readlink` capture should read into at
-least `max_path_len + 1` bytes (or use an equivalent length check) so it can
-distinguish a complete 512-byte path from a longer one.
+cannot distinguish an exact fit. Procfs `readlink` and macOS process-inspection
+capture should read into at least `max_path_len + 1` bytes (or use an
+equivalent length check) so they can distinguish a complete 512-byte path from
+a longer one. Store-side truncation uses `len > max_path_len`, not `>=`.
 
-Do not serialize UI/live caches: `revision` fields, `signal_slot`,
-`cpu_snapshot_at_ns`, `cpu_snapshot_initialized`, `depth`, `parent_pid`,
-`cpu_peak_cores`, slice `band`, arena offsets, or live PID maps.
+Each exec object contains every image field plus required `start_ns` and
+`end_ns`. A finished process always has at least one exec image. Exec intervals
+are ordered and non-overlapping within the process lifetime. Zero-width
+intervals are legal for same-timestamp exec/exit observations and recovered
+exit-only records. Adjacent intervals normally touch; a gap is legal because
+`Process.archiveCurrentExec` deliberately leaves one if retaining the replaced
+image runs out of memory. That failure must increment `loss_count`.
 
-### 4.5 Provenance enumerations
+`execs` means the chronological images exposed by `Process.execAt`, not only
+images introduced by an exec event. A forked child's inherited pre-exec image
+is its first interval, and a process that never calls exec still has one image.
+
+The final exec's `end_ns` equals the process `end_ns`. `row` is the stable
+command/name shown on the timeline, not another execution interval. Its common
+form is the string `"first_exec"`, which tells the reader to derive
+`Process.rowExec()` from `execs[0]` without duplicating an image object.
+
+The launched root is the only object form. `applyExec` can preserve the exact
+launch command in an internal `row_only` snapshot while coalescing the launch
+handoff into the first real exec interval. That row object has the image fields
+above but no timestamps. Its argv source is `launch`, its argv ref equals
+`target_argv`, and its exe is null, matching `Session.start` today. Non-root
+processes and a root whose row equals its first exec must use `"first_exec"`.
+This preserves current UI behavior without exposing the internal marker,
+inventing a fake exec, or repeating names and metadata references for every
+ordinary process.
+
+### 4.6 Provenance enumerations
 
 `origin`:
 
@@ -340,8 +429,8 @@ Do not serialize UI/live caches: `revision` fields, `signal_slot`,
 
 | Value | Meaning |
 |---|---|
-| `observed_exit` | Closed by a `group_dead` exit event. `cpu_time_ns` is kernel-final. |
-| `capture_clipped` | Closed at the capture horizon without observing this process exit. CPU is the last successful userspace snapshot. |
+| `observed_exit` | Closed by a lifecycle exit event. Whether its CPU total is authoritative is represented independently by `cpu_final`. |
+| `capture_clipped` | Closed at the capture horizon without observing this process exit. CPU is the last available snapshot and `cpu_final` is false. |
 
 `recovered_count` remains a useful `Session` cache and is recomputed after
 capture/import. Do not store a separate `incomplete` boolean in `Session`;
@@ -353,9 +442,12 @@ isIncomplete() = loss_count != 0 or recovered_count != 0
 ```
 
 The writer derives both decisions from canonical fields; the reader never
-accepts caller-provided summary values.
+accepts caller-provided summary values. `capture_fidelity = snapshot_recovery`
+is a separate capture guarantee, not an implicit nonzero loss count: the
+fallback can miss a short-lived branch without observing an event it could
+count as lost.
 
-### 4.6 CPU slices
+### 4.7 CPU slices
 
 A slice is the compact triple:
 
@@ -380,20 +472,24 @@ and rejected; the writer should have merged them. `cpu_peak_cores` is the
 maximum `cpu_ns / duration` over retained slices and is recomputed when a
 session finishes and when one is imported.
 
-`cpu_time_ns` remains authoritative. The checked sum of slice CPU must not
-exceed it. It normally equals it; a difference is legal because CPU observed
-at an inferred or zero-width boundary cannot always be assigned a positive
-wall interval. Forced stop by itself is not a reason to discard already
-recorded slice CPU.
+`cpu_time_ns` is the cumulative total Flamez retained. The checked sum of slice
+CPU must not exceed it. It normally equals it; a difference is legal because
+CPU observed at an inferred or zero-width boundary cannot always be assigned a
+positive wall interval. `cpu_final` says whether the total is authoritative,
+not whether the slice sum matches it. Forced stop by itself is not a reason to
+discard already recorded slice CPU.
 
 The file preserves snapshot buckets, not scheduler transitions:
 
 - cadence is `cpu_sample_period_ns`;
 - delayed snapshots move bucket boundaries but cumulative CPU is retained;
-- natural `group_dead` exit reconciles newest slices to the kernel total;
-- capture-clipped processes have no final kernel reconciliation.
+- a natural exit reconciles newest slices when its event carries
+  `cpu_final = true`;
+- an observed exit whose final CPU read failed retains `cpu_final = false`;
+- capture-clipped processes have `cpu_final = false` and no final
+  reconciliation.
 
-### 4.7 Structural invariants
+### 4.8 Structural invariants
 
 The reader validates all of these before returning:
 
@@ -402,40 +498,51 @@ The reader validates all of these before returning:
 2. Unknown object fields and duplicate keys are errors in v1.
 3. `loss_count` and all counts/times fit their destination integer types;
    checked addition/multiplication never wraps.
-4. `cpu_sample_period_ns > 0`, `host_cpu_count > 0`, and `target_argv` is an
+4. `capture_fidelity` is `exact` or `snapshot_recovery`; `unavailable` and
+   unknown values are rejected.
+5. `cpu_sample_period_ns > 0`, `host_cpu_count > 0`, and `target_argv` is an
    in-range reference to a non-empty argv vector.
-5. `processes` is non-empty. Process zero has null parent, `origin = observed`,
+6. `processes` is non-empty. Process zero has null parent, `origin = observed`,
    and `start_ns = 0`.
-6. Every later process has `parent < current_index`. This proves references
+7. Every later process has `parent < current_index`. This proves references
    are in range and the graph is rooted and acyclic without a second graph
    walk. Derived depth is computed with checked addition and must fit
    `Process.depth`.
-7. `start_ns <= end_ns <= elapsed_ns`. Zero width is legal, especially for
+8. `start_ns <= end_ns <= elapsed_ns`. Zero width is legal, especially for
    `recovered_exit`.
-8. A child's start is within its parent's recorded lifetime.
-9. Metadata references are in range, sources are field-appropriate, decoded
+9. A child's start is within its parent's recorded lifetime.
+10. Metadata references are in range, sources are field-appropriate, decoded
    byte limits hold, and unavailable values are null.
-10. Names are non-empty and at most 48 decoded bytes; paths are at most 512
-    decoded bytes.
-11. `end_kind` is never `open` and every enum string is known.
-12. Slice triples satisfy section 4.6, including lifetime bounds, ordering,
+11. Every `row` and exec name is non-empty and at most 48 decoded bytes; paths
+    contain 1...512 decoded bytes.
+12. Every process has at least one exec. Each exec lies within the process
+    lifetime, has `start_ns <= end_ns`, and is ordered and non-overlapping with
+    its neighbors. The final exec ends at the process end. Gaps and zero-width
+    execs are accepted as described in section 4.5.
+13. Every non-root `row` is `"first_exec"`. The root uses either that string or
+    an image object satisfying the retained-launch constraints in section 4.5.
+14. `end_kind` is never `open`, every enum string is known, and
+    `capture_clipped` implies `cpu_final = false`.
+15. Slice triples satisfy section 4.7, including lifetime bounds, ordering,
     non-overlap, canonical coalescing, and checked CPU summation.
-13. `root_exit` has exactly the fields allowed by its tag and bounded payload;
+16. `root_exit` has exactly the fields allowed by its tag and bounded payload;
     `unknown` has no payload fields.
-14. The process array ends before trailing non-whitespace; there is exactly one
+17. The process array ends before trailing non-whitespace; there is exactly one
     JSON document.
 
 The writer applies the same checks to the in-memory session before output.
 Assertions inside rendering are not a substitute for file validation.
 
-### 4.8 Example
+### 4.9 Example
 
-Two-process session on an eight-CPU host:
+One root PID whose stable launch command differs from its first captured image
+and which later execs again:
 
 ```json
 {
   "flamez": 1,
   "loss_count": 0,
+  "capture_fidelity": "exact",
   "cpu_sample_period_ns": 16000000,
   "host_cpu_count": 8,
   "target_argv": 0,
@@ -443,13 +550,14 @@ Two-process session on an eight-CPU host:
   "root_exit": { "kind": "exited", "code": 0 },
   "metadata": {
     "argv": [
-      ["sleep", "30"],
+      ["sh", "-c", "exec clang -c source.c"],
+      ["dash", "-c", "exec clang -c source.c"],
       ["clang", "-c", "source.c"]
     ],
     "paths": [
-      "/usr/bin/sleep",
       "/home/user/src",
-      "clang"
+      "/usr/bin/dash",
+      "/usr/bin/clang"
     ]
   },
   "processes": [
@@ -460,37 +568,47 @@ Two-process session on an eight-CPU host:
       "end_ns": 15000000,
       "origin": "observed",
       "end_kind": "observed_exit",
-      "name": "sleep",
-      "name_kind": "process",
-      "argv": { "ref": 0, "source": "launch" },
-      "exe": { "ref": 0, "source": "procfs", "truncated": false },
-      "cwd": { "ref": 1, "source": "procfs", "truncated": false },
+      "row": {
+        "name": "sh",
+        "name_kind": "process",
+        "argv": { "ref": 0, "source": "launch" },
+        "exe": null,
+        "cwd": { "ref": 0, "source": "procfs", "truncated": false }
+      },
+      "execs": [
+        {
+          "start_ns": 0,
+          "end_ns": 10000000,
+          "name": "dash",
+          "name_kind": "process",
+          "argv": { "ref": 1, "source": "kernel" },
+          "exe": { "ref": 1, "source": "kernel", "truncated": false },
+          "cwd": { "ref": 0, "source": "procfs", "truncated": false }
+        },
+        {
+          "start_ns": 10000000,
+          "end_ns": 15000000,
+          "name": "clang",
+          "name_kind": "process",
+          "argv": { "ref": 2, "source": "kernel" },
+          "exe": { "ref": 2, "source": "kernel", "truncated": false },
+          "cwd": { "ref": 0, "source": "procfs", "truncated": false }
+        }
+      ],
       "cpu_time_ns": 200000,
+      "cpu_final": true,
       "slices": [[0, 15000000, 200000]]
-    },
-    {
-      "pid": 1001,
-      "parent": 0,
-      "start_ns": 10000000,
-      "end_ns": 14000000,
-      "origin": "observed",
-      "end_kind": "observed_exit",
-      "name": "clang",
-      "name_kind": "process",
-      "argv": { "ref": 1, "source": "kernel" },
-      "exe": { "ref": 2, "source": "kernel", "truncated": false },
-      "cwd": { "ref": 1, "source": "inherited", "truncated": false },
-      "cpu_time_ns": 3500000,
-      "slices": [[10000000, 14000000, 3500000]]
     }
   ]
 }
 ```
 
-The shared cwd appears once in `metadata.paths` even though both processes
-reference it. An inherited multi-MiB argv receives the same treatment.
+The launch row, both exec images, and `target_argv` preserve distinct roles
+while sharing interned metadata references. The cwd appears once even though
+three image objects refer to it. An inherited multi-MiB argv receives the same
+treatment.
 
-### 4.9 Compatibility and schema evolution
+### 4.10 Compatibility and schema evolution
 
 The schema described here is still the draft of the first release. Until v1
 is explicitly declared stable:
@@ -610,16 +728,33 @@ At capture start, retain:
 |---|---|
 | target argv arena block | Exact argv passed to `Session.start`; keep it reachable even if the root later execs |
 | `host_cpu_count` | `max(std.Thread.getCpuCount() catch 1, 1)` |
+| `sample_period_ns` | Current `default_cpu_sample_period_ns` (16 ms); retained so import/re-export does not substitute a newer build's default |
 | `loss_count` | Collector loss counter plus known userspace admission/storage loss |
+| `capture_fidelity` | `collector.fidelity()` after `armLaunch` selects the per-launch macOS backend |
 
 `started_at` remains live-only for event rebasing. It is not exported.
+Rename the current `Session.cpu_sample_period_ns` declaration to
+`default_cpu_sample_period_ns`; `Session.update` uses `self.sample_period_ns`,
+and the tracer facade may keep its existing public constant as an alias to the
+default. A file's top-level `cpu_sample_period_ns` maps to the session field.
 Before file work lands, make path capture preserve bytes without
-`std.mem.trim` and make the procfs cap observable as described in section 4.4.
+`std.mem.trim` and make the procfs cap observable as described in section 4.5.
 
-Keep kernel and userspace loss components separately or merge only collector
-deltas. An `update` that copies the collector's cumulative counter must not
-overwrite userspace losses already recorded. The exported/query value is their
-saturating sum.
+Replace `lost_events` with a canonical `loss_count` and keep a live-only
+`collector_loss_seen`. Each update adds only the positive delta from the
+collector's cumulative counter, saturating into `loss_count`; userspace
+failures increment the same total directly. This prevents a later collector
+poll from overwriting userspace loss. Every failure to retain canonical data—a
+process record, exec history/row snapshot, image metadata, or CPU slice—must
+not be logged and then omitted while the file still claims `loss_count = 0`.
+Failure of the optional finish-time compaction scratch allocation is not data
+loss because the old arena and every reference remain valid. The footer and
+`isIncomplete()` read `loss_count`.
+
+Initialize `collector_loss_seen` from the collector after `armLaunch`, rather
+than assuming zero, so reusing a Linux collector for another session cannot
+charge the new session for an older capture. If a backend counter resets, treat
+the new value as the next baseline; never subtract from `loss_count`.
 
 Replace the two nullable session fields with the same tagged shape used by the
 file:
@@ -636,9 +771,18 @@ pub const RootExit = union(enum) {
 `stop` set one union prong, so live code cannot accidentally leave both an
 exit code and signal populated.
 
-Thread target stdout routing through a small `Session.start` options bag:
-`target_stdout: enum { inherit, stderr } = .inherit`. Headless `-o -` selects
-`.stderr`; every other mode uses the default. Keep this spawn concern out of
+Add `Session.finished`, reset it to false by `start`, and set it only after the
+orderly shared finish path or a successful import. `write` requires it. This
+distinguishes a real finished capture from an idle/new session or abort-only
+cleanup; `running == false` alone cannot make that distinction.
+
+Thread target stdout routing through a small `Session.StartOptions` bag with
+`target_stdout: TargetStdout = .inherit`, then through a matching
+`process_ops.SpawnOptions`. Headless `-o -` selects `.stderr`; every other mode
+uses the default. The Linux `.stderr` case passes
+`.stdout = .{ .file = std.Io.File.stderr() }`; `SpawnOptions.StdIo` has no
+dedicated stderr-redirect tag. The macOS suspended-spawn shim adds a
+`dup2(STDERR_FILENO, STDOUT_FILENO)` file action. Keep this spawn concern out of
 the collector and session-file modules.
 
 At capture finish, recompute `recovered_count`, process depths, derived PPIDs,
@@ -646,44 +790,61 @@ slice bands, and peak cores from canonical fields. `isIncomplete()` reads the
 loss/recovery counters directly. This gives the writer a single validation
 point and fixes stale peak caches on capture-clipped sessions.
 
-`Session.stop()` must preserve the root wait result. After the signal-safe
-tree sweep makes blocking bounded, wait for the owned child through the API
-that returns `std.process.Child.Term` and translate it to `root_exit`. Do not
-call the convenience kill path that waits and discards the status.
+`Session.stop(&collector)` must preserve the root wait result. After the
+signal-safe tree sweep makes blocking bounded, wait for the owned child through
+the API that returns `std.process.Child.Term` and translate it to `root_exit`.
+Map `.exited` and `.signal` to their matching prongs; map `.stopped` and
+`.unknown` to `RootExit.unknown` rather than assuming an exhaustive normal-exit
+status. If `Child.wait` fails, retain `RootExit.unknown`, use the idempotent
+kill path only as the cleanup fallback, and continue finishing the capture.
+Do not use that convenience kill path for the normal case because it waits and
+discards the status. Then flush the collector and take the same
+capture-boundary snapshot used by natural root exit before closing remaining
+records.
 
 After import:
 
-- `running == false`, `child == null`, `root_pid == null`, and
-  `active_count == 0`;
+- `finished == true`, `running == false`, `child == null`, `root_pid == null`,
+  and `active_count == 0`;
 - `elapsed_ns` is the file horizon and `timelineNs()` returns it;
 - process zero is the root;
 - `by_pid` remains empty because it is live-only;
-- metadata table entries exist once in the arena and process references share
+- metadata table entries exist once in the arena and row/exec references share
   offsets;
 - `parent_index` comes from `parent`, while `parent_pid` and `depth` are
   derived;
+- preceding real execs populate `Process.execs`, the last exec populates
+  `exec_start_ns` and the scalar current-image fields, and a root `row_only`
+  entry is created only when the file's root `row` is an object;
+- `cpu_final` is restored independently of `end_kind`;
 - slice `band` and `cpu_peak_cores` are derived;
 - revision counters are initialized so the first GUI frame rebuilds all
   relevant caches;
-- `host_cpu_count` and the retained target argv come from the file.
+- `host_cpu_count`, `sample_period_ns`, `capture_fidelity`, loss accounting,
+  root status, and the retained target argv come from the file.
 
 ### 5.3 Writer
 
 The writer has two phases:
 
 1. Validate the finished session and build deterministic argv/path intern
-   tables plus process-to-table references.
+   tables plus row/exec-to-table references.
 2. Emit compact JSON incrementally through `std.json.Stringify`:
-   top-level scalars, metadata entries, process objects, slice triples, closing
-   newline.
+   top-level scalars, metadata entries, process/row/exec objects, slice
+   triples, and the closing newline.
 
 Use standard JSON stringification for valid UTF-8 strings and field names.
 Never hand-roll escaping. Stream base64 fallback and argv iteration. Do not
 materialize a schema-shaped copy or whole JSON document.
 
-The intern prepass is expected O(processes + distinct metadata bytes) time and
-O(distinct metadata entries) scratch space. Slice emission is O(slice count)
-and O(1) scratch.
+For `row`, compare `rowExec()` with `execAt(0)` by complete image contents and
+provenance, not arena offsets alone. Emit `"first_exec"` when they are equal;
+the only permitted unequal case is process zero's validated launch snapshot,
+which is emitted as an image object.
+
+The intern prepass is expected O(processes + execs + distinct metadata bytes)
+time and O(distinct metadata entries + image references) scratch space. Slice
+emission is O(slice count) and O(1) scratch.
 
 `writeFile` writes to a uniquely created sibling temporary file, flushes and
 closes it successfully, then renames it into place. On any failure it removes
@@ -718,8 +879,9 @@ Immediately after the top-level object begins, require and parse the `flamez`
 field, then dispatch to the matching version-specific body reader. Reject an
 unknown version before reading another body token. The remaining top-level
 fields may arrive in any order. If `processes` precedes `metadata`, retain only
-small numeric metadata references until the tables arrive, then resolve them
-before validation succeeds.
+small numeric metadata references for row/exec images until the tables arrive,
+then resolve them before validation succeeds. This scratch is proportional to
+the number of images, not their metadata payload bytes.
 
 Build into a local session and use `errdefer session.deinit()` immediately.
 No partially parsed session reaches `App`. On success, release token/table
@@ -735,10 +897,11 @@ not silently ignored typos inside v1.
 intern order is normalized, but it must preserve:
 
 - top-level canonical fields and tagged root exit;
-- process array order, PIDs, parents, times, provenance, names, and metadata
-  bytes;
+- capture fidelity and loss count;
+- process array order, PIDs, parents, lifetime provenance, stable row images,
+  and every exec interval/image in order;
 - target argv;
-- CPU totals and every slice triple.
+- CPU totals, `cpu_final`, and every slice triple.
 
 Derived caches are compared to recomputation, not serialized values.
 
@@ -754,11 +917,12 @@ flamez [flamez-flags] [--] [<target> [target-args...]]
 
 Modes:
 
-| Mode | Invocation | Window | BPF |
+| Mode | Invocation | Window | Collector |
 |---|---|---|---|
-| Capture + GUI | `flamez [--] <target> [args...]` | yes | yes |
-| Capture + file | `flamez -o <path> [--] <target> [args...]` | no | yes |
-| Open file | `flamez -i <path>` | yes | no |
+| Capture + GUI | `flamez [--] <target> [args...]` | yes | required |
+| Capture + file | `flamez -o <path> [--] <target> [args...]` | no | required |
+| Open file | `flamez -i <path>` | yes | not initialized |
+| Analyze file | `flamez -a <path>` | no | not initialized |
 
 Flags:
 
@@ -766,6 +930,7 @@ Flags:
 |---|---|
 | `-o <path>`, `--output <path>` | Write the finished capture. Implies headless. `-` means stdout. |
 | `-i <path>`, `--import <path>` | Read a finished session and open it in the GUI. `-` means stdin. |
+| `-a <path>`, `--analyze <path>` | Write `analyzed-<filename>` beside a session file. |
 | `--` | End Flamez flags; required when the target begins with `-`. |
 
 Examples:
@@ -775,14 +940,17 @@ flamez -o capture.json -- zig build -Doptimize=ReleaseFast
 flamez --output=- make -j8 | jq .
 flamez zig build
 flamez -i capture.json
+flamez -a capture.json
 cat capture.json | flamez -i -
 ```
 
 Rules:
 
-- `-o` and `-i` together are a usage error.
+- Capture output, import, and analysis modes are mutually exclusive.
 - `-o` requires a target.
 - `-i` rejects target/extra positionals.
+- `-a` requires a named file, rejects stdin and extra positionals, and
+  atomically replaces the derived sibling only after a successful write.
 - There is no bare-path import heuristic; `flamez capture.json` runs a target
   named `capture.json`. Use `flamez -i capture.json` to import.
 - A named `-o` path atomically replaces an existing destination only after a
@@ -792,24 +960,30 @@ Rules:
   on stderr. This keeps pipelines valid.
 - `-i -` reads stdin completely through the streaming parser before opening
   the window. GUI input does not require the terminal stream afterward.
-- Import never initializes BPF, drops capabilities, or requires an installed
-  BPF object.
+- Import never initializes a collector, performs capability/entitlement setup,
+  or requires an installed Linux BPF object.
 
-Usage text shows all three explicit modes.
+Usage text shows all four explicit modes.
 
 ### 6.1 Exit status for headless capture
 
 | Code | Meaning |
 |---|---|
-| 0 | File written, capture complete, and `root_exit` is `exited` with code zero. |
-| 1 | Flamez failed before producing a complete file: BPF, spawn, internal, or write failure. |
+| 0 | File written with no known loss/recovery, and `root_exit` is `exited` with code zero. |
+| 1 | Flamez failed before producing a complete file: collector, spawn, internal, or write failure. |
 | 2 | CLI usage error. |
 | 3 | File written but the session is incomplete (`loss_count > 0` or recovered records). |
-| 4 | File written, session complete, but `root_exit` is nonzero `exited`, `signaled`, or `unknown`. |
+| 4 | File written with no known loss/recovery, but `root_exit` is nonzero `exited`, `signaled`, or `unknown`. |
 
 If both the target failed and the capture is incomplete, code 3 wins because
 the capture-quality warning would otherwise be lost; `root_exit` still records
 the target result. This precedence must be unit-tested.
+
+`capture_fidelity = snapshot_recovery` does not by itself select code 3. It is
+a visible guarantee on an otherwise successful file, whereas code 3 means
+Flamez observed concrete loss or had to create recovered records. Deployments
+that require exact macOS capture can use the existing exact-capture build
+policy and fail before launch when it is unavailable.
 
 A first cooperative termination signal that successfully writes a file is not
 a Flamez write failure. It normally produces code 4 because the root was
@@ -828,13 +1002,16 @@ Headless mode uses capture without window initialization:
 installCooperativeSignalHandlers()
 parse argv
 collector.init()
-dropCapabilities()
-session.start(collector, target_argv)
+collector.dropPrivileges()
+if stop_requested: exit 1 without launching or writing
+session.start(&collector, target_argv, start_options)
 while session.running:
-    session.update(collector)
-    if stop_requested: session.stop()
+    if stop_requested:
+        session.stop(&collector)
+    else:
+        session.update(&collector)
     sleep about 1 ms
-finishCollector(session, collector)
+collector.deinit()
 writeFile or write stdout
 exit per section 6.1
 ```
@@ -842,8 +1019,10 @@ exit per section 6.1
 Details:
 
 - Use the awake clock for the roughly 1 ms sleep. Faster polling adds CPU cost
-  without changing the 16 MiB kernel ring bound.
-- Natural exit and forced stop share the same finish and writer calls.
+  without changing the collectors' 16 MiB producer bounds.
+- Natural exit and forced stop share `Session`'s collector flush, boundary CPU
+  snapshot, close/compact, and writer calls.
+- Serialize the per-launch `collector.fidelity()` selected by `Session.start`.
 - A named path is installed atomically only after the whole JSON file closes
   successfully.
 - With `-o -`, JSON is the only stdout producer.
@@ -865,6 +1044,10 @@ After `session.running` becomes false, Ctrl+S calls the same
   collision consistently;
 - never mutate the finished session while saving.
 
+Add Ctrl+S to `hasKeyboardActivity()`. Finished captures use the idle polling
+path, so a save key that does not request a frame would otherwise never reach
+the save handler or redraw the footer message.
+
 No file picker is required in v1. Stop/Ctrl+C ends the capture but does not
 auto-save a GUI session.
 
@@ -879,7 +1062,8 @@ Import follows:
 - initialize the GUI directly in the existing finished/idle path;
 - use the imported `host_cpu_count`;
 - hide Stop because `running == false`;
-- show derived FINISHED/INCOMPLETE state and tagged root exit;
+- show derived FINISHED/INCOMPLETE state, imported capture fidelity, tagged
+  root exit, partial `CPU~` totals, and the complete exec history;
 - let Ctrl+S re-export through the same writer;
 - keep `FLAMEZ_SCREENSHOT` working for privilege-free visual fixtures.
 
@@ -891,16 +1075,27 @@ mistaken for live capture.
 ## 9. Tests
 
 Keep session-file tests under the tracer test root so they do not need a
-window or BPF privileges.
+window or a live platform collector.
 
 ### 9.1 Format and round trip
 
-- Minimal finished root; write/read and compare canonical fields.
+- Minimal finished root for each capture fidelity; write/read and compare
+  canonical fields.
 - PID reuse: two records with the same PID and different array positions.
 - Parent topology: reject null non-root parents, forward/self references, and
   cycles implied by them; derive depth and PPID on success.
+- Exec history: preserve multiple chronological images, zero-width intervals,
+  legal loss gaps, and the final scalar current-image reconstruction.
+- Root launch coalescing: a stable launch `row` that differs from the first real
+  exec round-trips without serializing or exposing `row_only`.
+- Ordinary processes use `row = "first_exec"`; reject unknown row strings, a
+  non-root row object, or a root launch object with the wrong argv/source/exe.
+- Reject empty exec arrays, out-of-order/overlapping execs, intervals outside
+  the process lifetime, and a final exec that does not end with the process.
+- `process_inspection` argv/path provenance round-trips alongside `launch`,
+  `kernel`, `procfs`, and `inherited`.
 - Metadata interning: thousands of inherited references to one large argv
-  produce one table entry and one imported arena block.
+  across rows and execs produce one table entry and one imported arena block.
 - Equal-but-separately-stored paths intern to one table entry.
 - Paths with leading/trailing spaces round-trip exactly; a path at/over the
   capture cap has the correct `truncated` value.
@@ -912,7 +1107,12 @@ window or BPF privileges.
 - Nonzero `loss_count` makes `isIncomplete()` true.
 - Tagged root exit: exited/signaled/unknown; reject mixed or out-of-range
   payloads.
-- Capture-clipped process retains CPU total and slices.
+- Final and partial observed-exit CPU totals round-trip independently of
+  `end_kind`; a capture-clipped process retains CPU total and slices but
+  rejects `cpu_final = true`.
+- Exact and snapshot-recovery fidelity round-trip; reject `unavailable` and
+  unknown fidelity strings. Snapshot recovery alone does not derive
+  `isIncomplete()`.
 - Slice order, lifetime bounds, non-overlap, nonzero CPU, derived band,
   canonical coalescing, peak recomputation, and checked sum.
 - A non-first or unknown `flamez` version, unknown field, duplicate field,
@@ -939,7 +1139,8 @@ v1 is declared stable; they do not create accidental compatibility promises.
 - A failed named-path write leaves the old destination byte-for-byte intact
   and removes its temporary file.
 - GUI exclusive save refuses an existing suggested name.
-- `-o -` keeps target stdout out of the JSON stream.
+- `-o -` keeps target stdout out of the JSON stream through both Linux and
+  macOS spawn-option implementations.
 
 ### 9.3 CLI and optional smoke tests
 
@@ -948,7 +1149,11 @@ v1 is declared stable; they do not create accidental compatibility promises.
 - `capture.json` without `-i` remains a target command.
 - Incomplete-plus-target-failure returns code 3; complete target failure
   returns code 4.
-- Privileged smoke: `flamez -o /tmp/t.json -- true`.
+- Forced Stop flushes queued events, takes a boundary CPU sample, reaps and
+  records the root status, and produces the same finished invariants as natural
+  exit.
+- Capture smoke where the platform collector is available:
+  `flamez -o /tmp/t.json -- true`.
 - Privilege-free import smoke: `flamez -i /tmp/t.json` with
   `FLAMEZ_SCREENSHOT` where a display is available.
 
@@ -956,21 +1161,29 @@ v1 is declared stable; they do not create accidental compatibility promises.
 
 ## 10. Implementation order
 
-1. Add session-owned target argv reference, host CPU count, unified loss count,
-   and one finish-time derived-cache rebuild/validation function.
-2. Implement `session_file.write` with metadata interning, ByteString, compact
-   slice triples, preflight validation, and buffer tests.
-3. Implement streaming `session_file.read` with version-first dispatch,
-   diagnostics, invariant validation, shared metadata reconstruction, and
-   round-trip/failure tests.
-4. Implement atomic `writeFile`/streaming `readFile`.
-5. Implement cooperative first-signal state and second-signal abort.
-6. Parse the explicit capture/output/import CLI modes, including stdin/stdout
-   routing.
-7. Add the headless loop and exit-status precedence.
-8. Add GUI exclusive Ctrl+S save.
-9. Add GUI import without collector/capabilities and imported host CPU scale.
-10. Update README/usage and add smoke coverage.
+1. Add the session-owned target argv reference, host CPU count, retained CPU
+   sample period, unified loss count/query, tagged root exit, explicit
+   `finished` marker, and finish-time derived-cache rebuild. Make path capture
+   preserve exact bytes and observable truncation.
+2. Refactor forced Stop into the existing collector-aware natural-finish path;
+   preserve the root wait result, queued events, boundary CPU sample, exec
+   metadata, and compaction. Keep a separate abort-only deinit cleanup.
+3. Implement exec-aware `session_file.write` with stable rows, chronological
+   execs, metadata interning, ByteString, compact slice triples, preflight
+   validation, and buffer tests.
+4. Implement streaming `session_file.read` with version-first dispatch,
+   diagnostics, invariant validation, shared row/exec metadata reconstruction,
+   and round-trip/failure tests.
+5. Implement atomic `writeFile` and streaming `readFile`.
+6. Thread stdout routing through `Session.StartOptions`, both process-operation
+   backends, and the macOS suspended-spawn shim.
+7. Implement cooperative first-signal state and second-signal abort.
+8. Parse the explicit capture/output/import CLI modes, including stdin/stdout
+   routing; add the headless loop and exit-status precedence.
+9. Add GUI exclusive Ctrl+S save.
+10. Add GUI import without collector/capability setup, using imported host CPU
+    scale, fidelity, root/CPU provenance, and exec history.
+11. Update README/usage and add smoke coverage.
 
 Do not block this sequence on compression, Perfetto, or a file picker.
 
@@ -981,8 +1194,8 @@ Do not block this sequence on compression, Perfetto, or a file picker.
 - Measure representative compact JSON files before choosing optional zstd or a
   binary container.
 - Chrome Trace / Perfetto converter.
-- Explicit summary-only export that omits slices, with a distinct documented
-  capability/schema field rather than silently empty slice arrays.
+- Additional analysis profiles if a future consumer needs more detail than the
+  bounded, slice-free format in `ANALYSIS.md`.
 - GUI file picker and explicit overwrite confirmation.
 - GUI save-on-window-close using the same atomic writer.
 - `flamez -i in.json -o out.json` rewrite/canonicalize mode.

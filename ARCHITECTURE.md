@@ -249,8 +249,14 @@ The UI is split between two rendering strategies:
 
 Other responsibilities:
 
-- argv parsing (`flamez <target> [args...]`, passed through verbatim — no
-  intermediate shell);
+- explicit CLI parsing for GUI capture, headless `-o` output, and `-i` import;
+  `--` ends Flamez flags and target argv is passed through verbatim without an
+  intermediate shell;
+- streaming finished-session import/export through `session_file.zig`, with
+  interned argv/path tables, strict v1 validation, atomic named-path saves, and
+  collision-safe GUI filenames derived from the retained target argv;
+- privilege-free imported sessions skip collector setup and render with the
+  tracing host's retained CPU count and capture fidelity;
 - wiring input into Clay (`setPointerState`, `updateScrollContainers`);
 - timeline zoom through Ctrl+wheel or the centered Ctrl+= / Ctrl+- keyboard
   equivalents, with Ctrl+0 restoring the full follow-live view;
@@ -338,7 +344,7 @@ exec or reused PID cannot update the wrong record. Neither macOS producer
 mutates `Session` or UI state. Fatal-signal teardown uses its separate atomic
 PID handoff described below.
 
-## Fatal-signal lifecycle
+## Cooperative termination lifecycle
 
 The target deliberately lives in its **own process group** (`pgid = 0` at
 spawn) so that `stop()` can cancel the whole build tree with one
@@ -350,18 +356,20 @@ silent orphan writing into the void.
 
 To close that hole, `installFatalSignalHandlers()` (called first thing in
 `main()`) registers handlers for SIGINT/SIGTERM/SIGHUP/SIGQUIT and ignores
-SIGPIPE. The handler is async-signal-safe by construction: it reads the
-target's pgid from an atomic (`live_target_pgid`, armed right after spawn,
-disarmed when the root exits naturally or the session stops), sends TERM to
-the group, waits ~120 ms via raw `nanosleep`, escalates to KILL, then restores
-the default disposition and re-raises so the process still dies from the
-signal it received. Group teardown tolerates `ESRCH` (group already gone) via
-a raw syscall wrapper instead of `std.posix.kill`, whose debug-mode behavior
-panics on `ESRCH`.
+SIGPIPE. The first signal atomically records a cooperative stop request and
+performs the async-signal-safe target-tree sweep. The GUI or headless loop then
+calls `Session.stop(&collector)`, reaps the root, drains queued lifecycle work,
+takes the capture-boundary CPU snapshot, closes every interval, rebuilds
+derived caches, and compacts metadata. Headless mode can therefore still write
+a complete file after Ctrl+C.
 
-The same teardown helper backs `Session.stop()`, the spawn error path, and
-deinit, so every way flamez can die — Stop button, window close, fatal
-signal — ends with the target group terminated.
+A second termination signal restores the default disposition and re-raises,
+so a wedged stop or output write cannot trap the user. The armed root pgid and
+fixed tracked-PID table let both passes reach build tools that create their own
+process groups. Group teardown tolerates `ESRCH` via raw syscall wrappers.
+Window close and the Stop button use the same collector-aware finish path;
+deinitialization retains a separate abort-only cleanup path for failures before
+an orderly boundary exists.
 
 ## Build system
 
@@ -411,6 +419,8 @@ the renderer:
   timeline zoom/pan implementation;
 - session JSON export, GUI import of that file, and headless `-o` capture
   (see HEADLESS.md);
+- derived dependency/bottleneck analysis without a collector or GUI
+  (see ANALYSIS.md);
 - optional per-thread views (CPU is currently aggregated by TGID);
 - alternate frontends: `Session` has no raylib dependency and can drive any
   renderer, headless dump, or TUI.

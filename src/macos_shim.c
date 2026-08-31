@@ -82,7 +82,9 @@ int flamez_macos_process_identity(int32_t pid,
     return 0;
 }
 
-int flamez_macos_spawn_suspended(const char *const *argv, int32_t *pid)
+int flamez_macos_spawn_suspended(const char *const *argv,
+                                 int32_t *pid,
+                                 int redirect_stdout_to_stderr)
 {
     posix_spawnattr_t attributes;
     posix_spawn_file_actions_t actions;
@@ -113,6 +115,12 @@ int flamez_macos_spawn_suspended(const char *const *argv, int32_t *pid)
             "/dev/null",
             O_RDONLY,
             0);
+    }
+    if (result == 0 && redirect_stdout_to_stderr != 0) {
+        result = posix_spawn_file_actions_adddup2(
+            &actions,
+            STDERR_FILENO,
+            STDOUT_FILENO);
     }
     if (result == 0) {
         result = posix_spawnp(
@@ -249,7 +257,7 @@ int flamez_macos_read_cwd(int32_t pid, void *buffer, size_t buffer_size)
         return -ENOENT;
     }
     if (length > buffer_size) {
-        return -ERANGE;
+        length = buffer_size;
     }
     memcpy(buffer, path, length);
     return (int)length;

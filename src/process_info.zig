@@ -483,7 +483,7 @@ pub fn buildProcessInfo(
     }
     if (process.origin != .observed or
         process.end_kind == .capture_clipped or
-        session.incomplete)
+        session.isIncomplete())
     {
         tip.addFmt(
             "CAPTURE  {s}  ·  END  {s}{s}",
@@ -499,7 +499,7 @@ pub fn buildProcessInfo(
                     .observed_exit => "observed",
                     .capture_clipped => "capture edge",
                 },
-                if (session.incomplete) "  ·  SESSION INCOMPLETE" else "",
+                if (session.isIncomplete()) "  ·  SESSION INCOMPLETE" else "",
             },
             sizes.body,
             toRaylibColor(theme.danger),
