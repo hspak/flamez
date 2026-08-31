@@ -18,13 +18,36 @@ pub const tooltip_more_marker = "…";
 /// Visible hover-tooltip rows, including a trailing overflow marker when needed.
 pub const tooltip_max_rows: usize = 7;
 
+pub const TextSpan = struct {
+    start: usize,
+    end: usize,
+};
+
+const LineStyles = struct {
+    bold: ?TextSpan = null,
+    accent: ?TextSpan = null,
+};
+
 pub const TooltipLine = struct {
     text: []const u8,
     size: f32,
     color: rl.Color,
+    bold: ?TextSpan = null,
+    accent: ?TextSpan = null,
     /// Copying joins wrapped continuations and preserves only logical row breaks.
     break_after: bool = true,
 };
+
+fn spanWithin(span: ?TextSpan, offset: usize, len: usize) ?TextSpan {
+    const source = span orelse return null;
+    const start = @max(source.start, offset);
+    const end = @min(source.end, offset + len);
+    if (start >= end) return null;
+    return .{
+        .start = start - offset,
+        .end = end - offset,
+    };
+}
 
 /// Caller-backed builder for process-detail lines. It never allocates; text
 /// and line storage must outlive every slice returned through `lines`.
@@ -91,35 +114,51 @@ pub const TooltipBuilder = struct {
     }
 
     fn addWrapped(self: *TooltipBuilder, value: []const u8, size: f32, color: rl.Color) void {
-        if (self.line_count >= self.lines.len) {
-            self.overflowed = true;
-            return;
-        }
-        var rest = value;
-        while (rest.len > 0 and self.line_count < self.lines.len) {
-            const take = wrapPrefix(self.font, rest, size, self.inner_w);
-            const remaining = std.mem.trimStart(u8, rest[take..], " ");
-            const line_index = self.line_count;
-            self.add(rest[0..take], size, color);
-            if (self.line_count > line_index) {
-                self.lines[line_index].break_after = remaining.len == 0;
-            }
-            rest = remaining;
-        }
-        if (rest.len > 0) self.overflowed = true;
+        self.addWrappedStyled(value, size, color, .{});
     }
 
-    fn addStoredWrapped(
+    fn addWrappedStyled(
         self: *TooltipBuilder,
         value: []const u8,
         size: f32,
         color: rl.Color,
+        styles: LineStyles,
     ) void {
         if (self.line_count >= self.lines.len) {
             self.overflowed = true;
             return;
         }
         var rest = value;
+        var offset: usize = 0;
+        while (rest.len > 0 and self.line_count < self.lines.len) {
+            const take = wrapPrefix(self.font, rest, size, self.inner_w);
+            const remaining = std.mem.trimStart(u8, rest[take..], " ");
+            const line_index = self.line_count;
+            self.add(rest[0..take], size, color);
+            if (self.line_count > line_index) {
+                self.lines[line_index].bold = spanWithin(styles.bold, offset, take);
+                self.lines[line_index].accent = spanWithin(styles.accent, offset, take);
+                self.lines[line_index].break_after = remaining.len == 0;
+            }
+            offset += take + rest[take..].len - remaining.len;
+            rest = remaining;
+        }
+        if (rest.len > 0) self.overflowed = true;
+    }
+
+    fn addStoredWrappedStyled(
+        self: *TooltipBuilder,
+        value: []const u8,
+        size: f32,
+        color: rl.Color,
+        styles: LineStyles,
+    ) void {
+        if (self.line_count >= self.lines.len) {
+            self.overflowed = true;
+            return;
+        }
+        var rest = value;
+        var offset: usize = 0;
         while (rest.len > 0 and self.line_count < self.lines.len) {
             const take = wrapPrefix(self.font, rest, size, self.inner_w);
             const remaining = std.mem.trimStart(u8, rest[take..], " ");
@@ -127,9 +166,12 @@ pub const TooltipBuilder = struct {
                 .text = rest[0..take],
                 .size = size,
                 .color = color,
+                .bold = spanWithin(styles.bold, offset, take),
+                .accent = spanWithin(styles.accent, offset, take),
                 .break_after = remaining.len == 0,
             };
             self.line_count += 1;
+            offset += take + rest[take..].len - remaining.len;
             rest = remaining;
         }
         if (rest.len > 0) self.overflowed = true;
@@ -201,7 +243,14 @@ fn addArguments(
     }
     const start = tip.store_len;
     tip.store_len += arguments.len;
-    tip.addStoredWrapped(tip.store[start..tip.store_len], size, color);
+    var prefix_buf: [64]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buf, "Command (args: {d}): ", .{arg_count}) catch
+        unreachable;
+    const argv0_end = prefix.len +| process.argv0(metadata).len;
+    tip.addStoredWrappedStyled(tip.store[start..tip.store_len], size, color, .{
+        .bold = .{ .start = 0, .end = "Command".len },
+        .accent = .{ .start = prefix.len, .end = argv0_end },
+    });
 }
 
 fn formatArguments(
@@ -216,7 +265,7 @@ fn formatArguments(
     const required = std.math.add(usize, prefix.len, process.args_len) catch return null;
     if (required > output.len) return null;
     @memcpy(output[0..prefix.len], prefix);
-    const arguments = process.copyArguments(
+    const arguments = process.copyCmdline(
         metadata,
         output[prefix.len..][0..process.args_len],
     );
@@ -236,7 +285,6 @@ fn formatArgumentsPrefix(
     @memcpy(output[0..prefix.len], prefix);
     var len = prefix.len;
     var args = process.argsIter(metadata);
-    _ = args.next();
     var argument_index: usize = 0;
     while (args.next()) |arg| {
         if (argument_index > 0) {
@@ -390,12 +438,15 @@ pub fn buildProcessInfo(
                 process.cwdSlice(metadata),
             },
         ) catch unreachable;
-        tip.addWrapped(cwd_line, sizes.body, toRaylibColor(ink));
+        tip.addWrappedStyled(cwd_line, sizes.body, toRaylibColor(ink), .{
+            .bold = .{ .start = 0, .end = "Directory".len },
+        });
     }
 
-    // Minus 1 to not count the program itself.
+    // The displayed argument count excludes the program name, but the command
+    // itself includes argv[0] so it can be copied and run as shown.
     const arg_count = process.args_count -| 1;
-    if (arg_count > 0) {
+    if (process.args_count > 0) {
         addArguments(
             tip,
             process,
@@ -430,6 +481,20 @@ test "TooltipBuilder interns text into caller storage" {
     tip.add("dropped", 12, rl.Color.white);
     try testing.expectEqual(@as(usize, 2), tip.line_count);
     try testing.expect(tip.overflowed);
+}
+
+test "text style spans clip and rebase across wrapped lines" {
+    const testing = std.testing;
+
+    try testing.expectEqual(
+        TextSpan{ .start = 0, .end = 3 },
+        spanWithin(.{ .start = 4, .end = 9 }, 4, 3).?,
+    );
+    try testing.expectEqual(
+        TextSpan{ .start = 0, .end = 2 },
+        spanWithin(.{ .start = 4, .end = 9 }, 7, 4).?,
+    );
+    try testing.expect(spanWithin(.{ .start = 4, .end = 9 }, 10, 4) == null);
 }
 
 test "wrap probe limit never exceeds the pixel budget" {
@@ -499,5 +564,5 @@ test "argument row joins argv with spaces" {
 
     const row = formatArguments(&process, metadata.items, 2, &buffer).?;
 
-    try testing.expectEqualStrings("Command (args: 2): -c source file.c", row);
+    try testing.expectEqualStrings("Command (args: 2): clang -c source file.c", row);
 }

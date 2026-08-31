@@ -339,6 +339,7 @@ pub fn main(init: std.process.Init) !void {
         perf.enter(.detail);
         try detail_pane.render(&app, &session, .{
             .font = frame_input.font,
+            .bold_font = frame_input.row_font,
             .mouse = frame_input.mouse,
             .wheel = frame_input.wheel,
             .clicked = frame_input.clicked,

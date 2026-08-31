@@ -25,6 +25,7 @@ const scrollbar_width: f32 = 12;
 const tooltip_max_width: f32 = 560;
 const tooltip_corner_radius: f32 = 4;
 const canvas = theme.canvas;
+const accent = theme.accent;
 const cpu_hot = theme.cpu_hot;
 const panel_raised = theme.panel_raised;
 const border = theme.border;
@@ -41,6 +42,7 @@ const measureTextSlice = text.measureTextSlice;
 
 pub const Input = struct {
     font: rl.Font,
+    bold_font: rl.Font,
     mouse: rl.Vector2,
     wheel: f32,
     clicked: bool,
@@ -58,6 +60,7 @@ const detail_line_gap: f32 = 5;
 const detail_min_line_glyphs: usize = 8;
 const detail_cpu_graph_height: f32 = 174;
 const detail_cpu_graph_gap: f32 = 16;
+const detail_cpu_graph_label_size: f32 = 12;
 const detail_resize_handle_height: f32 = 8;
 const detail_min_height: f32 = 160;
 const timeline_min_height: f32 = 180;
@@ -127,6 +130,19 @@ fn detailCpuGraphY(cores: f64, core_scale: f64, plot: rl.Rectangle) f32 {
     return plot.y + plot.height * (1 - @as(f32, @floatCast(fraction)));
 }
 
+fn drawDetailCpuGraphText(
+    font: rl.Font,
+    value: []const u8,
+    position: rl.Vector2,
+    size: f32,
+    color: rl.Color,
+) void {
+    drawTextSlice(font, value, .{
+        .x = @round(position.x),
+        .y = @round(position.y),
+    }, size, color);
+}
+
 fn drawDetailCpuGraph(
     app: *App,
     process: *const tracer.Process,
@@ -139,11 +155,11 @@ fn drawDetailCpuGraph(
     rl.drawRectangleRounded(card, 0.04, 4, toRaylibColor(panel_raised));
     rl.drawRectangleRoundedLinesEx(card, 0.04, 4, 1, toRaylibColor(border));
 
-    drawTextSlice(
+    drawDetailCpuGraphText(
         font,
         "THREAD CPU",
         .{ .x = card.x + 10, .y = card.y + 8 },
-        12,
+        detail_cpu_graph_label_size,
         toRaylibColor(ink),
     );
     const core_scale = detailCpuGraphCoreScale(process, host_cpu_count);
@@ -153,20 +169,20 @@ fn drawDetailCpuGraph(
         "0–{d:.0} CORES",
         .{core_scale},
     ) catch "CORES";
-    const scale_size = measureTextSlice(font, scale_label, 11);
-    drawTextSlice(
+    const scale_size = measureTextSlice(font, scale_label, detail_cpu_graph_label_size);
+    drawDetailCpuGraphText(
         font,
         scale_label,
         .{ .x = card.x + card.width - scale_size.x - 10, .y = card.y + 8 },
-        11,
+        detail_cpu_graph_label_size,
         toRaylibColor(cpu_hot),
     );
     drawTextSliceClipped(
         "ALL THREADS · FULL PROCESS RANGE · SESSION TIME",
         .{
             .font = font,
-            .position = .{ .x = card.x + 10, .y = card.y + 25 },
-            .size = 11,
+            .position = .{ .x = @round(card.x + 10), .y = @round(card.y + 25) },
+            .size = detail_cpu_graph_label_size,
             .color = toRaylibColor(faint),
             .max_width = card.width - 20,
         },
@@ -195,23 +211,23 @@ fn drawDetailCpuGraph(
 
     var top_core_buffer: [16]u8 = undefined;
     const top_core = std.fmt.bufPrint(&top_core_buffer, "{d:.0}", .{core_scale}) catch "";
-    const top_core_size = measureTextSlice(font, top_core, 10);
-    drawTextSlice(
+    const top_core_size = measureTextSlice(font, top_core, detail_cpu_graph_label_size);
+    drawDetailCpuGraphText(
         font,
         top_core,
         .{ .x = plot.x - top_core_size.x - 7, .y = plot.y - top_core_size.y / 2 },
-        10,
+        detail_cpu_graph_label_size,
         toRaylibColor(muted),
     );
-    const zero_size = measureTextSlice(font, "0", 10);
-    drawTextSlice(
+    const zero_size = measureTextSlice(font, "0", detail_cpu_graph_label_size);
+    drawDetailCpuGraphText(
         font,
         "0",
         .{
             .x = plot.x - zero_size.x - 7,
             .y = plot.y + plot.height - zero_size.y / 2,
         },
-        10,
+        detail_cpu_graph_label_size,
         toRaylibColor(muted),
     );
 
@@ -299,15 +315,15 @@ fn drawDetailCpuGraph(
     }
     if (!drew_slice) {
         const no_samples = "NO CPU SAMPLES";
-        const no_samples_size = measureTextSlice(font, no_samples, 11);
-        drawTextSlice(
+        const no_samples_size = measureTextSlice(font, no_samples, detail_cpu_graph_label_size);
+        drawDetailCpuGraphText(
             font,
             no_samples,
             .{
                 .x = plot.x + (plot.width - no_samples_size.x) / 2,
                 .y = plot.y + (plot.height - no_samples_size.y) / 2,
             },
-            11,
+            detail_cpu_graph_label_size,
             toRaylibColor(faint),
         );
     }
@@ -330,23 +346,29 @@ fn drawDetailCpuGraph(
         .{formatDuration(range.end_ns, &end_time_buffer)},
     ) catch "END";
     const label_y = plot.y + plot.height + 8;
-    drawTextSlice(font, start_label, .{ .x = plot.x, .y = label_y }, 10, toRaylibColor(muted));
+    drawDetailCpuGraphText(
+        font,
+        start_label,
+        .{ .x = plot.x, .y = label_y },
+        detail_cpu_graph_label_size,
+        toRaylibColor(muted),
+    );
     if (plot.width >= 300) {
-        const middle_size = measureTextSlice(font, middle_label, 10);
-        drawTextSlice(
+        const middle_size = measureTextSlice(font, middle_label, detail_cpu_graph_label_size);
+        drawDetailCpuGraphText(
             font,
             middle_label,
             .{ .x = plot.x + (plot.width - middle_size.x) / 2, .y = label_y },
-            10,
+            detail_cpu_graph_label_size,
             toRaylibColor(muted),
         );
     }
-    const end_size = measureTextSlice(font, end_label, 10);
-    drawTextSlice(
+    const end_size = measureTextSlice(font, end_label, detail_cpu_graph_label_size);
+    drawDetailCpuGraphText(
         font,
         end_label,
         .{ .x = plot.x + plot.width - end_size.x, .y = label_y },
-        10,
+        detail_cpu_graph_label_size,
         toRaylibColor(muted),
     );
 }
@@ -488,14 +510,120 @@ fn utf8FloorBoundary(value: []const u8, byte_index: usize) usize {
     return index;
 }
 
-fn detailByteAtX(font: rl.Font, line: TooltipLine, x: f32) usize {
+fn measureDetailLinePrefix(
+    font: rl.Font,
+    bold_font: rl.Font,
+    line: TooltipLine,
+    byte_index: usize,
+) f32 {
+    const end = @min(byte_index, line.text.len);
+    const bold = line.bold orelse return measureTextSlice(font, line.text[0..end], line.size).x;
+    var width: f32 = 0;
+    const before_end = @min(end, bold.start);
+    if (before_end > 0) {
+        width += measureTextSlice(font, line.text[0..before_end], line.size).x;
+    }
+    if (end > bold.start) {
+        const bold_end = @min(end, bold.end);
+        width += measureTextSlice(bold_font, line.text[bold.start..bold_end], line.size).x;
+    }
+    if (end > bold.end) {
+        width += measureTextSlice(font, line.text[bold.end..end], line.size).x;
+    }
+    return width;
+}
+
+fn detailLineHeight(font: rl.Font, bold_font: rl.Font, line: TooltipLine) f32 {
+    const regular_height = measureTextSlice(
+        font,
+        if (line.text.len == 0) " " else line.text,
+        line.size,
+    ).y;
+    const bold = line.bold orelse return regular_height;
+    return @max(
+        regular_height,
+        measureTextSlice(bold_font, line.text[bold.start..bold.end], line.size).y,
+    );
+}
+
+fn drawDetailLinePart(
+    font: rl.Font,
+    value: []const u8,
+    x: *f32,
+    y: f32,
+    size: f32,
+    color: rl.Color,
+) void {
+    if (value.len == 0) return;
+    drawTextSlice(font, value, .{ .x = x.*, .y = y }, size, color);
+    x.* += measureTextSlice(font, value, size).x;
+}
+
+fn drawDetailLine(
+    font: rl.Font,
+    bold_font: rl.Font,
+    line: TooltipLine,
+    position: rl.Vector2,
+) void {
+    var x = position.x;
+    var byte_index: usize = 0;
+    if (line.bold) |bold| {
+        drawDetailLinePart(
+            font,
+            line.text[byte_index..bold.start],
+            &x,
+            position.y,
+            line.size,
+            line.color,
+        );
+        drawDetailLinePart(
+            bold_font,
+            line.text[bold.start..bold.end],
+            &x,
+            position.y,
+            line.size,
+            line.color,
+        );
+        byte_index = bold.end;
+    }
+    if (line.accent) |highlight| {
+        std.debug.assert(byte_index <= highlight.start);
+        drawDetailLinePart(
+            font,
+            line.text[byte_index..highlight.start],
+            &x,
+            position.y,
+            line.size,
+            line.color,
+        );
+        drawDetailLinePart(
+            font,
+            line.text[highlight.start..highlight.end],
+            &x,
+            position.y,
+            line.size,
+            toRaylibColor(accent),
+        );
+        byte_index = highlight.end;
+    }
+    drawDetailLinePart(
+        font,
+        line.text[byte_index..],
+        &x,
+        position.y,
+        line.size,
+        line.color,
+    );
+}
+
+fn detailByteAtX(font: rl.Font, bold_font: rl.Font, line: TooltipLine, x: f32) usize {
     if (x <= 0 or line.text.len == 0) return 0;
-    if (measureTextSlice(font, line.text, line.size).x <= x) return line.text.len;
+    if (measureDetailLinePrefix(font, bold_font, line, line.text.len) <= x) return line.text.len;
     var low: usize = 0;
     var high = line.text.len;
     while (low < high) {
         const middle = low + (high - low + 1) / 2;
-        if (measureTextSlice(font, line.text[0..middle], line.size).x <= x) {
+        if (measureDetailLinePrefix(font, bold_font, line, middle) <= x) {
             low = middle;
         } else {
             high = middle - 1;
@@ -507,6 +635,7 @@ fn detailByteAtX(font: rl.Font, line: TooltipLine, x: f32) usize {
 fn detailPositionAt(
     app: *const App,
     font: rl.Font,
+    bold_font: rl.Font,
     mouse: rl.Vector2,
     content: clay.BoundingBox,
     pad: f32,
@@ -516,11 +645,10 @@ fn detailPositionAt(
     const local_x = mouse.x - (content.x + pad);
     const local_y = mouse.y -
         (content.y + pad + leading_height - app.detail_scroll_px);
-    if (local_y <= 0) return .{ .line = 0, .byte = detailByteAtX(
-        font,
-        app.detail_lines[0],
-        local_x,
-    ) };
+    if (local_y <= 0) return .{
+        .line = 0,
+        .byte = detailByteAtX(font, bold_font, app.detail_lines[0], local_x),
+    };
 
     var line_top: f32 = 0;
     for (app.detail_lines[0..app.detail_line_count], 0..) |line, line_index| {
@@ -531,7 +659,7 @@ fn detailPositionAt(
                 .byte = if (local_y > line_top + line_height)
                     line.text.len
                 else
-                    detailByteAtX(font, line, local_x),
+                    detailByteAtX(font, bold_font, line, local_x),
             };
         }
         line_top += line_height + detail_line_gap;
@@ -600,6 +728,7 @@ fn drawDetailTextSelection(
     app: *const App,
     selection: ?DetailTextSelection,
     font: rl.Font,
+    bold_font: rl.Font,
     line_index: usize,
     text_x: f32,
     text_y: f32,
@@ -611,8 +740,8 @@ fn drawDetailTextSelection(
     const start = if (line_index == selected.start.line) selected.start.byte else 0;
     const end = if (line_index == selected.end.line) selected.end.byte else line.text.len;
     if (start >= end) return;
-    const start_x = measureTextSlice(font, line.text[0..start], line.size).x;
-    const end_x = measureTextSlice(font, line.text[0..end], line.size).x;
+    const start_x = measureDetailLinePrefix(font, bold_font, line, start);
+    const end_x = measureDetailLinePrefix(font, bold_font, line, end);
     rl.drawRectangleRec(
         .init(text_x + start_x, text_y, @max(1, end_x - start_x), line_height),
         rl.Color.init(55, 105, 170, 170),
@@ -653,6 +782,7 @@ pub fn render(
     input: Input,
 ) Allocator.Error!void {
     const font = input.font;
+    const bold_font = input.bold_font;
     const mouse = input.mouse;
     const wheel = input.wheel;
     const clicked = input.clicked;
@@ -806,11 +936,7 @@ pub fn render(
         app.detail_cache_width = inner_w;
         app.detail_content_height = 0;
         for (app.detail_lines[0..app.detail_line_count], 0..) |line, line_index| {
-            const line_height = measureTextSlice(
-                font,
-                if (line.text.len == 0) " " else line.text,
-                line.size,
-            ).y;
+            const line_height = detailLineHeight(font, bold_font, line);
             app.detail_line_heights[line_index] = line_height;
             app.detail_content_height += line_height + detail_line_gap;
         }
@@ -889,7 +1015,15 @@ pub fn render(
     app.detail_scroll_px = std.math.clamp(app.detail_scroll_px, 0, max_scroll);
 
     if (clicked and over_metadata and !over_track) {
-        if (detailPositionAt(app, font, mouse, content, pad, leading_height)) |position| {
+        if (detailPositionAt(
+            app,
+            font,
+            bold_font,
+            mouse,
+            content,
+            pad,
+            leading_height,
+        )) |position| {
             app.detail_selection_anchor = position;
             app.detail_selection_focus = position;
             app.detail_text_selecting = true;
@@ -903,7 +1037,15 @@ pub fn render(
             app.detail_scroll_px += 12;
         }
         app.detail_scroll_px = std.math.clamp(app.detail_scroll_px, 0, max_scroll);
-        if (detailPositionAt(app, font, mouse, content, pad, leading_height)) |position| {
+        if (detailPositionAt(
+            app,
+            font,
+            bold_font,
+            mouse,
+            content,
+            pad,
+            leading_height,
+        )) |position| {
             app.detail_selection_focus = position;
         }
     }
@@ -949,17 +1091,17 @@ pub fn render(
                 app,
                 selection,
                 font,
+                bold_font,
                 line_index,
                 text_x,
                 text_y,
                 line_h,
             );
-            drawTextSlice(
+            drawDetailLine(
                 font,
-                line.text,
+                bold_font,
+                line,
                 .{ .x = text_x, .y = text_y },
-                line.size,
-                line.color,
             );
         }
         text_y += line_h + detail_line_gap;
