@@ -636,6 +636,85 @@ test "overlapping packed descendants move down until the row is clear" {
     try testing.expectEqual(second_row + 1, third_row);
 }
 
+test "expanding a live packed row uses the tallest block" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var session = tracer.Session.init(gpa, testing.io);
+    defer session.deinit();
+    session.running = true;
+    try session.processes.append(gpa, .{ .pid = 1 });
+    try session.processes.append(gpa, .{
+        .pid = 2,
+        .parent_pid = 1,
+        .parent_index = 0,
+        .depth = 1,
+        .end_ns = 40,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 3,
+        .parent_pid = 1,
+        .parent_index = 0,
+        .depth = 1,
+        .start_ns = 50,
+        .end_ns = 100,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 4,
+        .parent_pid = 2,
+        .parent_index = 1,
+        .depth = 2,
+        .start_ns = 10,
+        .end_ns = 20,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 5,
+        .parent_pid = 3,
+        .parent_index = 2,
+        .depth = 2,
+        .start_ns = 60,
+        .end_ns = 90,
+    });
+
+    var app = try App.init(gpa);
+    defer app.deinit();
+    try ensureProcessTree(&app, &session);
+    const lane = app.pack_slot.items[1];
+    try testing.expectEqual(lane, app.pack_slot.items[2]);
+    try testing.expectEqual(@as(u16, 2), laneHeight(&app, 0, lane));
+
+    toggleRowCollapsed(&app, .{ .packed_row = 1 });
+    try ensureProcessTree(&app, &session);
+    try testing.expect(isRowCollapsed(&app, .{ .packed_row = 1 }));
+    try testing.expectEqual(@as(u16, 1), laneHeight(&app, 0, lane));
+
+    try session.processes.append(gpa, .{
+        .pid = 6,
+        .parent_pid = 3,
+        .parent_index = 2,
+        .depth = 2,
+        .start_ns = 65,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 7,
+        .parent_pid = 3,
+        .parent_index = 2,
+        .depth = 2,
+        .start_ns = 70,
+    });
+    session.topology_revision +%= 1;
+    try ensureProcessTree(&app, &session);
+    try testing.expectEqual(lane, app.pack_slot.items[2]);
+    try testing.expect(isRowCollapsed(&app, .{ .packed_row = 1 }));
+    try testing.expectEqual(@as(u16, 1), laneHeight(&app, 0, lane));
+
+    toggleRowCollapsed(&app, .{ .packed_row = 1 });
+    try ensureProcessTree(&app, &session);
+
+    try testing.expectEqual(lane, app.pack_slot.items[2]);
+    try testing.expectEqual(@as(u16, 4), laneHeight(&app, 0, lane));
+}
+
 fn packedRowForProcess(app: *const App, target: usize) ?usize {
     for (app.row_order.items, 0..) |row, row_index| switch (row) {
         .process => {},
