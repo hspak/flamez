@@ -1,0 +1,653 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/hspak/flamez/main/schema/flamez-analysis-v1.schema.json",
+  "title": "Flamez analysis v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema",
+    "capture",
+    "environment",
+    "target",
+    "cache",
+    "units",
+    "totals",
+    "commands",
+    "processes",
+    "analysis",
+    "diagnostics"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://raw.githubusercontent.com/hspak/flamez/main/schema/flamez-analysis-v1.schema.json"
+    },
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "source_name", "source_version"],
+      "properties": {
+        "name": { "const": "flamez-analysis" },
+        "version": { "const": 1 },
+        "source_name": { "const": "flamez-capture" },
+        "source_version": { "const": 1 }
+      }
+    },
+    "capture": { "$ref": "#/$defs/capture" },
+    "environment": { "$ref": "#/$defs/environment" },
+    "target": { "$ref": "#/$defs/target" },
+    "cache": { "$ref": "#/$defs/cache" },
+    "units": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["time", "cpu_rate", "ratio"],
+      "properties": {
+        "time": { "const": "nanoseconds" },
+        "cpu_rate": { "const": "millicores" },
+        "ratio": { "const": "permyriad" }
+      }
+    },
+    "totals": { "$ref": "#/$defs/totals" },
+    "commands": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[0-9]+$" },
+      "additionalProperties": { "$ref": "#/$defs/command" }
+    },
+    "processes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/process" }
+    },
+    "analysis": { "$ref": "#/$defs/analysis" },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diagnostic" }
+    }
+  },
+  "$defs": {
+    "nonnegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fidelity",
+        "incomplete",
+        "loss_count",
+        "recovered_process_count",
+        "capture_clipped_process_count",
+        "partial_cpu_process_count",
+        "elapsed_ns",
+        "cpu_sample_period_ns",
+        "interval_semantics",
+        "root_exit",
+        "invariants"
+      ],
+      "properties": {
+        "fidelity": { "enum": ["exact", "snapshot_recovery"] },
+        "incomplete": { "type": "boolean" },
+        "loss_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "recovered_process_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "capture_clipped_process_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "partial_cpu_process_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "elapsed_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "cpu_sample_period_ns": { "type": "integer", "minimum": 1 },
+        "interval_semantics": { "const": "half_open" },
+        "root_exit": { "$ref": "#/$defs/rootExit" },
+        "invariants": { "$ref": "#/$defs/invariants" }
+      }
+    },
+    "rootExit": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "unknown" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "code"],
+          "properties": {
+            "kind": { "const": "exited" },
+            "code": { "type": "integer", "minimum": 0, "maximum": 255 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "signal"],
+          "properties": {
+            "kind": { "const": "signaled" },
+            "signal": { "type": "integer", "minimum": 1, "maximum": 255 }
+          }
+        }
+      ]
+    },
+    "invariants": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checked", "not_checked"],
+      "properties": {
+        "checked": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        },
+        "not_checked": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generated_at",
+        "flamez_version",
+        "flamez_build_zig_version",
+        "zig_version",
+        "os",
+        "architecture",
+        "kernel_version",
+        "optimize_mode",
+        "host_cpu_count"
+      ],
+      "properties": {
+        "generated_at": {
+          "anyOf": [
+            { "type": "string", "format": "date-time" },
+            { "type": "null" }
+          ]
+        },
+        "flamez_version": { "$ref": "#/$defs/nullableString" },
+        "flamez_build_zig_version": { "$ref": "#/$defs/nullableString" },
+        "zig_version": { "$ref": "#/$defs/nullableString" },
+        "os": { "$ref": "#/$defs/nullableString" },
+        "architecture": { "$ref": "#/$defs/nullableString" },
+        "kernel_version": { "$ref": "#/$defs/nullableString" },
+        "optimize_mode": { "$ref": "#/$defs/nullableString" },
+        "host_cpu_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "observed"],
+      "properties": {
+        "requested": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["argv", "cwd"],
+          "properties": {
+            "argv": { "$ref": "#/$defs/argv" },
+            "cwd": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        "observed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["process_id", "final_command_id", "command"],
+          "properties": {
+            "process_id": { "$ref": "#/$defs/nonnegativeInteger" },
+            "final_command_id": { "$ref": "#/$defs/nonnegativeInteger" },
+            "command": { "$ref": "#/$defs/command" }
+          }
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "local_directory", "global_directory", "steps"],
+      "properties": {
+        "state": { "enum": ["unknown", "hit", "miss", "mixed"] },
+        "local_directory": { "$ref": "#/$defs/nullableString" },
+        "global_directory": { "$ref": "#/$defs/nullableString" },
+        "steps": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "process_count",
+        "command_interval_count",
+        "exec_transition_count",
+        "observed_exec_transition_count",
+        "exec_transition_count_complete",
+        "self_cpu_time_ns",
+        "average_cpu_millicores",
+        "unexplained_wall_time_ns"
+      ],
+      "properties": {
+        "process_count": { "type": "integer", "minimum": 1 },
+        "command_interval_count": { "type": "integer", "minimum": 1 },
+        "exec_transition_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "observed_exec_transition_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "exec_transition_count_complete": { "type": "boolean" },
+        "self_cpu_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "average_cpu_millicores": { "$ref": "#/$defs/nonnegativeInteger" },
+        "unexplained_wall_time_ns": { "$ref": "#/$defs/nonnegativeInteger" }
+      }
+    },
+    "argv": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["count", "head", "tail", "digest", "truncated", "redacted"],
+          "properties": {
+            "count": { "$ref": "#/$defs/nonnegativeInteger" },
+            "head": {
+              "type": "array",
+              "maxItems": 8,
+              "items": { "type": "string" }
+            },
+            "tail": {
+              "type": "array",
+              "maxItems": 4,
+              "items": { "type": "string" }
+            },
+            "digest": {
+              "type": ["string", "null"],
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "truncated": { "type": "boolean" },
+            "redacted": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "action",
+        "component",
+        "primary_input",
+        "language",
+        "output_kind",
+        "classification_method",
+        "label",
+        "name",
+        "argv",
+        "exe",
+        "exe_truncated",
+        "cwd",
+        "cwd_truncated"
+      ],
+      "properties": {
+        "tool": { "type": "string" },
+        "action": { "type": "string" },
+        "component": { "$ref": "#/$defs/nullableString" },
+        "primary_input": { "$ref": "#/$defs/nullableString" },
+        "language": { "$ref": "#/$defs/nullableString" },
+        "output_kind": { "$ref": "#/$defs/nullableString" },
+        "classification_method": {
+          "enum": ["arguments", "path", "build_metadata", "heuristic", "unknown"]
+        },
+        "classification_confidence_permyriad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "label": { "type": "string" },
+        "name": { "type": "string" },
+        "argv": { "$ref": "#/$defs/argv" },
+        "exe": { "$ref": "#/$defs/nullableString" },
+        "exe_truncated": { "type": "boolean" },
+        "cwd": { "$ref": "#/$defs/nullableString" },
+        "cwd_truncated": { "type": "boolean" }
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "parent_id",
+        "depth",
+        "pid",
+        "start_ns",
+        "end_ns",
+        "wall_time_ns",
+        "self_cpu_time_ns",
+        "self_average_cpu_millicores",
+        "peak_cpu_millicores",
+        "cpu_activity_span_ns",
+        "child_lifetime_span_ns",
+        "explained_wall_time_ns",
+        "unexplained_wall_time_ns",
+        "unexplained_wall_permyriad",
+        "inclusive_cpu_time_ns",
+        "inclusive_process_count",
+        "origin",
+        "end_kind",
+        "cpu_final",
+        "command_interval_count",
+        "exec_transition_count",
+        "final_command_id",
+        "command_intervals"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonnegativeInteger" },
+        "parent_id": { "type": ["integer", "null"], "minimum": 0 },
+        "depth": { "$ref": "#/$defs/nonnegativeInteger" },
+        "pid": { "type": "integer", "minimum": 1 },
+        "start_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "end_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "wall_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "self_cpu_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "self_average_cpu_millicores": { "$ref": "#/$defs/nonnegativeInteger" },
+        "peak_cpu_millicores": { "$ref": "#/$defs/nonnegativeInteger" },
+        "cpu_activity_span_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "child_lifetime_span_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "explained_wall_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "unexplained_wall_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "unexplained_wall_permyriad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "inclusive_cpu_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "inclusive_process_count": { "type": "integer", "minimum": 1 },
+        "origin": {
+          "enum": ["observed", "recovered_parent", "recovered_exec", "recovered_exit"]
+        },
+        "end_kind": { "enum": ["observed_exit", "capture_clipped"] },
+        "cpu_final": { "type": "boolean" },
+        "command_interval_count": { "type": "integer", "minimum": 1 },
+        "exec_transition_count": { "type": ["integer", "null"], "minimum": 0 },
+        "final_command_id": { "$ref": "#/$defs/nonnegativeInteger" },
+        "command_intervals": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/commandInterval" }
+        }
+      }
+    },
+    "commandInterval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "kind_inferred",
+        "start_ns",
+        "end_ns",
+        "wall_time_ns",
+        "command_id"
+      ],
+      "properties": {
+        "kind": { "enum": ["launch", "inherited", "exec", "initial_observation", "recovered"] },
+        "kind_inferred": { "type": "boolean" },
+        "start_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "end_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "wall_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "command_id": { "$ref": "#/$defs/nonnegativeInteger" }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bottlenecks",
+        "component_aggregates",
+        "phases",
+        "parallelism",
+        "hotspots",
+        "stall_candidates"
+      ],
+      "properties": {
+        "bottlenecks": { "$ref": "#/$defs/bottlenecks" },
+        "component_aggregates": { "$ref": "#/$defs/componentAggregates" },
+        "phases": { "$ref": "#/$defs/phases" },
+        "parallelism": { "$ref": "#/$defs/parallelism" },
+        "hotspots": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/hotspot" }
+        },
+        "stall_candidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/hotspot" }
+        }
+      }
+    },
+    "bottlenecks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["longest_process_chain", "wall_time_stragglers"],
+      "properties": {
+        "longest_process_chain": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["method", "additive", "inferred", "process_ids", "entries"],
+          "properties": {
+            "method": { "const": "process_ancestry_and_exit_order" },
+            "additive": { "const": false },
+            "inferred": { "const": true },
+            "process_ids": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/nonnegativeInteger" }
+            },
+            "entries": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/processChainEntry" }
+            }
+          }
+        },
+        "wall_time_stragglers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/hotspot" }
+        }
+      }
+    },
+    "processChainEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "process_id",
+        "label",
+        "start_ns",
+        "end_ns",
+        "wall_time_ns",
+        "self_cpu_time_ns",
+        "root_elapsed_share_permyriad"
+      ],
+      "properties": {
+        "process_id": { "$ref": "#/$defs/nonnegativeInteger" },
+        "label": { "type": "string" },
+        "start_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "end_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "wall_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "self_cpu_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "root_elapsed_share_permyriad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        }
+      }
+    },
+    "hotspot": {
+      "type": "object",
+      "required": [
+        "process_id",
+        "label",
+        "start_ns",
+        "end_ns",
+        "wall_time_ns",
+        "self_cpu_time_ns",
+        "inclusive_cpu_time_ns",
+        "total_cpu_share_permyriad",
+        "root_elapsed_share_permyriad",
+        "component",
+        "primary_input",
+        "inferred"
+      ],
+      "properties": {
+        "process_id": { "$ref": "#/$defs/nonnegativeInteger" },
+        "label": { "type": "string" },
+        "start_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "end_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "wall_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "self_cpu_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "inclusive_cpu_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "total_cpu_share_permyriad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "root_elapsed_share_permyriad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "component": { "$ref": "#/$defs/nullableString" },
+        "primary_input": { "$ref": "#/$defs/nullableString" },
+        "inferred": { "type": "boolean" },
+        "unexplained_wall_time_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "unexplained_wall_permyriad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "possible_causes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "evidence": { "type": "string" },
+        "confidence": { "enum": ["low", "medium", "high"] }
+      },
+      "additionalProperties": false
+    },
+    "componentAggregates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "items"],
+      "properties": {
+        "method": { "const": "final_command_classification" },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/componentAggregate" }
+        }
+      }
+    },
+    "componentAggregate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "process_ids",
+        "start_ns",
+        "end_ns",
+        "wall_envelope_ns",
+        "self_cpu_sum_ns",
+        "cpu_share_permyriad",
+        "root_elapsed_share_permyriad",
+        "critical_path_candidate"
+      ],
+      "properties": {
+        "component": { "type": "string" },
+        "process_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonnegativeInteger" }
+        },
+        "start_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "end_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "wall_envelope_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "self_cpu_sum_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "cpu_share_permyriad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "root_elapsed_share_permyriad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "critical_path_candidate": { "type": "boolean" }
+      }
+    },
+    "phases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overlap_allowed", "items"],
+      "properties": {
+        "overlap_allowed": { "const": true },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "start_ns", "end_ns", "method"],
+            "properties": {
+              "name": { "type": "string" },
+              "start_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+              "end_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+              "method": {
+                "enum": ["first_child_start", "classified_process_envelope"]
+              }
+            }
+          }
+        }
+      }
+    },
+    "parallelism": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host_cpu_count",
+        "total_cpu_capacity_ns",
+        "average_cpu_millicores",
+        "host_capacity_utilization_permyriad",
+        "peak_leaf_processes",
+        "peak_leaf_processes_at_ns",
+        "leaf_definition",
+        "includes_recovered_and_clipped"
+      ],
+      "properties": {
+        "host_cpu_count": { "type": "integer", "minimum": 1 },
+        "total_cpu_capacity_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "average_cpu_millicores": { "$ref": "#/$defs/nonnegativeInteger" },
+        "host_capacity_utilization_permyriad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "peak_leaf_processes": { "$ref": "#/$defs/nonnegativeInteger" },
+        "peak_leaf_processes_at_ns": { "$ref": "#/$defs/nonnegativeInteger" },
+        "leaf_definition": { "const": "process_record_without_children" },
+        "includes_recovered_and_clipped": { "type": "boolean" }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity"],
+      "properties": {
+        "code": { "type": "string" },
+        "severity": { "enum": ["info", "warning", "error"] },
+        "process_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonnegativeInteger" }
+        },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

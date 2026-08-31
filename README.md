@@ -133,12 +133,15 @@ lowercase and hyphen-delimited, the target-derived stem is capped at 50
 characters, and the next available numeric suffix is used without replacing an
 existing automatic save.
 
-`-a`/`--analyze` validates a session file and atomically writes a compact
-performance-debugging view beside it as `analyzed-<filename>`. The analysis
-surfaces process dependency chains, CPU and wall-time bottlenecks, bounded
-command previews, subtree CPU totals, and conservative I/O/wait candidates.
-It requires neither a window nor a collector. See [ANALYSIS.md](ANALYSIS.md)
-for the derived format and heuristic definitions.
+`-a`/`--analyze` validates a session file and atomically writes a pretty,
+schema-versioned performance view beside it as `analyzed-<filename>`. Analysis
+v1 distinguishes self from inclusive CPU, command intervals from observed exec
+transitions, and process ancestry from build dependencies. It also emits
+interned classified commands, component/capacity summaries, and explicitly
+low-confidence stall candidates. It requires neither a window nor a collector.
+See the [analysis architecture](ARCHITECTURE.md#derived-analysis-json) for the
+data flow and the
+[analysis v1 metric contract](schema/flamez-analysis-v1.md) for exact semantics.
 
 Press **Stop** to terminate the target process group. F5 toggles Clay's layout
 inspector. Use the arrow button in the timeline header to collapse or expand
@@ -233,8 +236,8 @@ process-image metadata.
   ingestion, lifetime state, and bucketed CPU slices.
 - `src/session_file.zig` validates and streams the compact versioned JSON
   session format, including interned metadata and atomic path installation.
-- `src/analysis_file.zig` streams the bounded, dependency- and
-  bottleneck-oriented analysis JSON derived from a validated session.
+- `src/analysis_file.zig` streams deterministic analysis v1 JSON with bounded
+  command previews and self-contained derived summaries.
 - `src/cli.zig` parses the explicit GUI capture, headless output, import, and
   analysis modes and classifies headless capture results.
 - `src/tracer/capture.zig` selects an operating-system collector at compile
@@ -255,14 +258,15 @@ process-image metadata.
 
 CPU slices answer which process was using cycles and when; they do not identify
 hot functions or prove why a process was off CPU. Analysis files expose spans
-with neither CPU activity nor a direct child as possible I/O/wait candidates.
+with neither CPU activity nor a direct child as low-confidence stall candidates
+whose possible causes include I/O, scheduling, synchronization, and sampling.
 Stack sampling, symbolization, wakeup/off-CPU accounting, and explicit thread
 grouping are natural follow-on layers; the event/data model is intentionally
 separate from the UI so those can be added without rewriting capture sessions.
 
-Session JSON export, import into the GUI, and a headless `-o` mode are
-specified in [HEADLESS.md](HEADLESS.md). The derived agent-oriented analysis
-format is specified in [ANALYSIS.md](ANALYSIS.md).
+The shared finished-session boundary, canonical session JSON, headless capture,
+GUI replay, and derived analysis pipeline are described together in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Validation hooks
 

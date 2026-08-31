@@ -9,27 +9,30 @@ backend, while macOS prefers exact Endpoint Security capture and otherwise
 uses a best-effort kqueue/libproc recovery backend. The UI is immediate-mode
 [Clay](https://github.com/nicbarker/clay) layout rendered by raylib.
 
-This document describes how the pieces fit together. For usage, see README.md.
-For the eBPF load/attach path and the Linux 7.x `EACCES` trap, see EBPF.md.
-For macOS API contracts, limitations, entitlement requirements, and the exact
-capture validation plan, see MACAPI.md.
-For session JSON export, GUI import, and headless capture (not implemented),
-see HEADLESS.md.
+This document describes the runtime, persistence, replay, and analysis
+architecture. For usage, see [README.md](README.md). For the eBPF load/attach
+path and the Linux 7.x `EACCES` trap, see [EBPF.md](EBPF.md). For macOS API
+contracts, limitations, entitlement requirements, and exact-capture validation,
+see [MACAPI.md](MACAPI.md). The machine contract and metric semantics for
+derived analysis output live under [`schema/`](schema/).
 
 ## High-level view
 
 ```
-src/main.zig (raylib + Clay UI)
-    ↕
-src/tracer.zig (Session + Process model)
-    ├── src/tracer/process_ops.zig
-    │     └── platform spawn, wait, inspect, and signal operations
-    └── src/tracer/capture.zig
-          └── normalized lifecycle events, CPU snapshots, and fidelity
-                ├── Linux: capture/linux.zig → ebpf_shim.c → flamez.bpf.c
-                └── macOS: capture/macos.zig
-                      ├── exact: macos_es_shim.c → Endpoint Security
-                      └── fallback worker: kqueue/libproc → macos_shim.c
+src/cli.zig → src/main.zig
+                  ├── live capture → Collector → Session + Process model
+                  │                                  ├── Clay/raylib GUI
+                  │                                  └── session_file.write
+                  ├── import → session_file.read → finished Session → GUI
+                  └── analyze → session_file.read → analysis_file.write
+
+Collector
+    ├── process_ops.zig → platform spawn, wait, inspect, and signal operations
+    └── capture.zig → normalized lifecycle events, CPU snapshots, and fidelity
+          ├── Linux: capture/linux.zig → ebpf_shim.c → flamez.bpf.c
+          └── macOS: capture/macos.zig
+                ├── exact: macos_es_shim.c → Endpoint Security
+                └── fallback worker: kqueue/libproc → macos_shim.c
 ```
 
 The UI, `Session`, normalized-event consumption, and process model stay on the
@@ -41,7 +44,7 @@ main thread drains; neither mutates `Session` directly.
 
 ### `src/tracer.zig` — capture sessions and the process data model
 
-Owns everything that is *not* UI:
+Owns the capture and replay model independently of the UI and JSON formats:
 
 - **`Process`** — one record per observed pid: `pid`, optional `parent_pid`,
   stable `parent_index`, fixed-capacity name (`max_name_len = 48` bytes), tree
@@ -249,12 +252,10 @@ The UI is split between two rendering strategies:
 
 Other responsibilities:
 
-- explicit CLI parsing for GUI capture, headless `-o` output, and `-i` import;
-  `--` ends Flamez flags and target argv is passed through verbatim without an
-  intermediate shell;
-- streaming finished-session import/export through `session_file.zig`, with
-  interned argv/path tables, strict v1 validation, atomic named-path saves, and
-  collision-safe GUI filenames derived from the retained target argv;
+- dispatching the CLI-selected capture, import, and analysis paths without an
+  intermediate shell around the target;
+- coordinating finished-session import/export and collision-safe GUI filenames
+  derived from the retained target argv;
 - privilege-free imported sessions skip collector setup and render with the
   tracing host's retained CPU count and capture fidelity;
 - wiring input into Clay (`setPointerState`, `updateScrollContainers`);
@@ -295,6 +296,240 @@ Other responsibilities:
   summary line per second plus a final session summary;
 - screenshot automation: `FLAMEZ_SCREENSHOT=<path>` captures frame ~40 and
   exits, for CI-style visual checks.
+
+### `src/cli.zig` — application modes
+
+The CLI parser selects one of four mutually exclusive modes before any
+collector or window is initialized. Flags are recognized only before the
+target command, and `--` makes the remaining argv unambiguously target-owned.
+A bare JSON path is therefore still a command; import and analysis always
+require their explicit flags.
+
+`main.zig` dispatches the parsed mode and owns the corresponding loop. The CLI
+module also derives the sibling analysis output name and maps a successfully
+written headless capture to its documented exit status. Capture setup, JSON
+parsing, and rendering remain outside the parser.
+
+### `src/session_file.zig` — canonical session persistence
+
+This module is the storage boundary for the lossless replay/interchange form.
+It validates and streams a finished `Session` as compact Flamez session v1
+JSON, or reconstructs an owning, finished `Session` from that format. The
+reader does not build a generic JSON tree; it writes decoded metadata and
+processes directly into session-owned storage while retaining byte-offset
+diagnostics for malformed input.
+
+Named-path writes use an atomic temporary file and support either exclusive
+installation for automatic GUI names or replacement for explicit output.
+Validation and metadata-table preparation complete before the writer emits its
+first byte. The reader and writer are independent of raylib and the platform
+collector, so imports and round-trip tests require neither a window nor
+capture privileges.
+
+### `src/analysis_file.zig` — bounded derived analysis
+
+Analysis is a deterministic projection of a validated, finished session for
+performance tooling and human review. It replaces lossless metadata and CPU
+slice streams with bounded command descriptions, per-process aggregates,
+ranked observations, and explicitly qualified inferences. The default writer
+emits pretty JSON; `writeWithOptions` also provides minified transport output
+and a redacted privacy mode. Named output is atomically replaced only after a
+successful write.
+
+The JSON Schema is
+[`schema/flamez-analysis-v1.schema.json`](schema/flamez-analysis-v1.schema.json).
+Its companion
+[`schema/flamez-analysis-v1.md`](schema/flamez-analysis-v1.md) defines metric,
+rounding, ordering, inference, invariant, and privacy semantics. Those files
+are the normative analysis contract; this document describes how the format
+fits into the application.
+
+## Application modes and the finished-session boundary
+
+Every mode either produces or consumes the same `Session` model:
+
+| Mode | Session source | Window | Collector | Result |
+|---|---|---|---|---|
+| GUI capture | `Session.start` and the live update loop | yes | required | Browse, then optionally save |
+| File capture | The same start/update/finish path | no | required | Write session JSON and exit |
+| GUI import | `session_file.read` | yes | not initialized | Browse and optionally re-export |
+| Analysis | `session_file.read` | no | not initialized | Write derived analysis JSON and exit |
+
+The important boundary is not GUI versus headless execution; it is live versus
+finished state:
+
+```
+platform events → live Session → finish ─────────┐
+session JSON → session_file.read ─────────────┴─→ finished Session
+                                                      ├─→ GUI
+                                                      ├─→ session_file.write
+                                                      └─→ analysis_file.write
+```
+
+Natural root exit, GUI Stop, window close, and a cooperative termination signal
+all converge on the collector-aware finish path. It reaps the root, flushes
+capture work already known to the backend, takes the boundary CPU snapshot,
+closes surviving descendants, rebuilds derived caches, and compacts reachable
+metadata. `Session.deinit` retains a separate abort-only path for startup or
+caller failure before this orderly boundary.
+
+A writable finished session has these invariants:
+
+- `finished` is true, `running` is false, and the live PID index is empty;
+- process zero is the launched root and has a tagged exited, signaled, or
+  genuinely unknown result;
+- every process and real command-image interval has an end time;
+- capture-clipped lifetimes and partial CPU totals remain explicitly marked;
+- target argv, row images, and chronological exec images reference reachable
+  metadata; and
+- cached depth, parent PID, CPU bands, and peak occupancy agree with canonical
+  parent links and slice triples.
+
+Both JSON writers require a finished session. The canonical writer performs a
+full preflight validation; the analysis writer validates the tree, interval,
+and accounting facts it derives. Import returns only the finished shape, which
+is why the GUI can replay without a collector and analysis does not need a
+second capture model. Session files do not contain live/open records, UI
+selection, lane packing, collapse state, zoom, pixel aggregation, or other
+derived renderer state.
+
+In file-capture mode, `-o <path>` atomically replaces the named output after
+capture finishes. With `-o -`, session JSON is the only stdout producer and
+the target's stdout is routed to Flamez's stderr. After a successful write,
+headless exit status distinguishes Flamez/usage failure, incomplete capture,
+and target failure. GUI Ctrl+S calls the same file writer with a
+collision-resistant exclusive filename; stopping or closing the GUI does not
+implicitly save.
+
+## Canonical session JSON
+
+Session v1 preserves the information needed to rebuild a finished `Session`,
+including PID-reuse generations, chronological command images, exact retained
+metadata bytes, provenance, cumulative self CPU, and canonical CPU slices. It
+deliberately omits fields that can be derived or that exist only to accelerate
+the live UI.
+
+### Document shape and identity
+
+The file is one RFC 8259 UTF-8 JSON object followed by a newline. Its first
+field is `"flamez": 1`, allowing the streaming reader to reject unsupported
+versions before consuming the body. Remaining top-level fields have these
+roles:
+
+| Fields | Role |
+|---|---|
+| `loss_count`, `capture_fidelity` | Known loss and the exact versus snapshot-recovery guarantee |
+| `cpu_sample_period_ns`, `host_cpu_count` | Capture-time CPU accounting and replay scale |
+| `environment` | Capture time plus bounded Flamez, build-Zig, OS, architecture, and kernel provenance |
+| `target_argv`, `metadata` | Launch command and interned argv/path byte storage |
+| `elapsed_ns`, `root_exit` | Finished timeline horizon and tagged target result |
+| `processes` | Parent-before-child process generations, command images, CPU totals, and slices |
+
+Array position is the stable process ID. PID is not an identity because the OS
+can reuse it; a reused PID receives a new array element. Process zero is always
+the target root, and every other process stores a backward `parent` reference.
+The reader derives depth and parent PID in one pass, making cycles and
+disagreement between serialized tree caches impossible.
+
+### Metadata and command images
+
+Captured Linux metadata is bytes, not necessarily Unicode. A `ByteString` is a
+normal JSON string when the bytes are valid UTF-8 and otherwise an object with
+a standard padded-base64 payload. The reader rejects malformed encodings and
+field-specific bound violations; empty argv elements remain valid.
+
+Top-level `metadata.argv` and `metadata.paths` tables intern repeated content.
+The writer first recognizes shared session-arena ranges, then deduplicates
+equal independently captured values. Forked descendants and repeated exec
+images can therefore refer to one multi-MiB argv block both on disk and after
+import. References retain their capture source and, for paths, whether capture
+hit its bound.
+
+Each process has a stable timeline `row` and a non-empty chronological `execs`
+sequence. Ordinary rows derive from the first command image; the root may carry
+a distinct retained launch image so its requested command stays stable across
+the launch handoff. Exec intervals are ordered, non-overlapping, contained by
+the process lifetime, and end with it. A gap is legal only when loss prevented
+Flamez from retaining a replaced image, in which case the session records that
+loss. The format never serializes the internal split between archived execs
+and the current scalar image.
+
+Origin and end-kind tags distinguish observed processes from recovered parent,
+exec, or exit stubs and natural exits from capture-clipped boundaries. An
+independent `cpu_final` bit says whether cumulative self CPU came from an
+authoritative natural-exit observation; an observed exit can still have only a
+partial CPU total.
+
+### CPU slices and derived caches
+
+CPU activity is stored as compact `[start_ns, end_ns, cpu_ns]` triples. Each
+triple is a non-empty, non-overlapping interval inside the process lifetime
+with positive CPU. It represents a cumulative-snapshot bucket, not an exact
+scheduler transition, and `cpu_ns` may exceed wall duration when several
+threads run in parallel.
+
+The writer omits slice band, peak cores, depth, parent PID, metadata offsets,
+live PID maps, revisions, signal slots, and UI geometry. Import recomputes those
+caches from parent references, lifetimes, and slice triples. The sum of slice
+CPU cannot exceed the retained process total, and adjacent triples that belong
+to the same canonical occupancy band must already be coalesced.
+
+### Streaming, validation, and evolution
+
+The writer validates the complete session and prepares intern tables before
+emission. The reader checks required and duplicate fields, strict enums,
+integer bounds, metadata references, parent topology, lifetime and exec
+ordering, slice invariants, CPU consistency, root-row rules, and trailing input
+before returning ownership. Unknown fields are errors rather than silently
+ignored typos. Input can arrive in arbitrarily small chunks and large valid
+arguments do not depend on the standard JSON value-length default.
+
+Session v1 is the sole current format. The writer emits only v1 and the reader
+rejects every other version with `UnsupportedVersion`. A future required field,
+type or meaning change, enum expansion, or invariant change requires a new
+version and an explicit reader; older semantics must not be guessed or
+partially loaded.
+
+## Derived analysis JSON
+
+`flamez -a traces/build.json` streams and validates the canonical session, then
+atomically writes `traces/analyzed-build.json`. Analysis output is deliberately
+not accepted by `-i`: retain the session file whenever exact metadata, command
+history, CPU slices, or timeline replay matters.
+
+Analysis v1 separates source facts (`capture`, `environment`, `target`,
+`commands`, and `processes`) from summaries and interpretations (`totals`,
+`cache`, `analysis`, and `diagnostics`). Command records are interned in stable
+first-use order, process IDs retain parent-before-child session order, and
+rankings use deterministic ID tie-breaking. No nanosecond integer is converted
+through floating point. Tool, action, input, and component classifications come
+from structured command metadata rather than display-label parsing.
+
+The transformation makes several distinctions explicit:
+
+- self CPU belongs to one process, while inclusive CPU includes descendants;
+- command intervals include launch and inherited images, while an exec
+  transition is counted only when the retained history supports that claim;
+- process ancestry is observed or recovered capture structure, not a build
+  dependency graph;
+- the longest process chain is a non-additive ancestry heuristic, not a proven
+  critical path; and
+- spans with neither retained CPU activity nor a live direct child are
+  low-confidence stall candidates, not proof of I/O wait.
+
+Forward and reverse topological passes derive subtree totals and component
+membership. Interval merges compute CPU, child-lifetime, and unexplained wall
+spans without copying canonical slices into the output. Fixed-size rankings,
+component/phase envelopes, parallelism summaries, and diagnostics are then
+streamed alongside bounded command previews. The result is self-contained for
+common performance questions but intentionally less detailed than its source.
+
+Default output is two-space-indented JSON. Minified output has identical IDs,
+field order, array order, digests, and metric values. Redacted mode keeps
+metrics, classifications, and derived summaries while removing captured paths,
+argument previews and digests, host fingerprints, and other identifying
+provenance. The schema and semantics documents linked above define the exact
+fields and privacy contract.
 
 ## Frame-by-frame data flow
 
@@ -417,10 +652,10 @@ the renderer:
   blocking;
 - additional time-window filtering or export controls around the existing
   timeline zoom/pan implementation;
-- session JSON export, GUI import of that file, and headless `-o` capture
-  (see HEADLESS.md);
-- derived dependency/bottleneck analysis without a collector or GUI
-  (see ANALYSIS.md);
+- authoritative build-step dependencies supplied by build-tool-specific
+  metadata, rather than inferred from process ancestry;
+- optional compression, binary containers, or external trace-format converters
+  around the canonical session model, justified by measurements;
 - optional per-thread views (CPU is currently aggregated by TGID);
 - alternate frontends: `Session` has no raylib dependency and can drive any
   renderer, headless dump, or TUI.

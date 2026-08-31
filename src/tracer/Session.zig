@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const CaptureEnvironment = @import("CaptureEnvironment.zig");
 const signals = @import("signals.zig");
 const Process = @import("Process.zig");
 const capture = @import("capture.zig");
@@ -44,6 +45,8 @@ recovered_count: u64 = 0,
 host_cpu_count: usize = 1,
 /// Cumulative CPU snapshot cadence retained with this session.
 sample_period_ns: u64 = default_cpu_sample_period_ns,
+/// Capture-time host and Flamez provenance.
+environment: CaptureEnvironment = .{},
 /// Exact launch argv stored as one NUL-separated metadata arena range.
 target_argv_offset: usize = 0,
 target_argv_len: usize = 0,
@@ -152,6 +155,7 @@ pub fn start(
     self.recovered_count = 0;
     self.host_cpu_count = @max(std.Thread.getCpuCount() catch 1, 1);
     self.sample_period_ns = default_cpu_sample_period_ns;
+    self.environment = CaptureEnvironment.capture(self.io);
     self.target_argv_offset = 0;
     self.target_argv_len = 0;
     self.target_argv_count = 0;

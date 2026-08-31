@@ -1,0 +1,73 @@
+{
+  "flamez": 1,
+  "environment": {
+    "started_at_unix_seconds": 1788200580,
+    "flamez_version": "0.0.0",
+    "flamez_build_zig_version": "0.16.0",
+    "os": "linux",
+    "architecture": "x86_64",
+    "kernel_version": "6.18.0"
+  },
+  "loss_count": 0,
+  "capture_fidelity": "exact",
+  "cpu_sample_period_ns": 10,
+  "host_cpu_count": 2,
+  "target_argv": 0,
+  "elapsed_ns": 100,
+  "root_exit": { "kind": "exited", "code": 0 },
+  "metadata": {
+    "argv": [
+      ["build"],
+      ["zig", "clang", "/tmp/worker.c"]
+    ],
+    "paths": []
+  },
+  "processes": [
+    {
+      "pid": 1,
+      "parent": null,
+      "start_ns": 0,
+      "end_ns": 100,
+      "origin": "observed",
+      "end_kind": "observed_exit",
+      "row": "first_exec",
+      "execs": [
+        {
+          "start_ns": 0,
+          "end_ns": 100,
+          "name": "build",
+          "name_kind": "process",
+          "argv": { "ref": 0, "source": "launch" },
+          "exe": null,
+          "cwd": null
+        }
+      ],
+      "cpu_time_ns": 20,
+      "cpu_final": true,
+      "slices": [[0, 20, 20]]
+    },
+    {
+      "pid": 2,
+      "parent": 0,
+      "start_ns": 40,
+      "end_ns": 80,
+      "origin": "observed",
+      "end_kind": "observed_exit",
+      "row": "first_exec",
+      "execs": [
+        {
+          "start_ns": 40,
+          "end_ns": 80,
+          "name": "zig",
+          "name_kind": "process",
+          "argv": { "ref": 1, "source": "kernel" },
+          "exe": null,
+          "cwd": null
+        }
+      ],
+      "cpu_time_ns": 0,
+      "cpu_final": true,
+      "slices": []
+    }
+  ]
+}

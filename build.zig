@@ -166,6 +166,16 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
+    const install_analysis_schema = b.addInstallFile(
+        b.path("schema/flamez-analysis-v1.schema.json"),
+        "share/flamez/flamez-analysis-v1.schema.json",
+    );
+    const install_analysis_metrics = b.addInstallFile(
+        b.path("schema/flamez-analysis-v1.md"),
+        "share/flamez/flamez-analysis-v1.md",
+    );
+    b.getInstallStep().dependOn(&install_analysis_schema.step);
+    b.getInstallStep().dependOn(&install_analysis_metrics.step);
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);

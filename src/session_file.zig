@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const CaptureEnvironment = @import("tracer/CaptureEnvironment.zig");
 const Process = @import("tracer/Process.zig");
 const Session = @import("tracer/Session.zig");
 const capture = @import("tracer/capture.zig");
@@ -364,6 +365,8 @@ pub fn write(
     try field(&json, "capture_fidelity", @tagName(session.capture_fidelity));
     try field(&json, "cpu_sample_period_ns", session.sample_period_ns);
     try field(&json, "host_cpu_count", session.host_cpu_count);
+    try json.objectField("environment");
+    try writeCaptureEnvironment(&json, session.environment);
     try field(&json, "target_argv", tables.argvRef(targetArgvRange(session)));
     try field(&json, "elapsed_ns", session.elapsed_ns);
     try json.objectField("root_exit");
@@ -451,7 +454,8 @@ fn readSession(parser: *Parser, io: std.Io) ReadError!Session {
     var version_field = try parser.fieldName();
     defer version_field.deinit(parser.gpa);
     if (!std.mem.eql(u8, version_field.slice(), "flamez")) return error.UnsupportedVersion;
-    if (try parser.integer(u64) != 1) return error.UnsupportedVersion;
+    const version = try parser.integer(u8);
+    if (version != 1) return error.UnsupportedVersion;
 
     while (try parser.peek() != .object_end) {
         var name = try parser.fieldName();
@@ -484,6 +488,9 @@ fn readSession(parser: *Parser, io: std.Io) ReadError!Session {
         } else if (std.mem.eql(u8, bytes, "processes")) {
             try mark(&seen, 8);
             try parseProcesses(parser, &session);
+        } else if (std.mem.eql(u8, bytes, "environment")) {
+            try mark(&seen, 9);
+            session.environment = try parseCaptureEnvironment(parser);
         } else if (std.mem.eql(u8, bytes, "flamez")) {
             return error.DuplicateField;
         } else {
@@ -492,7 +499,8 @@ fn readSession(parser: *Parser, io: std.Io) ReadError!Session {
     }
     try parser.expect(.object_end);
     try parser.expect(.end_of_document);
-    if (seen != (1 << 9) - 1) return error.InvariantViolated;
+    const expected_fields: u16 = (1 << 10) - 1;
+    if (seen != expected_fields) return error.InvariantViolated;
 
     const target_ref = target_argv_ref orelse return error.InvariantViolated;
     if (target_ref >= metadata_tables.argv.items.len) return error.InvariantViolated;
@@ -521,6 +529,80 @@ fn parseCaptureFidelity(parser: *Parser) ReadError!capture.Fidelity {
     if (std.mem.eql(u8, text.slice(), "exact")) return .exact;
     if (std.mem.eql(u8, text.slice(), "snapshot_recovery")) return .snapshot_recovery;
     return error.InvariantViolated;
+}
+
+fn parseCaptureEnvironment(parser: *Parser) ReadError!CaptureEnvironment {
+    var environment: CaptureEnvironment = .{};
+    var seen: u8 = 0;
+    try parser.expect(.object_begin);
+    while (try parser.peek() != .object_end) {
+        var name = try parser.fieldName();
+        defer name.deinit(parser.gpa);
+        if (std.mem.eql(u8, name.slice(), "started_at_unix_seconds")) {
+            try mark(&seen, 0);
+            if (try parser.peek() == .null) {
+                try parser.expect(.null);
+            } else {
+                environment.started_at_unix_seconds = try parser.integer(i64);
+            }
+        } else if (std.mem.eql(u8, name.slice(), "flamez_version")) {
+            try mark(&seen, 1);
+            if (try parser.peek() == .null) {
+                try parser.expect(.null);
+            } else {
+                var value = try parser.text(CaptureEnvironment.max_tool_version_len);
+                defer value.deinit(parser.gpa);
+                environment.setFlamezVersion(value.slice());
+            }
+        } else if (std.mem.eql(u8, name.slice(), "flamez_build_zig_version")) {
+            try mark(&seen, 2);
+            if (try parser.peek() == .null) {
+                try parser.expect(.null);
+            } else {
+                var value = try parser.text(CaptureEnvironment.max_tool_version_len);
+                defer value.deinit(parser.gpa);
+                environment.setFlamezBuildZigVersion(value.slice());
+            }
+        } else if (std.mem.eql(u8, name.slice(), "os")) {
+            try mark(&seen, 3);
+            var value = try parser.text(16);
+            defer value.deinit(parser.gpa);
+            environment.host_os = if (std.mem.eql(u8, value.slice(), "linux"))
+                .linux
+            else if (std.mem.eql(u8, value.slice(), "macos"))
+                .macos
+            else if (std.mem.eql(u8, value.slice(), "unknown"))
+                .unknown
+            else
+                return error.InvariantViolated;
+        } else if (std.mem.eql(u8, name.slice(), "architecture")) {
+            try mark(&seen, 4);
+            var value = try parser.text(16);
+            defer value.deinit(parser.gpa);
+            environment.architecture = if (std.mem.eql(u8, value.slice(), "x86_64"))
+                .x86_64
+            else if (std.mem.eql(u8, value.slice(), "aarch64"))
+                .aarch64
+            else if (std.mem.eql(u8, value.slice(), "unknown"))
+                .unknown
+            else
+                return error.InvariantViolated;
+        } else if (std.mem.eql(u8, name.slice(), "kernel_version")) {
+            try mark(&seen, 5);
+            if (try parser.peek() == .null) {
+                try parser.expect(.null);
+            } else {
+                var value = try parser.text(CaptureEnvironment.max_kernel_version_len);
+                defer value.deinit(parser.gpa);
+                environment.setKernelVersion(value.slice());
+            }
+        } else {
+            return error.UnknownField;
+        }
+    }
+    try parser.expect(.object_end);
+    if (seen != 0b11_1111) return error.InvariantViolated;
+    return environment;
 }
 
 fn parseRootExit(parser: *Parser) ReadError!Session.RootExit {
@@ -1323,6 +1405,36 @@ fn writeRootExit(json: *std.json.Stringify, root_exit: Session.RootExit) !void {
     try json.endObject();
 }
 
+fn writeCaptureEnvironment(
+    json: *std.json.Stringify,
+    environment: CaptureEnvironment,
+) !void {
+    try json.beginObject();
+    try json.objectField("started_at_unix_seconds");
+    try json.write(environment.started_at_unix_seconds);
+    try json.objectField("flamez_version");
+    if (environment.flamezVersion().len == 0) {
+        try json.write(@as(?[]const u8, null));
+    } else {
+        try json.write(environment.flamezVersion());
+    }
+    try json.objectField("flamez_build_zig_version");
+    if (environment.flamezBuildZigVersion().len == 0) {
+        try json.write(@as(?[]const u8, null));
+    } else {
+        try json.write(environment.flamezBuildZigVersion());
+    }
+    try field(json, "os", @tagName(environment.host_os));
+    try field(json, "architecture", @tagName(environment.architecture));
+    try json.objectField("kernel_version");
+    if (environment.kernelVersion().len == 0) {
+        try json.write(@as(?[]const u8, null));
+    } else {
+        try json.write(environment.kernelVersion());
+    }
+    try json.endObject();
+}
+
 fn writeMetadata(json: *std.json.Stringify, tables: *const Tables) !void {
     try json.beginObject();
     try json.objectField("argv");
@@ -1540,6 +1652,7 @@ fn finishedSession(
     session.root_exit = .{ .exited = 0 };
     session.host_cpu_count = 4;
     session.sample_period_ns = Session.default_cpu_sample_period_ns;
+    session.environment = CaptureEnvironment.capture(io);
     session.capture_fidelity = .exact;
 
     var root = Process{
@@ -1631,6 +1744,7 @@ test "writer emits compact finished session and interns equal metadata" {
     const json = output.written();
 
     try testing.expect(std.mem.startsWith(u8, json, "{\"flamez\":1,"));
+    try testing.expect(std.mem.indexOf(u8, json, "\"environment\":{") != null);
     try testing.expect(std.mem.endsWith(u8, json, "}\n"));
     try testing.expect(std.mem.indexOf(
         u8,
@@ -1767,6 +1881,18 @@ test "reader round trip preserves canonical session fields" {
     try testing.expectEqual(original.capture_fidelity, imported.capture_fidelity);
     try testing.expectEqual(original.sample_period_ns, imported.sample_period_ns);
     try testing.expectEqual(original.host_cpu_count, imported.host_cpu_count);
+    try testing.expectEqual(
+        original.environment.started_at_unix_seconds,
+        imported.environment.started_at_unix_seconds,
+    );
+    try testing.expectEqualStrings(
+        original.environment.kernelVersion(),
+        imported.environment.kernelVersion(),
+    );
+    try testing.expectEqualStrings(
+        original.environment.flamezBuildZigVersion(),
+        imported.environment.flamezBuildZigVersion(),
+    );
     try testing.expectEqual(original.elapsed_ns, imported.elapsed_ns);
     try testing.expectEqual(original.processes.items.len, imported.processes.items.len);
     var target_argv = imported.targetArgvIter();
@@ -1886,6 +2012,27 @@ test "reader rejects an unsupported version before its body" {
     );
     try testing.expectEqual(Diagnostics.Reason.unsupported_version, diagnostics.reason);
     try testing.expect(diagnostics.byte_offset < 20);
+}
+
+test "reader requires the v1 capture environment" {
+    const testing = std.testing;
+    const without_environment = try changedBytes(
+        testing.allocator,
+        minimal_fixture,
+        "\"environment\":{\"started_at_unix_seconds\":1788200580," ++
+            "\"flamez_version\":\"0.0.0\",\"flamez_build_zig_version\":\"0.16.0\"," ++
+            "\"os\":\"linux\",\"architecture\":\"x86_64\"," ++
+            "\"kernel_version\":\"6.18.0\"},",
+        "",
+    );
+    defer testing.allocator.free(without_environment);
+    var input: std.Io.Reader = .fixed(without_environment);
+    var diagnostics: Diagnostics = .{};
+    try testing.expectError(
+        error.InvariantViolated,
+        read(testing.allocator, testing.io, &input, &diagnostics),
+    );
+    try testing.expectEqual(Diagnostics.Reason.invariant_violated, diagnostics.reason);
 }
 
 test "committed v1 fixtures stream into finished sessions" {
