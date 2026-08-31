@@ -274,6 +274,7 @@ fn addProcess(self: *Session, spec: ProcessSpec) !usize {
         .parent_pid = spec.parent_pid,
         .depth = spec.depth,
         .start_ns = spec.start_ns,
+        .exec_start_ns = spec.start_ns,
         .origin = spec.origin,
     };
     process.setName(spec.named.text, spec.named.kind);
@@ -497,7 +498,17 @@ fn compactMetadata(self: *Session) Allocator.Error!void {
 
     var remap: std.AutoHashMapUnmanaged(usize, usize) = .empty;
     defer remap.deinit(self.gpa);
-    const remap_capacity_usize = std.math.mul(usize, self.processes.items.len, 3) catch
+    var metadata_exec_count: usize = 0;
+    for (self.processes.items) |process| {
+        const retained_count = std.math.add(usize, process.execs.items.len, 1) catch
+            return error.OutOfMemory;
+        metadata_exec_count = std.math.add(
+            usize,
+            metadata_exec_count,
+            retained_count,
+        ) catch return error.OutOfMemory;
+    }
+    const remap_capacity_usize = std.math.mul(usize, metadata_exec_count, 3) catch
         return error.OutOfMemory;
     const remap_capacity = std.math.cast(u32, remap_capacity_usize) orelse
         return error.OutOfMemory;
@@ -505,6 +516,29 @@ fn compactMetadata(self: *Session) Allocator.Error!void {
 
     // Reserve both destinations before rewriting offsets so OOM leaves the session untouched.
     for (self.processes.items) |*process| {
+        for (process.execs.items) |*exec| {
+            remapMetadata(
+                &next,
+                &remap,
+                self.metadata.items,
+                &exec.args_offset,
+                exec.args_len,
+            );
+            remapMetadata(
+                &next,
+                &remap,
+                self.metadata.items,
+                &exec.exe_offset,
+                exec.exe_len,
+            );
+            remapMetadata(
+                &next,
+                &remap,
+                self.metadata.items,
+                &exec.cwd_offset,
+                exec.cwd_len,
+            );
+        }
         remapMetadata(
             &next,
             &remap,
@@ -674,13 +708,31 @@ fn applyExec(
     self: *Session,
     index: usize,
     event: capture.Event.Exec,
+    at_ns: u64,
+    initial_observation: bool,
 ) void {
-    if (event.name.len > 0) {
-        self.processes.items[index].setName(event.name, .process);
-    } else if (!event.inspect_missing) {
-        self.processes.items[index].setName("process", .other);
+    const process = &self.processes.items[index];
+    const coalesce_launch = process.execs.items.len == 0 and
+        process.args_source == .launch;
+    if (coalesce_launch) {
+        process.retainCurrentExecForRow(self.gpa) catch |err| {
+            @branchHint(.cold);
+            self.incomplete = true;
+            log.warn("could not retain the original row command: {s}", .{@errorName(err)});
+        };
+    } else if (!initial_observation) {
+        process.archiveCurrentExec(self.gpa, at_ns) catch |err| {
+            @branchHint(.cold);
+            self.incomplete = true;
+            log.warn("could not retain exec history: {s}", .{@errorName(err)});
+        };
     }
-    self.processes.items[index].clearExecMetadata();
+    if (event.name.len > 0) {
+        process.setName(event.name, .process);
+    } else if (!event.inspect_missing) {
+        process.setName("process", .other);
+    }
+    process.clearExecMetadata();
     self.label_revision +%= 1;
     if (event.exe) |exe| {
         (switch (event.metadata_source) {
@@ -776,9 +828,12 @@ pub fn consumeEvent(self: *Session, event: capture.Event) void {
             };
         },
         .exec => |exec| {
-            const index = self.liveIndex(exec.pid) orelse
-                self.recoverFromExec(exec.pid, exec.name, event_ns) orelse return;
-            self.applyExec(index, exec);
+            if (self.liveIndex(exec.pid)) |index| {
+                self.applyExec(index, exec, event_ns, false);
+            } else {
+                const index = self.recoverFromExec(exec.pid, exec.name, event_ns) orelse return;
+                self.applyExec(index, exec, event_ns, true);
+            }
         },
         .exit => |exit| {
             const index = self.liveIndex(exit.pid) orelse
@@ -1150,6 +1205,18 @@ test "capture events drive the process tree" {
         "clang -c source.c",
         session.processes.items[child_index].copyCmdline(session.metadataBytes(), &arg_buf),
     );
+    const inherited_exec = session.processes.items[child_index].execAt(0);
+    try std.testing.expectEqualStrings("cc1plus", inherited_exec.nameSlice());
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), inherited_exec.start_ns);
+    try std.testing.expectEqual(@as(u64, 12 * std.time.ns_per_ms), inherited_exec.end_ns.?);
+    try std.testing.expectEqualStrings(
+        "sh -c kill -STOP $$",
+        inherited_exec.copyCmdline(session.metadataBytes(), &arg_buf),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 12 * std.time.ns_per_ms),
+        session.processes.items[child_index].currentExec().start_ns,
+    );
     try std.testing.expectEqual(
         Process.MetadataSource.kernel,
         session.processes.items[child_index].args_source,
@@ -1181,6 +1248,62 @@ test "capture events drive the process tree" {
         session.processes.items[child_index].cpu_time_ns,
     );
     try std.testing.expect(session.processes.items[child_index].cpu_slices.items.len > 0);
+}
+
+test "root exec history coalesces launch and survives metadata compaction" {
+    var collector = capture.Collector{};
+    var session = Session.init(std.testing.allocator, std.testing.io);
+    defer session.deinit();
+    try session.start(&collector, held_target_argv);
+
+    const root_pid = session.root_pid.?;
+    const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
+    session.consumeEvent(execEvent(
+        root_pid,
+        base_ns + 1 * std.time.ns_per_ms,
+        "dash",
+        "/usr/bin/dash",
+        "dash\x00-c\x00kill -STOP $$\x00",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), session.processes.items[0].execCount());
+    try std.testing.expectEqual(@as(u64, 0), session.processes.items[0].currentExec().start_ns);
+    var command_buffer: [64]u8 = undefined;
+    const launch_exec = session.processes.items[0].rowExec();
+    try std.testing.expectEqualStrings("sh", launch_exec.nameSlice());
+    try std.testing.expectEqualStrings("sh", session.processes.items[0].rowNameSlice());
+    try std.testing.expectEqualStrings("dash", session.processes.items[0].nameSlice());
+    try std.testing.expectEqualStrings(
+        "sh -c kill -STOP $$",
+        launch_exec.copyCmdline(session.metadataBytes(), &command_buffer),
+    );
+
+    session.consumeEvent(execEvent(
+        root_pid,
+        base_ns + 10 * std.time.ns_per_ms,
+        "echo",
+        "/usr/bin/echo",
+        "echo\x00done\x00",
+    ));
+    try std.testing.expectEqual(@as(usize, 2), session.processes.items[0].execCount());
+    try session.compactMetadata();
+
+    const shell_exec = session.processes.items[0].execAt(0);
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), shell_exec.end_ns.?);
+    try std.testing.expectEqualStrings(
+        "dash -c kill -STOP $$",
+        shell_exec.copyCmdline(session.metadataBytes(), &command_buffer),
+    );
+    const retained_launch = session.processes.items[0].rowExec();
+    try std.testing.expectEqualStrings(
+        "sh -c kill -STOP $$",
+        retained_launch.copyCmdline(session.metadataBytes(), &command_buffer),
+    );
+    const echo = session.processes.items[0].currentExec();
+    try std.testing.expectEqualStrings(
+        "echo done",
+        echo.copyCmdline(session.metadataBytes(), &command_buffer),
+    );
+    try std.testing.expectEqualStrings("/usr/bin/echo", echo.exeSlice(session.metadataBytes()));
 }
 
 test "fork after exit reuses a tgid as a new record" {

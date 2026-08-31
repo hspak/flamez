@@ -34,6 +34,10 @@ cpu_peak_cores: f64 = 0,
 /// coalesced slice; pixel aggregation is a derived render view, not a
 /// replacement for these samples.
 cpu_slices: std.ArrayList(CpuSlice) = .empty,
+/// Completed exec intervals, in execution order. The current exec remains
+/// in the fields below so timeline rendering stays allocation-free.
+execs: std.ArrayList(Exec) = .empty,
+exec_start_ns: u64 = 0,
 name: [max_name_len]u8 = [_]u8{0} ** max_name_len,
 name_len: u8 = 0,
 name_kind: NameKind = .other,
@@ -84,6 +88,72 @@ pub const EndKind = enum {
     open,
     observed_exit,
     capture_clipped,
+};
+
+/// One exec that occupied a process PID during a bounded interval.
+/// Variable-length fields borrow the owning session's metadata store.
+pub const Exec = struct {
+    start_ns: u64,
+    end_ns: ?u64,
+    name: [max_name_len]u8 = [_]u8{0} ** max_name_len,
+    name_len: u8 = 0,
+    name_kind: NameKind = .other,
+    args_offset: usize = 0,
+    args_len: usize = 0,
+    args_count: usize = 0,
+    args_source: MetadataSource = .unavailable,
+    exe_offset: usize = 0,
+    exe_len: u16 = 0,
+    exe_source: MetadataSource = .unavailable,
+    exe_truncated: bool = false,
+    cwd_offset: usize = 0,
+    cwd_len: u16 = 0,
+    cwd_source: MetadataSource = .unavailable,
+    cwd_truncated: bool = false,
+    /// Retained only to keep the original row command stable; omitted from history.
+    row_only: bool = false,
+
+    /// Returns the exec's captured process name.
+    pub fn nameSlice(self: *const Exec) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    /// Iterates this exec's borrowed argv slices.
+    pub fn argsIter(self: *const Exec, metadata: []const u8) ArgIter {
+        return .{
+            .bytes = metadataSlice(metadata, self.args_offset, self.args_len),
+            .remaining = self.args_count,
+        };
+    }
+
+    /// Returns argv[0], or an empty slice when no arguments were captured.
+    pub fn argv0(self: *const Exec, metadata: []const u8) []const u8 {
+        var args = self.argsIter(metadata);
+        return args.next() orelse "";
+    }
+
+    /// Returns this exec's executable path, or an empty slice.
+    pub fn exeSlice(self: *const Exec, metadata: []const u8) []const u8 {
+        return metadataSlice(metadata, self.exe_offset, self.exe_len);
+    }
+
+    /// Returns this exec's working directory, or an empty slice.
+    pub fn cwdSlice(self: *const Exec, metadata: []const u8) []const u8 {
+        return metadataSlice(metadata, self.cwd_offset, self.cwd_len);
+    }
+
+    /// Space-joins the complete recorded argv into `dest`.
+    pub fn copyCmdline(self: *const Exec, metadata: []const u8, dest: []u8) []const u8 {
+        const args = metadataSlice(metadata, self.args_offset, self.args_len);
+        std.debug.assert(dest.len >= args.len);
+        for (args, 0..) |byte, index| dest[index] = if (byte == 0) ' ' else byte;
+        return std.mem.trim(u8, dest[0..args.len], " ");
+    }
+
+    /// Returns a short argv-derived suffix that distinguishes similar execs.
+    pub fn argSummary(self: *const Exec, metadata: []const u8, buffer: []u8) []const u8 {
+        return argSummaryFor(Exec, self, metadata, buffer);
+    }
 };
 
 pub const MetadataStore = std.ArrayList(u8);
@@ -149,6 +219,7 @@ const StoredPath = struct {
 /// Releases CPU activity storage owned by this process and invalidates it.
 pub fn deinit(self: *Process, gpa: Allocator) void {
     self.cpu_slices.deinit(gpa);
+    self.execs.deinit(gpa);
     self.* = undefined;
 }
 
@@ -281,6 +352,100 @@ pub fn nameSlice(self: *const Process) []const u8 {
     return self.name[0..self.name_len];
 }
 
+/// Returns a value snapshot of the current exec occupying this PID.
+pub fn currentExec(self: *const Process) Exec {
+    return .{
+        .start_ns = self.exec_start_ns,
+        .end_ns = self.end_ns,
+        .name = self.name,
+        .name_len = self.name_len,
+        .name_kind = self.name_kind,
+        .args_offset = self.args_offset,
+        .args_len = self.args_len,
+        .args_count = self.args_count,
+        .args_source = self.args_source,
+        .exe_offset = self.exe_offset,
+        .exe_len = self.exe_len,
+        .exe_source = self.exe_source,
+        .exe_truncated = self.exe_truncated,
+        .cwd_offset = self.cwd_offset,
+        .cwd_len = self.cwd_len,
+        .cwd_source = self.cwd_source,
+        .cwd_truncated = self.cwd_truncated,
+    };
+}
+
+/// Number of completed execs plus the current exec.
+pub fn execCount(self: *const Process) usize {
+    return self.execs.items.len - execHistoryOffset(self) + 1;
+}
+
+/// Returns one chronological exec snapshot. `index` must be less than `execCount()`.
+pub fn execAt(self: *const Process, index: usize) Exec {
+    std.debug.assert(index < self.execCount());
+    const stored_index = index + execHistoryOffset(self);
+    if (stored_index < self.execs.items.len) return self.execs.items[stored_index];
+    return self.currentExec();
+}
+
+fn execHistoryOffset(self: *const Process) usize {
+    if (self.execs.items.len > 0 and self.execs.items[0].row_only) return 1;
+    return 0;
+}
+
+/// Returns the exec whose command remains fixed on the timeline row.
+pub fn rowExec(self: *const Process) Exec {
+    if (self.execs.items.len > 0) return self.execs.items[0];
+    return self.currentExec();
+}
+
+/// Returns the stable process name used by the timeline row.
+pub fn rowNameSlice(self: *const Process) []const u8 {
+    if (self.execs.items.len > 0) return self.execs.items[0].nameSlice();
+    return self.nameSlice();
+}
+
+/// Returns the provenance of the stable timeline-row name.
+pub fn rowNameKind(self: *const Process) NameKind {
+    if (self.execs.items.len > 0) return self.execs.items[0].name_kind;
+    return self.name_kind;
+}
+
+/// Returns the stable argv-derived suffix used by the timeline row.
+pub fn rowArgSummary(self: *const Process, metadata: []const u8, buffer: []u8) []const u8 {
+    if (self.execs.items.len > 0) {
+        return self.execs.items[0].argSummary(metadata, buffer);
+    }
+    return self.argSummary(metadata, buffer);
+}
+
+/// Retains the current launch command for row rendering without adding a
+/// second entry to exec history.
+pub fn retainCurrentExecForRow(self: *Process, gpa: Allocator) Allocator.Error!void {
+    std.debug.assert(self.execs.items.len == 0);
+    var exec = self.currentExec();
+    exec.row_only = true;
+    try self.execs.append(gpa, exec);
+}
+
+/// Closes the current exec at `at_ns` and starts a new exec interval.
+/// On allocation failure the new interval still begins, leaving a visible gap
+/// rather than assigning the replacement exec to the previous interval.
+pub fn archiveCurrentExec(
+    self: *Process,
+    gpa: Allocator,
+    at_ns: u64,
+) Allocator.Error!void {
+    const next_start_ns = @max(self.exec_start_ns, at_ns);
+    var exec = self.currentExec();
+    exec.end_ns = next_start_ns;
+    self.execs.append(gpa, exec) catch |err| {
+        self.exec_start_ns = next_start_ns;
+        return err;
+    };
+    self.exec_start_ns = next_start_ns;
+}
+
 /// Returns the recorded lifetime, using `now_ns` when the process is open.
 pub fn durationNs(self: *const Process, now_ns: u64) u64 {
     return (self.end_ns orelse now_ns) -| self.start_ns;
@@ -347,45 +512,65 @@ pub fn copyArguments(self: *const Process, metadata: []const u8, dest: []u8) []c
 
 /// Short distinguishing suffix: rustc crate, compiler source, cargo subcommand.
 pub fn argSummary(self: *const Process, metadata: []const u8, buffer: []u8) []const u8 {
-    const comm = self.nameSlice();
+    return argSummaryFor(Process, self, metadata, buffer);
+}
+
+fn argSummaryFor(
+    comptime Subject: type,
+    subject: *const Subject,
+    metadata: []const u8,
+    buffer: []u8,
+) []const u8 {
+    const comm = subject.nameSlice();
     if (isRustc(comm)) {
-        if (self.flagValue(metadata, "--crate-name")) |crate| return copyShort(buffer, crate);
-        if (self.lastSourceBasename(metadata)) |src| return copyShort(buffer, src);
+        if (flagValue(Subject, subject, metadata, "--crate-name")) |crate|
+            return copyShort(buffer, crate);
+        if (lastSourceBasename(Subject, subject, metadata)) |src| return copyShort(buffer, src);
     } else if (isLinker(comm)) {
-        if (self.flagValue(metadata, "-o")) |out| {
+        if (flagValue(Subject, subject, metadata, "-o")) |out| {
             return copyShort(buffer, std.fs.path.basename(out));
         }
     } else if (isCompiler(comm)) {
-        if (self.lastSourceBasename(metadata)) |src| return copyShort(buffer, src);
+        if (lastSourceBasename(Subject, subject, metadata)) |src| return copyShort(buffer, src);
     } else if (isCargo(comm)) {
-        return self.cargoSummary(metadata, buffer);
+        return cargoSummary(Subject, subject, metadata, buffer);
     } else if (isNinja(comm)) {
-        const dir = self.flagValue(metadata, "-C");
-        const target = self.firstPositional(metadata);
+        const dir = flagValue(Subject, subject, metadata, "-C");
+        const target = firstPositional(Subject, subject, metadata);
         if (dir) |d| {
             if (target) |t| return copyShortJoin(buffer, std.fs.path.basename(d), t);
             return copyShort(buffer, std.fs.path.basename(d));
         }
         if (target) |t| return copyShort(buffer, t);
-    } else if (self.firstPositional(metadata)) |pos| {
+    } else if (firstPositional(Subject, subject, metadata)) |pos| {
         const base = std.fs.path.basename(pos);
         if (!std.mem.eql(u8, base, comm)) return copyShort(buffer, base);
     }
     return "";
 }
 
-fn cargoSummary(self: *const Process, metadata: []const u8, buffer: []u8) []const u8 {
-    const sub = self.firstPositional(metadata) orelse "";
-    const pkg = self.flagValue(metadata, "-p") orelse
-        self.flagValue(metadata, "--package") orelse "";
+fn cargoSummary(
+    comptime Subject: type,
+    subject: *const Subject,
+    metadata: []const u8,
+    buffer: []u8,
+) []const u8 {
+    const sub = firstPositional(Subject, subject, metadata) orelse "";
+    const pkg = flagValue(Subject, subject, metadata, "-p") orelse
+        flagValue(Subject, subject, metadata, "--package") orelse "";
     if (sub.len != 0 and pkg.len != 0) return copyShortJoin(buffer, sub, pkg);
     if (pkg.len != 0) return copyShort(buffer, pkg);
     if (sub.len != 0) return copyShort(buffer, sub);
     return "";
 }
 
-fn flagValue(self: *const Process, metadata: []const u8, flag: []const u8) ?[]const u8 {
-    var it = self.argsIter(metadata);
+fn flagValue(
+    comptime Subject: type,
+    subject: *const Subject,
+    metadata: []const u8,
+    flag: []const u8,
+) ?[]const u8 {
+    var it = subject.argsIter(metadata);
     _ = it.next();
     var pending = false;
     while (it.next()) |arg| {
@@ -401,8 +586,12 @@ fn flagValue(self: *const Process, metadata: []const u8, flag: []const u8) ?[]co
     return null;
 }
 
-fn firstPositional(self: *const Process, metadata: []const u8) ?[]const u8 {
-    var it = self.argsIter(metadata);
+fn firstPositional(
+    comptime Subject: type,
+    subject: *const Subject,
+    metadata: []const u8,
+) ?[]const u8 {
+    var it = subject.argsIter(metadata);
     _ = it.next();
     var skip_next = false;
     while (it.next()) |arg| {
@@ -420,8 +609,12 @@ fn firstPositional(self: *const Process, metadata: []const u8) ?[]const u8 {
     return null;
 }
 
-fn lastSourceBasename(self: *const Process, metadata: []const u8) ?[]const u8 {
-    var it = self.argsIter(metadata);
+fn lastSourceBasename(
+    comptime Subject: type,
+    subject: *const Subject,
+    metadata: []const u8,
+) ?[]const u8 {
+    var it = subject.argsIter(metadata);
     _ = it.next();
     var last: ?[]const u8 = null;
     var skip_next = false;
@@ -675,7 +868,7 @@ pub fn setCwdFromKernel(
     self.revision +%= 1;
 }
 
-/// Copies the process image snapshot inherited by a newly forked child.
+/// Copies the current exec metadata inherited by a newly forked child.
 pub fn inheritMetadata(self: *Process, parent: *const Process) void {
     if (parent.args_len > 0) {
         self.args_offset = parent.args_offset;
@@ -990,6 +1183,60 @@ test "identical CWD and exe paths reuse the stored offset" {
     try process.setExe(&metadata, gpa, "/usr/bin/clang");
     try testing.expectEqual(exe_offset, process.exe_offset);
     try testing.expectEqual(exe_store_len, metadata.items.len);
+}
+
+test "exec history retains replaced metadata" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var metadata = MetadataStore.empty;
+    defer metadata.deinit(gpa);
+    var process = Process{ .pid = 7 };
+    defer process.deinit(gpa);
+
+    process.setName("sh", .process);
+    try process.setArgsFromArgv(&metadata, gpa, &.{ "sh", "build.sh" });
+    try process.setExe(&metadata, gpa, "/usr/bin/sh");
+    try process.setCwd(&metadata, gpa, "/tmp/project");
+    try process.archiveCurrentExec(gpa, 25);
+
+    process.setName("clang", .process);
+    process.clearExecMetadata();
+    try process.setArgsFromKernel(&metadata, gpa, "clang\x00-c\x00main.c\x00");
+    try process.setExeFromKernel(&metadata, gpa, "/usr/bin/clang", false);
+
+    try testing.expectEqual(@as(usize, 2), process.execCount());
+    const shell = process.execAt(0);
+    try testing.expectEqual(@as(u64, 0), shell.start_ns);
+    try testing.expectEqual(@as(u64, 25), shell.end_ns.?);
+    try testing.expectEqualStrings("sh", shell.nameSlice());
+    var command_buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings(
+        "sh build.sh",
+        shell.copyCmdline(metadata.items, &command_buffer),
+    );
+    try testing.expectEqualStrings("/usr/bin/sh", shell.exeSlice(metadata.items));
+    try testing.expectEqualStrings("/tmp/project", shell.cwdSlice(metadata.items));
+    const row_exec = process.rowExec();
+    try testing.expectEqualStrings("sh", row_exec.nameSlice());
+    try testing.expectEqualStrings(
+        "sh build.sh",
+        row_exec.copyCmdline(metadata.items, &command_buffer),
+    );
+    var summary_buffer: [32]u8 = undefined;
+    try testing.expectEqualStrings(
+        "build.sh",
+        process.rowArgSummary(metadata.items, &summary_buffer),
+    );
+
+    const compiler = process.currentExec();
+    try testing.expectEqual(@as(u64, 25), compiler.start_ns);
+    try testing.expect(compiler.end_ns == null);
+    try testing.expectEqualStrings("clang", compiler.nameSlice());
+    try testing.expectEqualStrings(
+        "clang -c main.c",
+        compiler.copyCmdline(metadata.items, &command_buffer),
+    );
+    try testing.expectEqualStrings("/tmp/project", compiler.cwdSlice(metadata.items));
 }
 
 test "first visible slice is the lower bound on end time" {
