@@ -287,9 +287,10 @@ Other responsibilities:
   wheel/page/home/end navigation, mouse text selection, and Ctrl+A/Ctrl+C
   clipboard actions;
 - after capture ends, the frame loop drops to a low idle rate unless the user
-  is interacting. Live and interactive frames are paced by vsync
-  (`setTargetFPS(0)`); screenshots keep a fixed 60 FPS clock because they
-  disable vsync;
+  is interacting. Input keeps a short vsync-paced rendering burst alive, while
+  hover tooltips bridge one missing timeline hit without delaying a newly hit
+  block. Live and interactive frames are paced by vsync (`setTargetFPS(0)`);
+  screenshots keep a fixed 60 FPS clock because they disable vsync;
 - an optional compile-time `-Dfps-counter=true` flag adds the measured FPS in
   a fixed-width green slot between the footer title and target command;
 - an optional compile-time `-Dperf-telemetry=true` flag logs one performance

@@ -308,8 +308,11 @@ disables vsync and uses a fixed 60 FPS clock for deterministic capture.
 After the target exits, the main loop skips Clay layout, timeline work, detail
 rendering, and buffer presentation until input, resize, mouse movement, or the
 optional FPS display requires a redraw. It sleeps and polls input every 32 ms
-while idle. This reduces completed-capture CPU and GPU use without changing
-the retained session.
+while idle. Input starts a 120 ms vsync-paced rendering burst so a quiet input
+sample cannot stall an in-progress gesture. A newly hit block replaces the
+tooltip immediately, while one missing hit inside a timeline row retains the
+previous tooltip to mask a transient gap. A second miss clears it. This reduces
+completed-capture CPU and GPU use without changing the retained session.
 
 Clay receives one fixed arena at startup. Most per-frame display strings use
 stack buffers, and `App` retains viewport, tree, detail, and aggregation

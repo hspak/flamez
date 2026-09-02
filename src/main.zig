@@ -54,6 +54,8 @@ const window_height = 760;
 const screenshot_fps = 60;
 /// Completed captures poll for input without rebuilding or presenting unchanged frames.
 const idle_poll_interval_ms: i64 = 32;
+/// Keep polling and presenting briefly after input so a quiet sample cannot stall a gesture.
+const interaction_burst_ms: i64 = 120;
 /// FPS-enabled idle captures present only often enough to keep the diagnostic visibly live.
 const idle_fps_refresh_polls: usize = @intCast(@divTrunc(1000, idle_poll_interval_ms));
 /// Keep presenting while the compositor delivers the initial HiDPI framebuffer configuration.
@@ -82,6 +84,18 @@ const WindowMetrics = struct {
             a.screen_height == b.screen_height and
             a.render_width == b.render_width and
             a.render_height == b.render_height;
+    }
+};
+
+const InteractionBurst = struct {
+    until: std.Io.Timestamp = .zero,
+
+    fn refresh(self: *InteractionBurst, now: std.Io.Timestamp) void {
+        self.until = now.addDuration(.fromMilliseconds(interaction_burst_ms));
+    }
+
+    fn active(self: *const InteractionBurst, now: std.Io.Timestamp) bool {
+        return now.nanoseconds < self.until.nanoseconds;
     }
 };
 
@@ -305,6 +319,8 @@ pub fn main(init: std.process.Init) !void {
     var last_drawn_mouse = rl.getMousePosition();
     var last_drawn_window: WindowMetrics = .{};
     var idle_polls_since_draw: usize = 0;
+    var interaction_burst: InteractionBurst = .{};
+    var tooltip_hold: TooltipHold = .{};
     var next_save_index: usize = 0;
     var save_path_buffer: [128]u8 = undefined;
     perf.beginSession(init.io);
@@ -314,6 +330,7 @@ pub fn main(init: std.process.Init) !void {
             if (session.running) session.stop(&collector);
             break;
         }
+        const now = std.Io.Clock.awake.now(init.io);
         const frame_time = rl.getFrameTime();
         const mouse = rl.getMousePosition();
         const wheel = rl.getMouseWheelMoveV();
@@ -346,6 +363,7 @@ pub fn main(init: std.process.Init) !void {
             hasKeyboardActivity() or
             rl.isWindowResized() or
             !window.eql(last_drawn_window);
+        if (input_changed) interaction_burst.refresh(now);
         const fps_refresh_due = if (comptime build_options.fps_counter)
             idle_polls_since_draw >= idle_fps_refresh_polls
         else
@@ -354,6 +372,7 @@ pub fn main(init: std.process.Init) !void {
             screenshot_path != null or
             frame_number < initial_present_frames or
             input_changed or
+            interaction_burst.active(now) or
             fps_refresh_due;
         if (!redraw) {
             init.io.sleep(.fromMilliseconds(idle_poll_interval_ms), .awake) catch {};
@@ -440,7 +459,8 @@ pub fn main(init: std.process.Init) !void {
         renderClay(commands, &fonts);
         perf.leave();
         perf.enter(.timeline);
-        const hovered = try renderTimeline(&app, &session, frame_input);
+        const timeline_hover = try renderTimeline(&app, &session, frame_input);
+        const hovered = tooltip_hold.update(timeline_hover);
         perf.leave();
         perf.enter(.detail);
         try detail_pane.render(&app, &session, .{
@@ -816,6 +836,30 @@ const TimelineHover = struct {
     process_index: usize,
 };
 
+const TimelineHoverResult = struct {
+    target: ?TimelineHover = null,
+    can_retain_previous: bool = false,
+};
+
+const TooltipHold = struct {
+    target: ?TimelineHover = null,
+    missed_last_frame: bool = false,
+
+    fn update(self: *TooltipHold, hover: TimelineHoverResult) ?TimelineHover {
+        if (hover.target) |target| {
+            self.target = target;
+            self.missed_last_frame = false;
+            return target;
+        }
+        if (!hover.can_retain_previous or self.target == null or self.missed_last_frame) {
+            self.* = .{};
+            return null;
+        }
+        self.missed_last_frame = true;
+        return self.target;
+    }
+};
+
 fn lifetimeBar(process: *const tracer.Process, now_ns: u64, layout: BarLayout) ?rl.Rectangle {
     const window = layout.window;
     const bar_start_ns = process.start_ns;
@@ -1185,7 +1229,7 @@ fn renderTimeline(
     app: *App,
     session: *const tracer.Session,
     input: FrameInput,
-) Allocator.Error!?TimelineHover {
+) Allocator.Error!TimelineHoverResult {
     const font = input.font;
     const row_font = input.row_font;
     const mouse = input.mouse;
@@ -1193,9 +1237,9 @@ fn renderTimeline(
     const pinch_zoom = input.pinch_zoom;
     const clicked = input.clicked;
     const element = clay.getElementData(.ID("TimelineViewport"));
-    if (!element.found) return null;
+    if (!element.found) return .{};
     const box = element.bounding_box;
-    if (box.width < 100 or box.height < 80) return null;
+    if (box.width < 100 or box.height < 80) return .{};
 
     try process_tree.ensureProcessTree(app, session);
     var row_count = app.row_order.items.len;
@@ -1432,10 +1476,11 @@ fn renderTimeline(
             .y = box.y + header_height + (box.height - header_height - size.y) / 2,
         }, 17, toRaylibColor(faint));
         rl.endScissorMode();
-        return null;
+        return .{};
     }
 
     var hovered: ?TimelineHover = null;
+    var can_retain_previous = false;
     const now_ns = session.timelineNs();
     const end_row = @min(row_count, app.graph_scroll + visible_rows + 1);
     for (app.graph_scroll..end_row) |row| {
@@ -1490,6 +1535,7 @@ fn renderTimeline(
                     over_row and pointInRect(mouse, control.hit_box)
                 else
                     false;
+                if (over_row and !over_button) can_retain_previous = true;
                 if (over_row) {
                     rl.drawRectangleRec(
                         .init(row_box.x, row_box.y, row_box.width, row_box.height),
@@ -1677,6 +1723,7 @@ fn renderTimeline(
                     over_row and pointInRect(mouse, control.hit_box)
                 else
                     false;
+                if (over_row and !over_button) can_retain_previous = true;
                 if (over_button) rl.setMouseCursor(.pointing_hand);
                 if (button) |control| {
                     paintCollapseButton(
@@ -1784,7 +1831,10 @@ fn renderTimeline(
     }
     rl.endScissorMode();
     // The caller draws the tooltip after every other layer so it stays on top.
-    return hovered;
+    return .{
+        .target = hovered,
+        .can_retain_previous = can_retain_previous,
+    };
 }
 
 const tooltip_max_width: f32 = 560;
@@ -2008,6 +2058,55 @@ test "window metrics notice framebuffer-only DPI changes" {
 
     try testing.expect(!initial.eql(scaled));
     try testing.expect(initial.eql(initial));
+}
+
+test "interaction burst remains active after a quiet input sample" {
+    const testing = std.testing;
+    const start = std.Io.Timestamp.zero;
+    var burst: InteractionBurst = .{};
+
+    try testing.expect(!burst.active(start));
+    burst.refresh(start);
+    try testing.expect(burst.active(start.addDuration(.fromMilliseconds(119))));
+    try testing.expect(!burst.active(start.addDuration(.fromMilliseconds(120))));
+
+    const refreshed = start.addDuration(.fromMilliseconds(80));
+    burst.refresh(refreshed);
+    try testing.expect(burst.active(start.addDuration(.fromMilliseconds(199))));
+    try testing.expect(!burst.active(start.addDuration(.fromMilliseconds(200))));
+}
+
+test "tooltip hold bridges one missed frame and switches immediately" {
+    const testing = std.testing;
+    const first = TimelineHover{ .process_index = 3 };
+    const second = TimelineHover{ .process_index = 8 };
+    var hold: TooltipHold = .{};
+
+    try testing.expectEqual(
+        first.process_index,
+        hold.update(.{ .target = first }).?.process_index,
+    );
+    try testing.expectEqual(
+        first.process_index,
+        hold.update(.{ .can_retain_previous = true }).?.process_index,
+    );
+    try testing.expectEqual(
+        second.process_index,
+        hold.update(.{ .target = second }).?.process_index,
+    );
+    try testing.expectEqual(
+        second.process_index,
+        hold.update(.{ .can_retain_previous = true }).?.process_index,
+    );
+    try testing.expect(hold.update(.{ .can_retain_previous = true }) == null);
+}
+
+test "tooltip hold clears immediately outside a timeline row" {
+    const target = TimelineHover{ .process_index = 3 };
+    var hold: TooltipHold = .{};
+
+    try std.testing.expect(hold.update(.{ .target = target }) != null);
+    try std.testing.expect(hold.update(.{}) == null);
 }
 
 test "rectangleRoundness scales with the shorter side only" {
