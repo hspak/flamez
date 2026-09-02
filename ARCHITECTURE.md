@@ -454,6 +454,12 @@ Flamez from retaining a replaced image, in which case the session records that
 loss. The format never serializes the internal split between archived execs
 and the current scalar image.
 
+The fork tracepoint's child `comm` is a task name and can therefore be copied
+from a named worker thread. When the parent command is known, the inherited
+child image copies that command name together with argv, executable, and CWD;
+the task name is not promoted to process identity. The timeline label advances
+from an inherited image to the first observed exec and then remains stable.
+
 Origin and end-kind tags distinguish observed processes from recovered parent,
 exec, or exit stubs and natural exits from capture-clipped boundaries. An
 independent `cpu_final` bit says whether cumulative self CPU came from an

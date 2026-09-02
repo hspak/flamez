@@ -408,18 +408,16 @@ fn addExecFields(
 fn addExecHeader(
     tip: *TooltipBuilder,
     exec: *const tracer.Process.Exec,
-    ordinal: usize,
+    label: []const u8,
     size: f32,
 ) void {
     var start_buf: [32]u8 = undefined;
     var end_buf: [32]u8 = undefined;
-    var label_buf: [32]u8 = undefined;
     const start = text.formatDuration(exec.start_ns, &start_buf);
     const end = if (exec.end_ns) |end_ns|
         text.formatDuration(end_ns, &end_buf)
     else
         "running";
-    const label = std.fmt.bufPrint(&label_buf, "EXEC {d}", .{ordinal}) catch unreachable;
     var header_buf: [128]u8 = undefined;
     const header = std.fmt.bufPrint(
         &header_buf,
@@ -443,9 +441,21 @@ fn addExecHistory(
         toRaylibColor(ink),
         .{ .bold = .{ .start = 0, .end = "EXECUTION HISTORY".len } },
     );
+    var exec_ordinal: usize = 1;
     for (0..process.execCount()) |index| {
         const exec = process.execAt(index);
-        addExecHeader(tip, &exec, index + 1, sizes.body);
+        var label_buf: [32]u8 = undefined;
+        const label: []const u8 = if (index == 0 and exec.args_source == .inherited)
+            "INHERITED"
+        else if (index == 0 and exec.args_source == .launch)
+            "LAUNCH"
+        else label: {
+            const value = std.fmt.bufPrint(&label_buf, "EXEC {d}", .{exec_ordinal}) catch
+                unreachable;
+            exec_ordinal += 1;
+            break :label value;
+        };
+        addExecHeader(tip, &exec, label, sizes.body);
         addExecFields(tip, &exec, metadata, sizes.body);
     }
 }

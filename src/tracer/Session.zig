@@ -371,15 +371,20 @@ fn addProcess(self: *Session, spec: ProcessSpec) !usize {
         .exec_start_ns = spec.start_ns,
         .origin = spec.origin,
     };
-    process.setName(spec.named.text, spec.named.kind);
+    var named = spec.named;
     if (spec.parent_pid) |parent_pid| {
         if (self.by_pid.get(parent_pid)) |parent_index| {
             process.parent_index = parent_index;
             if (spec.inherit_metadata) {
-                process.inheritMetadata(&self.processes.items[parent_index]);
+                const parent = &self.processes.items[parent_index];
+                process.inheritMetadata(parent);
+                if (parent.origin != .recovered_parent) {
+                    named = .{ .text = parent.nameSlice(), .kind = parent.name_kind };
+                }
             }
         }
     }
+    process.setName(named.text, named.kind);
     process.signal_slot = signals.rememberPid(spec.pid);
     if (process.signal_slot == null and comptime !builtin.is_test) {
         log.warn("teardown pid table is full; pid {d} may survive Stop/Ctrl+C", .{spec.pid});
@@ -1365,7 +1370,7 @@ test "capture events drive the process tree" {
         4242,
         root_pid,
         base_ns + 10 * std.time.ns_per_ms,
-        "cc1plus",
+        "io",
     );
     session.consumeEvent(fork_event);
 
@@ -1373,7 +1378,7 @@ test "capture events drive the process tree" {
     const child_index = session.by_pid.get(4242).?;
     const child = session.processes.items[child_index];
     try std.testing.expectEqual(root_pid, child.parent_pid.?);
-    try std.testing.expectEqualStrings("cc1plus", child.nameSlice());
+    try std.testing.expectEqualStrings("sh", child.nameSlice());
     try std.testing.expectEqual(NameKind.process, child.name_kind);
     try std.testing.expectEqual(@as(u16, 1), child.depth);
     try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), child.start_ns);
@@ -1408,7 +1413,7 @@ test "capture events drive the process tree" {
         session.processes.items[child_index].copyCmdline(session.metadataBytes(), &arg_buf),
     );
     const inherited_exec = session.processes.items[child_index].execAt(0);
-    try std.testing.expectEqualStrings("cc1plus", inherited_exec.nameSlice());
+    try std.testing.expectEqualStrings("sh", inherited_exec.nameSlice());
     try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), inherited_exec.start_ns);
     try std.testing.expectEqual(@as(u64, 12 * std.time.ns_per_ms), inherited_exec.end_ns.?);
     try std.testing.expectEqualStrings(
@@ -1423,6 +1428,10 @@ test "capture events drive the process tree" {
         Process.MetadataSource.kernel,
         session.processes.items[child_index].args_source,
     );
+    try std.testing.expectEqualStrings(
+        "clang",
+        session.processes.items[child_index].rowNameSlice(),
+    );
 
     session.consumeCpuSnapshot(
         4242,
@@ -1434,11 +1443,23 @@ test "capture events drive the process tree" {
         4 * std.time.ns_per_ms,
         base_ns + 14 * std.time.ns_per_ms,
     );
+    session.consumeEvent(execEvent(
+        4242,
+        base_ns + 14 * std.time.ns_per_ms,
+        "ld",
+        "/usr/bin/ld",
+        "ld\x00-o\x00app\x00",
+    ));
+    try std.testing.expectEqualStrings("ld", session.processes.items[child_index].nameSlice());
+    try std.testing.expectEqualStrings(
+        "clang",
+        session.processes.items[child_index].rowNameSlice(),
+    );
 
     session.consumeEvent(exitEvent(
         4242,
         base_ns + 15 * std.time.ns_per_ms,
-        "clang",
+        "ld",
         6 * std.time.ns_per_ms,
     ));
     try std.testing.expectEqual(

@@ -20,7 +20,7 @@ pub const Payload = union(enum) {
 pub const Fork = struct {
     pid: std.posix.pid_t,
     parent_pid: std.posix.pid_t,
-    /// Kernel process name, borrowed for the delivery callback.
+    /// Fork-time child task name, which may be inherited from a named parent thread.
     name: []const u8,
 };
 

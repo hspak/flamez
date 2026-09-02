@@ -433,23 +433,35 @@ pub fn rowExec(self: *const Process) Exec {
     return self.currentExec();
 }
 
-/// Returns the stable process name used by the timeline row.
+fn rowDisplayArchivedExec(self: *const Process) ?*const Exec {
+    if (self.execs.items.len > 0 and self.execs.items[0].row_only) {
+        return &self.execs.items[0];
+    }
+    const display_index: usize = if (self.execCount() > 1 and
+        self.execs.items[0].args_source == .inherited)
+        1
+    else
+        0;
+    if (display_index < self.execs.items.len) return &self.execs.items[display_index];
+    return null;
+}
+
+/// Returns the command name used by the timeline row. A child that execs is
+/// labeled by its first replacement image rather than its inherited fork image.
 pub fn rowNameSlice(self: *const Process) []const u8 {
-    if (self.execs.items.len > 0) return self.execs.items[0].nameSlice();
+    if (self.rowDisplayArchivedExec()) |exec| return exec.nameSlice();
     return self.nameSlice();
 }
 
-/// Returns the provenance of the stable timeline-row name.
+/// Returns the provenance of the command name used by the timeline row.
 pub fn rowNameKind(self: *const Process) NameKind {
-    if (self.execs.items.len > 0) return self.execs.items[0].name_kind;
+    if (self.rowDisplayArchivedExec()) |exec| return exec.name_kind;
     return self.name_kind;
 }
 
-/// Returns the stable argv-derived suffix used by the timeline row.
+/// Returns the argv-derived suffix for the command used by the timeline row.
 pub fn rowArgSummary(self: *const Process, metadata: []const u8, buffer: []u8) []const u8 {
-    if (self.execs.items.len > 0) {
-        return self.execs.items[0].argSummary(metadata, buffer);
-    }
+    if (self.rowDisplayArchivedExec()) |exec| return exec.argSummary(metadata, buffer);
     return self.argSummary(metadata, buffer);
 }
 
