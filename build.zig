@@ -71,6 +71,8 @@ pub fn build(b: *std.Build) void {
     );
     const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
     const build_options = b.addOptions();
+    const version = b.option([]const u8, "version", "Set the build version") orelse "unset";
+    build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "ebpf", enable_ebpf);
     build_options.addOption(bool, "fps_counter", enable_fps_counter);
     build_options.addOption(bool, "perf_telemetry", enable_perf_telemetry);
@@ -192,6 +194,7 @@ pub fn build(b: *std.Build) void {
     const run_main_tests = b.addRunArtifact(main_tests);
 
     const tracer_options = b.addOptions();
+    tracer_options.addOption([]const u8, "version", version);
     tracer_options.addOption(bool, "ebpf", enable_ebpf);
     tracer_options.addOption(bool, "fps_counter", enable_fps_counter);
     tracer_options.addOption(bool, "perf_telemetry", enable_perf_telemetry);

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 const CaptureEnvironment = @This();
 
@@ -44,7 +45,7 @@ pub fn capture(io: std.Io) CaptureEnvironment {
             else => .unknown,
         },
     };
-    environment.setFlamezVersion("0.0.0");
+    environment.setFlamezVersion(build_options.version);
     environment.setFlamezBuildZigVersion(builtin.zig_version_string);
     if (comptime builtin.os.tag == .linux or builtin.os.tag == .macos) {
         const uts = std.posix.uname();
@@ -91,6 +92,6 @@ test "capture records bounded static provenance" {
     try std.testing.expect(environment.host_os != .unknown);
     try std.testing.expect(environment.architecture != .unknown);
     try std.testing.expect(environment.kernelVersion().len != 0);
-    try std.testing.expectEqualStrings("0.0.0", environment.flamezVersion());
+    try std.testing.expectEqualStrings(build_options.version, environment.flamezVersion());
     try std.testing.expect(environment.flamezBuildZigVersion().len != 0);
 }

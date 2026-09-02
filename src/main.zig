@@ -150,6 +150,18 @@ pub fn main(init: std.process.Init) !void {
         const owned = try init.arena.allocator().dupe(u8, arg);
         try arguments.append(init.gpa, owned);
     }
+    if (arguments.items.len == 1 and
+        (std.mem.eql(u8, arguments.items[0], "-v") or
+            std.mem.eql(u8, arguments.items[0], "--version")))
+    {
+        const output = try std.fmt.allocPrint(
+            init.arena.allocator(),
+            "flamez {s}\n",
+            .{build_options.version},
+        );
+        try std.Io.File.stdout().writeStreamingAll(init.io, output);
+        return;
+    }
 
     const parsed = cli.parse(arguments.items) catch |err| {
         std.debug.print("flamez: {s}\n\n", .{@errorName(err)});
@@ -634,11 +646,13 @@ fn printUsage() void {
         \\  flamez -o <path|-> [--] <target> [target args...]
         \\  flamez -i <path|->
         \\  flamez -a <session.json>
+        \\  flamez -v, --version
         \\
         \\Flags:
         \\  -o, --output <path>  capture without a window; '-' writes JSON to stdout
         \\  -i, --import <path>  open a finished session; '-' reads JSON from stdin
         \\  -a, --analyze <path> write analyzed-<filename> beside a session file
+        \\  -v, --version        print the Flamez version
         \\  --                   end Flamez flag parsing
         \\
     , .{});
