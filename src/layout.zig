@@ -13,6 +13,9 @@ const text = @import("text.zig");
 const tracer = @import("tracer.zig");
 
 const footer_font_id: u16 = 1;
+const max_elapsed_text = "99999.99 s";
+const max_process_count_text = "999999";
+const max_active_count_text = "9999";
 pub const process_row_height: f32 = 28;
 pub const detail_pane_fraction: f32 = 0.6;
 
@@ -87,19 +90,28 @@ pub fn makeViewText(session: *const tracer.Session) ViewText {
         .unknown => if (session.finished) "FINISHED" else "READY",
     };
     view_text.status_len = status.len;
-    view_text.elapsed_len = text.formatDuration(session.timelineNs(), &view_text.elapsed).len;
+    const elapsed = text.formatDuration(session.timelineNs(), &view_text.elapsed);
+    view_text.elapsed_len = reserveWidth(&view_text.elapsed, elapsed.len, max_elapsed_text.len);
     const process_count = std.fmt.bufPrint(
         &view_text.process_count,
         "{d}",
         .{session.processes.items.len},
     ) catch "0";
-    view_text.process_count_len = process_count.len;
+    view_text.process_count_len = reserveWidth(
+        &view_text.process_count,
+        process_count.len,
+        max_process_count_text.len,
+    );
     const active_count = std.fmt.bufPrint(
         &view_text.active_count,
         "{d}",
         .{session.activeCount()},
     ) catch "0";
-    view_text.active_count_len = active_count.len;
+    view_text.active_count_len = reserveWidth(
+        &view_text.active_count,
+        active_count.len,
+        max_active_count_text.len,
+    );
     if (session.loss_count > 0) {
         const dropped = std.fmt.bufPrint(
             &view_text.dropped,
@@ -109,6 +121,22 @@ pub fn makeViewText(session: *const tracer.Session) ViewText {
         view_text.dropped_len = dropped.len;
     }
     return view_text;
+}
+
+fn reserveWidth(buffer: []u8, value_len: usize, width: usize) usize {
+    std.debug.assert(value_len <= buffer.len);
+    const value_width = std.unicode.utf8CountCodepoints(buffer[0..value_len]) catch value_len;
+    if (value_width >= width) return value_len;
+
+    const padding = width - value_width;
+    std.debug.assert(value_len + padding <= buffer.len);
+    var index = value_len;
+    while (index > 0) {
+        index -= 1;
+        buffer[index + padding] = buffer[index];
+    }
+    @memset(buffer[0..padding], ' ');
+    return value_len + padding;
 }
 
 pub fn create(
@@ -318,4 +346,25 @@ test "FPS counter build option controls footer text" {
     } else {
         try testing.expectEqual(@as(usize, 0), view_text.fps_len);
     }
+}
+
+test "footer values reserve their maximum widths" {
+    const testing = std.testing;
+
+    var buffer: [32]u8 = [_]u8{0} ** 32;
+    @memcpy(buffer[0.."9.00 s".len], "9.00 s");
+    const elapsed_len = reserveWidth(&buffer, "9.00 s".len, max_elapsed_text.len);
+    try testing.expectEqualStrings("    9.00 s", buffer[0..elapsed_len]);
+
+    @memcpy(buffer[0.."0 µs".len], "0 µs");
+    const microseconds_len = reserveWidth(&buffer, "0 µs".len, max_elapsed_text.len);
+    try testing.expectEqualStrings("      0 µs", buffer[0..microseconds_len]);
+
+    @memcpy(buffer[0..1], "9");
+    const process_len = reserveWidth(&buffer, 1, max_process_count_text.len);
+    try testing.expectEqualStrings("     9", buffer[0..process_len]);
+
+    @memcpy(buffer[0..2], "99");
+    const active_len = reserveWidth(&buffer, 2, max_active_count_text.len);
+    try testing.expectEqualStrings("  99", buffer[0..active_len]);
 }
