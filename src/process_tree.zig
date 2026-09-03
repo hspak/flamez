@@ -121,6 +121,15 @@ pub fn canCollapseRow(app: *const App, target: RowCollapseTarget) bool {
     }
 }
 
+pub fn collapseTarget(app: *const App, row: App.GraphRow) ?RowCollapseTarget {
+    const target: RowCollapseTarget = switch (row) {
+        .process => |index| .{ .process = index },
+        .slot => |slot| .{ .packed_row = slot.head orelse return null },
+    };
+    if (!canCollapseRow(app, target)) return null;
+    return target;
+}
+
 pub fn isRowCollapsed(app: *const App, target: RowCollapseTarget) bool {
     switch (target) {
         .process => |index| return isCollapsed(app, index),
@@ -634,6 +643,68 @@ test "overlapping packed descendants move down until the row is clear" {
     const third_row = packedRowForProcess(&app, 5).?;
     try testing.expectEqual(first_row + 1, second_row);
     try testing.expectEqual(second_row + 1, third_row);
+}
+
+test "collapsed descendants remain toggleable on deeper packed rows" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var session = tracer.Session.init(gpa, testing.io);
+    defer session.deinit();
+    try session.processes.append(gpa, .{ .pid = 1, .end_ns = 200 });
+    try session.processes.append(gpa, .{
+        .pid = 2,
+        .parent_pid = 1,
+        .parent_index = 0,
+        .depth = 1,
+        .end_ns = 100,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 3,
+        .parent_pid = 1,
+        .parent_index = 0,
+        .depth = 1,
+        .start_ns = 110,
+        .end_ns = 180,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 4,
+        .parent_pid = 2,
+        .parent_index = 1,
+        .depth = 2,
+        .start_ns = 10,
+        .end_ns = 90,
+    });
+    try session.processes.append(gpa, .{
+        .pid = 5,
+        .parent_pid = 4,
+        .parent_index = 3,
+        .depth = 3,
+        .start_ns = 20,
+        .end_ns = 80,
+    });
+
+    var app = try App.init(gpa);
+    defer app.deinit();
+    try ensureProcessTree(&app, &session);
+    toggleAllRowsCollapsed(&app);
+    try ensureProcessTree(&app, &session);
+
+    toggleRowCollapsed(&app, collapseTarget(&app, app.row_order.items[0]).?);
+    try ensureProcessTree(&app, &session);
+    try testing.expectEqual(@as(usize, 2), app.row_order.items.len);
+
+    toggleRowCollapsed(&app, collapseTarget(&app, app.row_order.items[1]).?);
+    try ensureProcessTree(&app, &session);
+    try testing.expectEqual(@as(usize, 3), app.row_order.items.len);
+    switch (app.row_order.items[2]) {
+        .process => return error.TestExpectedEqual,
+        .slot => |slot| try testing.expectEqual(@as(u16, 1), slot.subrow),
+    }
+
+    toggleRowCollapsed(&app, collapseTarget(&app, app.row_order.items[2]).?);
+    try ensureProcessTree(&app, &session);
+    try testing.expectEqual(@as(usize, 4), app.row_order.items.len);
 }
 
 test "expanding a live packed row uses the tallest block" {

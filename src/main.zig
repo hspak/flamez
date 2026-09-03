@@ -1526,8 +1526,11 @@ fn renderTimeline(
                     .y = y,
                     .row_height = row_height,
                 });
-                const collapse_target = process_tree.RowCollapseTarget{ .process = index };
-                const button = if (has_children)
+                const collapse_target = process_tree.collapseTarget(
+                    app,
+                    app.row_order.items[row],
+                );
+                const button = if (collapse_target != null)
                     collapseButton(collapse_gutter)
                 else
                     null;
@@ -1581,7 +1584,7 @@ fn renderTimeline(
                 if (button) |control| {
                     paintCollapseButton(
                         control,
-                        process_tree.isRowCollapsed(app, collapse_target),
+                        process_tree.isRowCollapsed(app, collapse_target.?),
                         over_button,
                     );
                 }
@@ -1708,13 +1711,10 @@ fn renderTimeline(
                     );
                 }
 
-                const collapse_target: ?process_tree.RowCollapseTarget = target: {
-                    if (slot.subrow != 0) break :target null;
-                    const head = slot.head orelse break :target null;
-                    const target = process_tree.RowCollapseTarget{ .packed_row = head };
-                    if (!process_tree.canCollapseRow(app, target)) break :target null;
-                    break :target target;
-                };
+                const collapse_target = process_tree.collapseTarget(
+                    app,
+                    app.row_order.items[row],
+                );
                 const button = if (collapse_target != null)
                     collapseButton(collapse_gutter)
                 else
