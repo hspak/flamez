@@ -102,9 +102,13 @@ Owns the capture and replay model independently of the UI and JSON formats:
   - Root exit is detected with `process_ops.waitNowait()`. Before ending the
     session, Session asks the backend to flush lifecycle work already known to
     the capture source and forces one final cumulative CPU snapshot. An observed
-    root-exit timestamp becomes the timeline ceiling for the last CPU sample and
-    every surviving descendant. Any records still open are then closed at that
-    boundary, tracked-process state is cleared, and the collector is detached.
+    root-exit timestamp becomes the timeline ceiling for the complete model.
+    Later exits are clipped, later exec images are removed, and records born
+    after the boundary are discarded. CPU buckets crossing the boundary keep
+    their average occupancy and become partial totals. Process-index remapping
+    is reserved during capture so finalization cannot fail to allocate; the UI
+    uses the same mapping to preserve selection and collapse state. Tracked-process
+    state is cleared and the collector is detached.
     Natural exits distinguish a final CPU total from a partial last sample; a
     user-forced Stop always retains the last available sample.
 

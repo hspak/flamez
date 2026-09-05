@@ -428,6 +428,8 @@ pub fn main(init: std.process.Init) !void {
             perf.noteSnapshot(collector.last_cpu_samples, collector.last_ring_events);
         }
         if (!session.running and collector_attached) {
+            app.remapProcesses(session.process_remap.items);
+            if (session.process_remap.items.len != 0) tooltip_hold = .{};
             collector.deinit();
             collector_attached = false;
         }

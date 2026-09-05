@@ -409,6 +409,28 @@ pub fn currentExec(self: *const Process) Exec {
     };
 }
 
+/// Replaces the current image with a snapshot borrowing this session's metadata.
+/// The process lifetime and archived images are unchanged.
+pub fn setCurrentExec(self: *Process, image: Exec) void {
+    self.exec_start_ns = image.start_ns;
+    self.name = image.name;
+    self.name_len = image.name_len;
+    self.name_kind = image.name_kind;
+    self.args_offset = image.args_offset;
+    self.args_len = image.args_len;
+    self.args_count = image.args_count;
+    self.args_source = image.args_source;
+    self.exe_offset = image.exe_offset;
+    self.exe_len = image.exe_len;
+    self.exe_source = image.exe_source;
+    self.exe_truncated = image.exe_truncated;
+    self.cwd_offset = image.cwd_offset;
+    self.cwd_len = image.cwd_len;
+    self.cwd_source = image.cwd_source;
+    self.cwd_truncated = image.cwd_truncated;
+    self.revision +%= 1;
+}
+
 /// Number of completed execs plus the current exec.
 pub fn execCount(self: *const Process) usize {
     return self.execs.items.len - execHistoryOffset(self) + 1;
@@ -954,6 +976,62 @@ pub fn finish(self: *Process, at_ns: u64, kind: EndKind) bool {
     self.clipCpuSlices(self.end_ns.?);
     self.revision +%= 1;
     return true;
+}
+
+/// Removes observations after the capture boundary, including later exec images.
+/// Asserts the process was born at or before `at_ns`. Crossing CPU buckets retain
+/// their average occupancy; their clipped totals are partial, not final exit totals.
+pub fn clipToCapture(self: *Process, at_ns: u64) void {
+    std.debug.assert(self.start_ns <= at_ns);
+    if (self.end_ns) |end_ns| {
+        if (end_ns <= at_ns) return;
+    }
+    if (self.exec_start_ns > at_ns) {
+        while (self.execs.items.len > 0) {
+            const last = self.execs.items[self.execs.items.len - 1];
+            if (last.start_ns <= at_ns) break;
+            self.execs.items.len -= 1;
+        }
+        const previous: ?Exec = if (self.execs.items.len > 0)
+            self.execs.items[self.execs.items.len - 1]
+        else
+            null;
+        if (previous != null and !previous.?.row_only and previous.?.end_ns.? >= at_ns) {
+            self.setCurrentExec(self.execs.pop().?);
+        } else {
+            // An earlier allocation failure can leave no image covering the cutoff.
+            self.setCurrentExec(.{
+                .start_ns = if (previous) |image| image.end_ns orelse self.start_ns else self.start_ns,
+                .end_ns = at_ns,
+            });
+            self.setName("process", .other);
+        }
+    }
+    self.end_ns = at_ns;
+    self.end_kind = .capture_clipped;
+    self.cpu_final = false;
+    self.cpu_snapshot_at_ns = @min(self.cpu_snapshot_at_ns, at_ns);
+    var retained: usize = 0;
+    var total_ns: u64 = 0;
+    for (self.cpu_slices.items) |slice| {
+        if (slice.start_ns >= at_ns) break;
+        var clipped = slice;
+        if (clipped.end_ns > at_ns) {
+            clipped.cpu_ns = @intCast(@as(u128, slice.cpu_ns) *
+                (at_ns - slice.start_ns) / slice.durationNs());
+            clipped.end_ns = at_ns;
+        }
+        if (clipped.cpu_ns == 0) continue;
+        total_ns +|= clipped.cpu_ns;
+        self.cpu_slices.items[retained] = clipped;
+        retained += 1;
+    }
+    self.cpu_slices.items.len = retained;
+    self.cpu_time_ns = total_ns;
+    self.rebuildCpuCaches();
+    self.coalesceLastCpuSlices();
+    self.rebuildCpuCaches();
+    self.revision +%= 1;
 }
 
 fn copyShort(buffer: []u8, value: []const u8) []const u8 {

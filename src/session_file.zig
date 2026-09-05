@@ -804,7 +804,7 @@ fn parseProcess(parser: *Parser, session: *const Session) ReadError!Process {
     const current = process.execs.items[process.execs.items.len - 1];
     if (current.end_ns != process.end_ns) return error.InvariantViolated;
     process.execs.items.len -= 1;
-    installCurrentImage(&process, current);
+    process.setCurrentExec(current);
     switch (row orelse return error.InvariantViolated) {
         .first_exec => {},
         .image => |image| {
@@ -1024,25 +1024,6 @@ fn parseCpuSlices(
     try parser.expect(.array_end);
 }
 
-fn installCurrentImage(process: *Process, image: Process.Exec) void {
-    process.exec_start_ns = image.start_ns;
-    process.name = image.name;
-    process.name_len = image.name_len;
-    process.name_kind = image.name_kind;
-    process.args_offset = image.args_offset;
-    process.args_len = image.args_len;
-    process.args_count = image.args_count;
-    process.args_source = image.args_source;
-    process.exe_offset = image.exe_offset;
-    process.exe_len = image.exe_len;
-    process.exe_source = image.exe_source;
-    process.exe_truncated = image.exe_truncated;
-    process.cwd_offset = image.cwd_offset;
-    process.cwd_len = image.cwd_len;
-    process.cwd_source = image.cwd_source;
-    process.cwd_truncated = image.cwd_truncated;
-}
-
 fn resolveProcessMetadata(
     session: *Session,
     tables: *const MetadataTables,
@@ -1051,7 +1032,7 @@ fn resolveProcessMetadata(
         for (process.execs.items) |*exec| try resolveImageMetadata(exec, tables);
         var current = process.currentExec();
         try resolveImageMetadata(&current, tables);
-        installCurrentImage(process, current);
+        process.setCurrentExec(current);
     }
 }
 

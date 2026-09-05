@@ -13,6 +13,7 @@ const Process = @import("Process.zig");
 const capture = @import("capture.zig");
 const process_ops = @import("process_ops.zig");
 const perf = @import("../perf.zig");
+const session_file = @import("../session_file.zig");
 
 const log = std.log.scoped(.tracer);
 
@@ -21,6 +22,9 @@ const Session = @This();
 gpa: Allocator,
 io: std.Io,
 processes: std.ArrayList(Process) = .empty,
+/// Reserved with each capture record so final clipping cannot fail to allocate.
+/// After finalization, maps old process indices to retained indices (null when removed).
+process_remap: std.ArrayList(?usize) = .empty,
 metadata: Process.MetadataStore = .empty,
 /// tgid → index into `processes`. Unmanaged: takes `gpa` per mutation.
 by_pid: std.AutoHashMapUnmanaged(std.posix.pid_t, usize) = .empty,
@@ -53,8 +57,6 @@ target_argv_len: usize = 0,
 target_argv_count: usize = 0,
 /// Session time of the last cumulative CPU map snapshot.
 last_cpu_sample_ns: u64 = 0,
-/// Temporary ceiling applied while sampling the root-exit capture boundary.
-cpu_sample_ceiling_ns: ?u64 = null,
 /// Parentage and process-record count. Exec and finish do not change this.
 topology_revision: u64 = 0,
 /// Lifetime end times. Packing can ignore this while capture is live.
@@ -124,6 +126,7 @@ pub fn deinit(self: *Session) void {
     self.abort();
     self.clearProcesses();
     self.processes.deinit(self.gpa);
+    self.process_remap.deinit(self.gpa);
     self.metadata.deinit(self.gpa);
     self.by_pid.deinit(self.gpa);
     self.* = undefined;
@@ -160,7 +163,6 @@ pub fn start(
     self.target_argv_len = 0;
     self.target_argv_count = 0;
     self.last_cpu_sample_ns = 0;
-    self.cpu_sample_ceiling_ns = null;
     self.topology_revision +%= 1;
     self.interval_revision +%= 1;
     self.label_revision +%= 1;
@@ -316,6 +318,7 @@ fn consumeCaptureCpuSample(
 fn clearProcesses(self: *Session) void {
     for (self.processes.items) |*process| process.deinit(self.gpa);
     self.processes.clearRetainingCapacity();
+    self.process_remap.clearRetainingCapacity();
 }
 
 /// Counts process records whose lifetime remains open.
@@ -361,6 +364,7 @@ fn addProcess(self: *Session, spec: ProcessSpec) !usize {
     if (self.liveIndex(spec.pid)) |index| return index;
     try self.by_pid.ensureUnusedCapacity(self.gpa, 1);
     try self.processes.ensureUnusedCapacity(self.gpa, 1);
+    try self.process_remap.ensureTotalCapacity(self.gpa, self.processes.items.len + 1);
 
     const index = self.processes.items.len;
     var process = Process{
@@ -373,7 +377,9 @@ fn addProcess(self: *Session, spec: ProcessSpec) !usize {
     };
     var named = spec.named;
     if (spec.parent_pid) |parent_pid| {
-        if (self.by_pid.get(parent_pid)) |parent_index| {
+        if (self.by_pid.get(parent_pid) orelse
+            (if (self.root_pid == parent_pid) self.rootIndex() else null)) |parent_index|
+        {
             process.parent_index = parent_index;
             if (spec.inherit_metadata) {
                 const parent = &self.processes.items[parent_index];
@@ -524,7 +530,7 @@ fn onRootExited(self: *Session, status: ?u32) void {
     if (status) |s| self.recordRootStatus(s);
     if (self.child) |*child| child.id = null;
     self.child = null;
-    self.finishOpenProcesses(self.elapsed_ns);
+    self.clipToBoundary(self.elapsed_ns);
     self.root_pid = null;
     self.running = false;
     self.rebuildDerivedCaches();
@@ -566,9 +572,7 @@ fn finishRootCapture(
     collector.flushEvents(self.captureSink());
     self.elapsed_ns = self.nowElapsedNs();
     const boundary_ns = self.observedRootEndNs() orelse self.elapsed_ns;
-    self.cpu_sample_ceiling_ns = boundary_ns;
     collector.snapshotCpu(self.captureSink());
-    self.cpu_sample_ceiling_ns = null;
     self.elapsed_ns = boundary_ns;
     self.last_cpu_sample_ns = boundary_ns;
     self.mergeCollectorLoss(collector.lost_events);
@@ -586,6 +590,36 @@ fn finishOpenProcesses(self: *Session, at_ns: u64) void {
     for (self.processes.items, 0..) |process, index| {
         if (process.end_ns == null) self.finishProcess(index, at_ns, .capture_clipped);
     }
+}
+
+fn clipToBoundary(self: *Session, at_ns: u64) void {
+    const processes = self.processes.items;
+    std.debug.assert(self.process_remap.capacity >= processes.len);
+    self.process_remap.items.len = processes.len;
+    var retained: usize = 0;
+    for (processes, 0..) |*process, index| {
+        signals.forgetPid(process.signal_slot, process.pid);
+        process.signal_slot = null;
+        if (process.start_ns > at_ns) {
+            process.deinit(self.gpa);
+            self.process_remap.items[index] = null;
+            continue;
+        }
+        self.process_remap.items[index] = retained;
+        process.clipToCapture(at_ns);
+        if (process.parent_index) |parent| {
+            process.parent_index = self.process_remap.items[parent].?;
+        }
+        processes[retained] = process.*;
+        retained += 1;
+    }
+    self.processes.items.len = retained;
+    self.by_pid.clearRetainingCapacity();
+    self.active_count = 0;
+    if (retained == processes.len) self.process_remap.clearRetainingCapacity();
+    self.topology_revision +%= 1;
+    self.interval_revision +%= 1;
+    self.label_revision +%= 1;
 }
 
 /// Latest record for `pid`, including finished generations. `by_pid` is live-only.
@@ -742,7 +776,7 @@ fn remapMetadata(
 }
 
 fn rootIndex(self: *const Session) ?usize {
-    return if (self.root_pid) |pid| self.by_pid.get(pid) else null;
+    return if (self.root_pid) |pid| self.by_pid.get(pid) orelse self.latestIndex(pid) else null;
 }
 
 fn liveIndex(self: *const Session, pid: std.posix.pid_t) ?usize {
@@ -762,6 +796,7 @@ fn eventElapsedNs(self: *const Session, timestamp_ns: u64) u64 {
 fn ensureParent(self: *Session, parent_pid: std.posix.pid_t, at_ns: u64) ?usize {
     if (self.liveIndex(parent_pid)) |index| return index;
     const root_index = self.rootIndex() orelse return null;
+    if (parent_pid == self.root_pid) return root_index;
     const stub = self.addProcess(.{
         .pid = parent_pid,
         .parent_pid = self.root_pid,
@@ -1042,10 +1077,7 @@ pub fn consumeCpuSnapshot(
     const observed_ns = self.eventElapsedNs(timestamp_ns);
     self.processes.items[index].recordCpuSnapshot(
         self.gpa,
-        if (self.cpu_sample_ceiling_ns) |ceiling_ns|
-            @min(observed_ns, ceiling_ns)
-        else
-            observed_ns,
+        observed_ns,
         cpu_ns,
     ) catch |err| {
         @branchHint(.cold);
@@ -2239,4 +2271,116 @@ test "root label is other when argv basename does not match comm" {
     const named = Session.rootLabel(self_pid, argv0, &comm_buf);
     try std.testing.expectEqual(NameKind.other, named.kind);
     try std.testing.expectEqualStrings(argv0, named.text);
+}
+
+fn boundaryTestSession(gpa: Allocator) !Session {
+    var session = Session.init(gpa, std.testing.io);
+    errdefer session.deinit();
+    session.running = true;
+    session.root_pid = 2_000_000_000;
+    const root = try session.addProcess(.{ .pid = session.root_pid.?, .named = .fromOther("root") });
+    try session.processes.items[root].setArgsFromArgv(&session.metadata, gpa, &.{"root"});
+    session.target_argv_offset = session.processes.items[root].args_offset;
+    session.target_argv_len = session.processes.items[root].args_len;
+    session.target_argv_count = session.processes.items[root].args_count;
+    return session;
+}
+
+fn expectWritableBoundary(session: *const Session) !void {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try session_file.write(std.testing.allocator, session, &writer.writer);
+}
+
+test "root boundary clips a later child exit and its CPU" {
+    const testing = std.testing;
+    var session = try boundaryTestSession(testing.allocator);
+    defer session.deinit();
+    var collector = capture.Collector{};
+    const child_pid = session.root_pid.? + 1;
+    session.consumeEvent(forkEvent(child_pid, session.root_pid.?, 2, "child"));
+    session.consumeCpuSnapshot(child_pid, 6, 8);
+    session.consumeEvent(exitEvent(session.root_pid.?, 10, "root", 0));
+    session.consumeEvent(exitEvent(child_pid, 10, "child", 0));
+    // Reuse after the boundary must not replace the earlier generation.
+    session.consumeEvent(forkEvent(child_pid, session.root_pid.?, 11, "replacement"));
+    session.finishRootCapture(&collector, null);
+    try expectWritableBoundary(&session);
+    try testing.expectEqual(@as(usize, 2), session.processes.items.len);
+    try testing.expectEqual(Process.EndKind.observed_exit, session.processes.items[1].end_kind);
+
+    var delayed = try boundaryTestSession(testing.allocator);
+    defer delayed.deinit();
+    delayed.consumeEvent(forkEvent(child_pid, delayed.root_pid.?, 2, "child"));
+    delayed.consumeCpuSnapshot(child_pid, 6, 8);
+    delayed.consumeEvent(exitEvent(delayed.root_pid.?, 10, "root", 0));
+    delayed.consumeEvent(exitEvent(child_pid, 12, "child", 10));
+    delayed.finishRootCapture(&collector, null);
+    try expectWritableBoundary(&delayed);
+    const child = delayed.processes.items[1];
+    try testing.expectEqual(@as(?u64, 10), child.end_ns);
+    try testing.expectEqual(Process.EndKind.capture_clipped, child.end_kind);
+    try testing.expect(!child.cpu_final);
+    try testing.expectEqual(@as(u64, 8), child.cpu_time_ns);
+}
+
+test "root boundary restores the image before later child execs" {
+    const testing = std.testing;
+    var session = try boundaryTestSession(testing.allocator);
+    defer session.deinit();
+    var collector = capture.Collector{};
+    const child_pid = session.root_pid.? + 1;
+    session.consumeEvent(forkEvent(child_pid, session.root_pid.?, 2, "child"));
+    session.consumeEvent(execEvent(child_pid, 3, "before", "/bin/before", "before\x00"));
+    session.consumeEvent(execEvent(child_pid, 12, "after", "/bin/after", "after\x00"));
+    session.consumeEvent(execEvent(child_pid, 14, "later", "/bin/later", "later\x00"));
+    session.consumeEvent(exitEvent(child_pid, 15, "later", 0));
+    session.consumeEvent(exitEvent(session.root_pid.?, 10, "root", 0));
+    session.finishRootCapture(&collector, null);
+    try expectWritableBoundary(&session);
+    const child = session.processes.items[1];
+    try testing.expectEqual(@as(usize, 2), child.execCount());
+    try testing.expectEqualStrings("before", child.nameSlice());
+    try testing.expectEqualStrings("/bin/before", child.exeSlice(session.metadataBytes()));
+    try testing.expectEqualStrings("before", child.argv0(session.metadataBytes()));
+    try testing.expectEqual(@as(?u64, 10), child.end_ns);
+}
+
+test "root boundary removes later births and remaps retained parents without allocation" {
+    const testing = std.testing;
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    var session = try boundaryTestSession(failing.allocator());
+    defer session.deinit();
+    var collector = capture.Collector{};
+    const root_pid = session.root_pid.?;
+    session.consumeEvent(forkEvent(root_pid + 1, root_pid, 12, "discard"));
+    session.consumeEvent(forkEvent(root_pid + 2, root_pid, 4, "keep"));
+    session.consumeEvent(forkEvent(root_pid + 3, root_pid + 2, 5, "grandchild"));
+    session.consumeEvent(exitEvent(root_pid, 10, "root", 0));
+    failing.fail_index = failing.alloc_index;
+    session.finishRootCapture(&collector, null);
+    try expectWritableBoundary(&session);
+    try testing.expectEqual(@as(usize, 3), session.processes.items.len);
+    try testing.expectEqual(root_pid + 2, session.processes.items[1].pid);
+    try testing.expectEqual(@as(?usize, 1), session.processes.items[2].parent_index);
+    try testing.expectEqual(root_pid + 2, session.processes.items[2].parent_pid);
+    try testing.expectEqual(@as(usize, 0), session.active_count);
+    try testing.expectEqual(@as(u64, 10), session.elapsed_ns);
+}
+
+test "root boundary restores a surviving child image after root exit" {
+    const testing = std.testing;
+    var session = try boundaryTestSession(testing.allocator);
+    defer session.deinit();
+    var collector = capture.Collector{};
+    const child_pid = session.root_pid.? + 1;
+    session.consumeEvent(forkEvent(child_pid, session.root_pid.?, 2, "child"));
+    session.consumeEvent(exitEvent(session.root_pid.?, 10, "root", 0));
+    session.consumeEvent(execEvent(child_pid, 12, "after", "/bin/after", "after\x00"));
+    session.finishRootCapture(&collector, null);
+    try expectWritableBoundary(&session);
+    const child = session.processes.items[1];
+    try testing.expectEqual(@as(usize, 1), child.execCount());
+    try testing.expectEqual(@as(?u64, 10), child.end_ns);
+    try testing.expectEqualStrings("root", child.argv0(session.metadataBytes()));
 }

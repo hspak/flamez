@@ -208,6 +208,35 @@ pub fn deinit(self: *App) void {
     self.* = undefined;
 }
 
+/// Applies the session's final old-to-new index mapping once after capture ends.
+/// Null entries discard observations made after the root boundary.
+pub fn remapProcesses(self: *App, indices: []const ?usize) void {
+    if (indices.len == 0) return;
+    self.selected_process = remapIndex(self.selected_process, indices);
+    self.detail_for = remapIndex(self.detail_for, indices);
+    var retained: usize = 0;
+    for (self.collapsed.items, 0..) |collapsed, index| {
+        const destination = remapIndex(index, indices) orelse continue;
+        std.debug.assert(destination <= index);
+        self.collapsed.items[destination] = collapsed;
+        retained = destination + 1;
+    }
+    self.collapsed.items.len = retained;
+    self.collapse_revision +%= 1;
+    self.topology_revision_seen = std.math.maxInt(u64);
+    self.detail_cache_process = null;
+    self.graph_cache_process = null;
+    self.tooltip_cache_process = null;
+    self.detail_selection_anchor = null;
+    self.detail_selection_focus = null;
+    self.detail_text_selecting = false;
+}
+
+fn remapIndex(index: ?usize, indices: []const ?usize) ?usize {
+    const old = index orelse return null;
+    return if (old < indices.len) indices[old] else null;
+}
+
 /// Grows selected-process text storage so builders never drop arguments.
 pub fn ensureDetailCapacity(
     self: *App,
@@ -385,4 +414,25 @@ test "setTimeViewStart clamps the window inside the run" {
     setTimeViewStart(&app, total_ns, 10 * std.time.ns_per_ms);
     try testing.expectEqual(10 * std.time.ns_per_ms, app.view_start_ns);
     try testing.expect(!app.follow_live);
+}
+
+test "capture compaction preserves selected process and collapse identity" {
+    const testing = std.testing;
+    var app = try App.init(testing.allocator);
+    defer app.deinit();
+    try app.collapsed.appendSlice(testing.allocator, &.{ false, false, true, false });
+    app.selected_process = 2;
+    app.detail_for = 2;
+    app.detail_cache_process = 2;
+    app.graph_cache_process = 1;
+    app.tooltip_cache_process = 3;
+    app.remapProcesses(&.{ 0, null, 1, 2 });
+    try testing.expectEqual(@as(?usize, 1), app.selected_process);
+    try testing.expectEqual(@as(?usize, 1), app.detail_for);
+    try testing.expectEqualSlices(bool, &.{ false, true, false }, app.collapsed.items);
+    try testing.expect(app.detail_cache_process == null);
+    try testing.expect(app.graph_cache_process == null);
+    try testing.expect(app.tooltip_cache_process == null);
+    app.remapProcesses(&.{ 0, null, 1 });
+    try testing.expect(app.selected_process == null);
 }
