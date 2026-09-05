@@ -23,6 +23,12 @@ int flamez_macos_spawn_suspended(const char *const *argv,
 int flamez_macos_resume_process(int32_t pid);
 int flamez_macos_abstime_to_nanoseconds(uint64_t abstime, uint64_t *nanoseconds);
 int flamez_macos_cpu_time(int32_t pid, uint64_t *total_ns);
+/* Leave total_ns unchanged unless CPU and identity observations agree. */
+int flamez_macos_cpu_time_for_identity(
+    int32_t pid,
+    const struct flamez_macos_process_identity *identity,
+    uint64_t *total_ns);
+int flamez_macos_cpu_time_for_version(int32_t pid, int32_t pid_version, uint64_t *total_ns);
 int flamez_macos_read_executable(int32_t pid, void *buffer, size_t buffer_size);
 int flamez_macos_read_cwd(int32_t pid, void *buffer, size_t buffer_size);
 int flamez_macos_read_procargs(int32_t pid, void *buffer, size_t *buffer_size);

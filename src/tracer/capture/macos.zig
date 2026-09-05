@@ -274,6 +274,11 @@ extern "c" fn flamez_macos_process_identity(
     identity: *ProcessIdentity,
 ) c_int;
 extern "c" fn flamez_macos_cpu_time(pid: std.posix.pid_t, total_ns: *u64) c_int;
+extern "c" fn flamez_macos_cpu_time_for_identity(
+    pid: std.posix.pid_t,
+    identity: *const ProcessIdentity,
+    total_ns: *u64,
+) c_int;
 extern "c" fn flamez_macos_es_open(
     collector: *?*EsHandle,
     diagnostic: [*]u8,
@@ -1387,13 +1392,12 @@ pub const Collector = struct {
         pid: std.posix.pid_t,
         timestamp_ns: u64,
     ) void {
-        var tracked = self.tracked.get(pid) orelse return;
+        const tracked = self.tracked.get(pid) orelse return;
         var cpu_ns: u64 = 0;
         var cpu_final = false;
-        if (flamez_macos_cpu_time(pid, &cpu_ns) == 0) {
+        if (flamez_macos_cpu_time_for_identity(pid, &tracked.identity, &cpu_ns) == 0) {
             cpu_final = true;
         }
-        self.refreshName(pid, &tracked);
         _ = self.tracked.remove(pid);
         self.deleteRegistration(pid);
         self.queueEventLocked(.{
@@ -2678,4 +2682,24 @@ test "CPU snapshot advances after parallel thread work" {
     collector.snapshotCpu(sink);
     try testing.expect(probe.cpu_ns > baseline_cpu_ns);
     try testing.expectEqual(@as(u64, 4 * 2_000), completed_cycles.load(.monotonic));
+}
+
+test "fallback exit preserves CPU and name when a PID belongs to another lifetime" {
+    const testing = std.testing;
+    var collector = Collector{ .gpa = testing.allocator };
+    defer collector.deinit();
+    const pid = process_ops.currentPid();
+    var identity: ProcessIdentity = undefined;
+    try testing.expectEqual(@as(c_int, 0), flamez_macos_process_identity(pid, &identity));
+    identity.unique_id +%= 1;
+    var tracked = Tracked{ .identity = identity, .generation = 1, .cpu_ns = 42 };
+    @memcpy(tracked.name[0..3], "old");
+    tracked.name_len = 3;
+    try collector.tracked.put(testing.allocator, pid, tracked);
+    collector.queueExitLocked(pid, 100);
+    try testing.expectEqual(@as(usize, 1), collector.pending_events.items.len);
+    const event = collector.pending_events.items[0].payload.exit;
+    try testing.expectEqual(@as(u64, 42), event.cpu_ns);
+    try testing.expect(!event.cpu_final);
+    try testing.expectEqualStrings("old", event.name.slice());
 }

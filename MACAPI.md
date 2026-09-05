@@ -398,7 +398,12 @@ SDK documents that it accepts a live process or zombie, which permits a final re
 
 That final lookup can still lose a race when a descendant's parent reaps it before the asynchronous
 ES handler or kqueue worker performs the read. Exit records therefore carry an explicit
-`cpu_final` bit. On success, Flamez passes the raw final total to `recordFinalCpuSnapshot`, allowing
+`cpu_final` bit. Final reads check identity before and after `proc_pid_rusage`;
+the fallback requires the tracked lifetime, and Endpoint Security additionally
+requires the message's audit-token PID version. A missing or changed identity
+retains the previous partial CPU total and fallback name. Native fault-injection
+tests exercise these guards without Darwin headers in `src/macos_cpu.c`.
+On success, Flamez passes the raw final total to `recordFinalCpuSnapshot`, allowing
 it to correct bounded overestimate from the latest periodic sample. On failure, it preserves the
 largest periodic total without treating it as final; the process still has an observed lifetime
 exit, but the UI labels its CPU as partial (`CPU~`).

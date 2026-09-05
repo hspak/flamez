@@ -50,7 +50,7 @@ struct flamez_macos_es {
     es_string_token_t (*exec_arg)(const es_event_exec_t *event, uint32_t index);
     pid_t (*audit_pid)(audit_token_t token);
     int (*audit_pid_version)(audit_token_t token);
-    int (*cpu_time)(int32_t pid, uint64_t *total_ns);
+    int (*cpu_time)(int32_t pid, int32_t pid_version, uint64_t *total_ns);
 #ifdef FLAMEZ_TEST
     pthread_cond_t test_sync_condition;
     void (^test_sync_block)(void);
@@ -403,7 +403,7 @@ static void flamez_capture_exit(
     record->event.pid = collector->audit_pid(process->audit_token);
     record->event.pid_version = collector->audit_pid_version(process->audit_token);
     record->event.timestamp_ns = flamez_mach_time_to_ns(message->mach_time);
-    if (collector->cpu_time(record->event.pid, &cpu_ns) == 0) {
+    if (collector->cpu_time(record->event.pid, record->event.pid_version, &cpu_ns) == 0) {
         record->event.cpu_ns = cpu_ns;
         record->event.cpu_final = 1;
     }
@@ -503,7 +503,7 @@ enum flamez_macos_es_open_result flamez_macos_es_open(
         return FLAMEZ_MACOS_ES_OPEN_REJECTED;
     }
     result->queue_limit = FLAMEZ_MACOS_ES_QUEUE_BYTES;
-    result->cpu_time = flamez_macos_cpu_time;
+    result->cpu_time = flamez_macos_cpu_time_for_version;
     result->es_library = es_library;
     result->bsm_library = bsm_library;
     FLAMEZ_LOAD_FUNCTION(result->subscribe, es_library, "es_subscribe");
@@ -759,7 +759,7 @@ struct flamez_macos_es *flamez_macos_es_test_create(size_t queue_limit)
     }
     collector->creator = pthread_self();
     collector->queue_limit = queue_limit;
-    collector->cpu_time = flamez_macos_cpu_time;
+    collector->cpu_time = flamez_macos_cpu_time_for_version;
     return collector;
 }
 
@@ -943,9 +943,9 @@ static es_string_token_t flamez_macos_es_test_exec_arg(
     return flamez_macos_es_test_exec_args[index];
 }
 
-static int flamez_macos_es_test_cpu_time(int32_t pid, uint64_t *total_ns)
+static int flamez_macos_es_test_cpu_time(int32_t pid, int32_t pid_version, uint64_t *total_ns)
 {
-    if (pid != 6101 || total_ns == NULL) {
+    if (pid != 6101 || pid_version != 9 || total_ns == NULL) {
         return ESRCH;
     }
     *total_ns = 777;

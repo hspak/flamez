@@ -81,6 +81,8 @@ pub const Sink = struct {
     }
 };
 
+extern fn flamez_macos_test_cpu_identity(by_version: c_int, scenario: c_uint) c_int;
+
 test {
     _ = Event;
     _ = implementation;
@@ -96,4 +98,18 @@ test "unsupported collector reports the target operating system" {
         collector.diagnosticSlice(),
         @tagName(builtin.os.tag),
     ) != null);
+}
+
+test "macOS final CPU rejects reused identities before and during the read" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for (0..8) |scenario| {
+        try std.testing.expectEqual(@as(c_int, 0), flamez_macos_test_cpu_identity(0, @intCast(scenario)));
+    }
+}
+
+test "macOS final CPU binds Endpoint Security reads to the audit version" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    for (0..8) |scenario| {
+        try std.testing.expectEqual(@as(c_int, 0), flamez_macos_test_cpu_identity(1, @intCast(scenario)));
+    }
 }

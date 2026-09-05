@@ -152,7 +152,7 @@ map, ABI, privilege, and loader details.
 
 ### macOS collector and shims
 
-The macOS backend supports Apple silicon and is split across four implementation
+The macOS backend supports Apple silicon and is split across five implementation
 boundaries:
 
 - `src/tracer/capture/macos.zig` selects exact or fallback capture for each
@@ -161,6 +161,8 @@ boundaries:
 - `src/macos_es_shim.c` and `.h` isolate Endpoint Security and copy borrowed
   framework messages into an owned queue. Dynamic API lookup keeps the binary
   compatible with systems that do not provide descendant-scoped capture.
+- `src/macos_cpu.c` binds final CPU reads to a process identity or audit-token
+  version, rejecting PID reuse and identity changes during the read.
 - `src/macos_shim.c` and `.h` expose a small project-owned ABI for Darwin
   process launch, inspection, and CPU totals, keeping private structure layouts
   out of Zig and the shared model.

@@ -196,6 +196,16 @@ pub fn build(b: *std.Build) void {
 
 fn addLinuxCaptureTests(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{
+        .file = b.path("src/macos_cpu.c"),
+        .flags = &.{
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DFLAMEZ_MACOS_CPU_TEST=1",
+        },
+    });
+    module.addCSourceFile(.{
         .file = b.path("src/flamez.bpf.c"),
         .flags = &.{
             "-std=c11",
@@ -213,6 +223,15 @@ fn addMacosProcessShim(
     module: *std.Build.Module,
     test_build: bool,
 ) void {
+    module.addCSourceFile(.{
+        .file = b.path("src/macos_cpu.c"),
+        .flags = &.{
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+        },
+    });
     module.addCSourceFile(.{
         .file = b.path("src/macos_shim.c"),
         .flags = &.{
