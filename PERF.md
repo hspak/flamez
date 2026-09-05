@@ -118,8 +118,7 @@ intervals per process on schedule-out.
 
 This avoids sending system-wide context-switch traffic to Flamez. The remaining
 Linux observer cost is the raw `sched_switch` hook itself: every system context
-switch executes its cheap outgoing-thread lookup and incoming-process
-membership check even when neither side belongs to the target.
+switch executes one lookup for each outgoing and incoming thread even when neither side belongs to the target.
 
 The BPF object preallocates the hot maps so tracepoint execution does not depend
 on kernel allocation under load:
@@ -129,7 +128,7 @@ on kernel allocation under load:
 | lifecycle ring | 16 MiB |
 | tracked processes | 65,536 |
 | process CPU totals | 65,536 |
-| running threads | 65,536 |
+| admitted threads, running or idle | 65,536 |
 
 These are fixed startup costs chosen to avoid admission failure during capture.
 
@@ -398,7 +397,7 @@ not impose a lossy session-history limit.
 | Tree rebuild | Visits retained processes when topology/collapse changes and once for final interval packing |
 | Timeline draw | Visible rows, visible time ranges, and pixel-resolution aggregates |
 | Detail graph | Canonical history scan only when its process/range/width cache is stale; drawing is width-decimated |
-| Linux CPU snapshot | Batched reads over live process totals and running tracked threads |
+| Linux CPU snapshot | Batched reads over live process totals and all admitted thread entries |
 | macOS CPU snapshot | One rusage and identity validation sequence per tracked PID |
 | macOS fallback recovery | Recursive live-PID inspection every recovery wake plus event-triggered escaped-child scans |
 | Producer memory | 16 MiB lifecycle queue/ring per active backend |

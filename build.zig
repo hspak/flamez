@@ -147,11 +147,16 @@ pub fn build(b: *std.Build) void {
                     "-Wall",
                     "-Wextra",
                     "-Werror",
+                    if (module == main_module)
+                        "-DFLAMEZ_CAPTURE_TEST=1"
+                    else
+                        "-DFLAMEZ_CAPTURE_TEST=0",
                 },
             });
             module.linkSystemLibrary("bpf", .{});
             module.link_libc = true;
         }
+        addLinuxCaptureTests(b, main_module);
     } else {
         build_options.addOption([]const u8, "bpf_object", "");
     }
@@ -187,6 +192,20 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_main_tests.step);
+}
+
+fn addLinuxCaptureTests(b: *std.Build, module: *std.Build.Module) void {
+    module.addCSourceFile(.{
+        .file = b.path("src/flamez.bpf.c"),
+        .flags = &.{
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+            "-DFLAMEZ_BPF_TEST=1",
+        },
+    });
 }
 
 fn addMacosProcessShim(

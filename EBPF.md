@@ -59,19 +59,19 @@ The object is GPL-licensed and uses CO-RE raw tracepoints:
 | Section | Tracepoint arguments | Emitted data |
 |---|---|---|
 | `raw_tp/sched_process_fork` | parent and child `task_struct *` | TGID, parent TGID, child comm |
+| `raw_tp/task_newtask` | child task and clone flags | no record; admits threads including io_uring workers |
 | `raw_tp/sched_process_exec` | task, old PID, `linux_binprm *` | TGID, comm, bounded filename and complete argv |
 | `raw_tp/sched_process_exit` | task and `group_dead` | TGID, comm, final self CPU |
 | `raw_tp/sched_switch` | preempt flag, previous task, next task, previous state | no record; updates CPU maps |
 
 Lifecycle identity is the thread-group ID (the userspace PID), not the thread
 ID. Fork events where child and parent have the same TGID are thread creation
-and are ignored, but the scheduler hook attributes every member thread's CPU
-to its TGID.
+and emit no lifecycle record. The task-creation hook counts them before they
+can run, including io_uring workers that bypass `sched_process_fork`.
 
 All hooks run system-wide. Lifecycle hooks reject unrelated TGIDs before
 reserving a record. The scheduler miss path performs a `running_threads`
-lookup for the outgoing TID and a `tracked_pids` lookup for the incoming TGID;
-unrelated switches update no state and reserve no ring-buffer space. On a
+lookup for each outgoing and incoming TID; unrelated switches update no state and reserve no ring-buffer space. On a
 tracked fork, the kernel inserts the child before it can exec or fork, so
 tracking propagates synchronously through the tree.
 
@@ -90,7 +90,7 @@ preallocates:
 | `events` | ring buffer | 16 MiB | lifecycle records |
 | `tracked_pids` | hash | 65,536 | admission + sched_switch miss path |
 | `process_cpu` | hash | 65,536 | cumulative self-CPU totals |
-| `running_threads` | hash | 65,536 | in-flight on-CPU intervals |
+| `running_threads` | hash | 65,536 | admitted threads, with running flag and schedule-in time |
 
 The userspace teardown table is another 65,536 atomic PID slots. Do not shrink
 these or switch to non-preallocated hashes without measuring peak live
@@ -99,22 +99,21 @@ tracepoint is worse than a few idle MiB.
 
 ## Exit behavior
 
-Linux v7's `sched_process_exit(task, group_dead)` tracepoint still fires once
-per thread. `handle_process_exit` reads raw argument 1 and emits only when
-`group_dead` is true. Userspace therefore receives exactly one exit record per
-TGID and closes the process at the kernel timestamp without PID liveness
-polling. The hook deletes the TGID from `tracked_pids` synchronously even when
-the ring buffer is full, preventing stale entries and PID-reuse races. Kernels
-with the older one-argument tracepoint ABI are rejected before load.
+`sched_process_exit` fires once per thread. Each callback accounts its last
+interval and removes its scheduling entry before atomically releasing its
+thread count. The callback releasing the last thread emits the final CPU total
+and removes the process maps, even if the ring buffer cannot accept the event.
+The event time is the final accounting callback's timestamp.
 
-Before that final record, every exiting thread is removed from CPU accounting.
-The final event includes cumulative process self CPU, then the hook deletes the
-TGID's CPU map entry. The tracepoint prototype and the kernel's `group_dead`
-calculation are the
-source of truth:
+The kernel determines `group_dead` before reaching the tracepoint. A thread
+that decremented the kernel's live count earlier can reach the callback later,
+so `group_dead` is not an accounting barrier. Counting thread completion in
+the BPF programs prevents premature publication and map deletion. Scheduling
+cannot re-admit an exited thread while kernel teardown continues.
 
 - [Linux `sched_process_exit` tracepoint](https://github.com/torvalds/linux/blob/master/include/trace/events/sched.h)
 - [Linux process-exit path](https://github.com/torvalds/linux/blob/master/kernel/exit.c)
+- [Linux task-creation paths](https://github.com/torvalds/linux/blob/master/kernel/fork.c)
 
 ## CO-RE and the classic-tracepoint trap
 
@@ -169,10 +168,11 @@ increments the loss counter and emits no partial argv.
 
 ### CPU accounting and snapshots
 
-`running_threads` maps each currently scheduled tracked TID to its TGID and
-schedule-in timestamp. `process_cpu` stores the TGID's completed on-CPU time.
-Schedule-out deletes the running entry first and then atomically adds its
-elapsed interval to the completed total. Deleting first means a concurrent
+`running_threads` maps each admitted TID to its TGID, running flag, and
+schedule-in timestamp. Sleeping threads retain an idle entry; exiting threads
+remove it. `process_cpu` stores completed on-CPU time and the live thread count.
+Schedule-out clears the running flag before adding the elapsed interval to the
+completed total. Clearing first means a concurrent
 snapshot may defer an interval until the next frame, but cannot count the same
 interval as both running and complete. A snapshot evaluates:
 
@@ -183,12 +183,14 @@ cumulative_cpu_ns = completed_cpu_ns
 
 The atomic update is valid in tracing programs; `bpf_spin_lock` is deliberately
 not used because the verifier rejects it for this program type. The C shim
-batch-reads both maps (256 entries at a time), sorts the process totals by
-TGID, adds still-running intervals, and sends `(tgid, cpu_ns, timestamp_ns)`
-to Zig. Snapshot scratch storage grows geometrically with the number of live
+batch-reads both maps (256 entries at a time), indexes process totals in a
+reusable hash table, adds still-running intervals, and delivers the borrowed
+`(tgid, cpu_ns)` array plus its snapshot timestamp to Zig. Idle thread entries
+are skipped. Snapshot scratch storage grows geometrically with the number of live
 processes and is reused across frames.
 
-Zig takes one snapshot per UI frame. Consecutive cumulative values become
+Zig samples on the session cadence, independently of rendering, and once more
+at the root boundary. Consecutive cumulative values become
 variable-duration activity buckets; idle buckets require no stored slice, and
 adjacent active buckets in the same quarter-core occupancy band coalesce.
 This deliberately trades scheduler-transition precision for bounded transfer
@@ -197,7 +199,7 @@ TGID, no descendants), and a bucket may exceed one average core. Because the
 userspace timestamp follows the running-thread map read, a live bucket can
 contain a small scheduling-race overestimate. The kernel-timestamped final exit total
 reconciles that skew from the newest slices on natural exit; forced Stop keeps
-the most recent frame snapshot.
+the most recent successful snapshot.
 
 The `counters[0]` value increments when:
 
@@ -216,15 +218,25 @@ The lifecycle callback accepts only the three known event kinds, exact sizes
 for fork/exit, and a validated header-plus-payload size for exec before passing
 a record to Zig. The loader also requires:
 
-- four exact program-name/section pairs (fork, exec, exit, scheduler switch);
+- five exact program-name/section pairs (fork, thread creation, exec, exit, scheduler switch);
 - `events`: ring buffer, 16 MiB;
 - `tracked_pids`: hash, `u32 -> u8`, 65,536 entries;
-- `process_cpu`: hash, `u32 -> { total_ns }`, 65,536 entries;
+- `process_cpu`: hash, `u32 -> { u64 total_ns, u64 live_threads }`, 65,536 entries;
 - `running_threads`: hash,
-  `u32 tid -> { u32 tgid, u32 reserved, u64 started_at_ns }`, 65,536 entries;
+  `u32 tid -> { u32 tgid, u32 running, u64 started_at_ns }`, 65,536 entries;
 - `counters`: array, `u32 -> u64`, one entry;
-- `abi_v7`: array, `u32 -> u32`, one entry. This marker covers record layout,
+- `abi_v8`: array, `u32 -> u32`, one entry. This marker covers record layout,
   final-TGID exit semantics, and CPU accounting, so a stale object is rejected.
+
+Compiler-emitted constants can add internal maps such as `.rodata.cst16`.
+The loader uses libbpf's `bpf_map__is_internal` interface to recognize these
+separately from the six ABI maps. Only read-only single-entry arrays with the
+standard key layout and optional mmap flag are accepted; writable internal
+maps and changes to the ABI maps are still rejected. This follows
+[libbpf's internal-map construction](https://github.com/libbpf/libbpf/blob/v1.7.0/src/libbpf.c#L1837-L1891).
+A normal, unprivileged test opens the compiled BPF object and runs the same
+program/map validators, so compiler-generated sections cannot hide behind the
+privileged collector tests' skips.
 
 ## Object trust
 

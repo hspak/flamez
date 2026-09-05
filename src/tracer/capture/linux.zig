@@ -76,6 +76,8 @@ extern fn flamez_ebpf_track_pid(handle: *Handle, pid: std.posix.pid_t) c_int;
 extern fn flamez_ebpf_seed_parent(handle: *Handle, pid: std.posix.pid_t) c_int;
 extern fn flamez_ebpf_untrack_pid(handle: *Handle, pid: std.posix.pid_t) void;
 extern fn flamez_ebpf_close(handle: *Handle) void;
+extern fn flamez_bpf_test_exit_order(final_first: c_int, io_worker: c_int) c_int;
+extern fn flamez_bpf_test_thread_lifecycle() c_int;
 
 comptime {
     std.debug.assert(@sizeOf(RawEvent) == 56);
@@ -381,4 +383,58 @@ test "exec metadata preserves argv beyond the former fixed limit" {
     try std.testing.expectEqual(@as(usize, args_len), metadata.args.?.len);
     try std.testing.expectEqual(@as(u8, 'x'), metadata.args.?[args_len - 2]);
     try std.testing.expectEqual(@as(u8, 0), metadata.args.?[args_len - 1]);
+}
+
+test "final thread CPU waits for earlier exits to finish accounting" {
+    if (comptime !supported()) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 0), flamez_bpf_test_exit_order(1, 0));
+    try std.testing.expectEqual(@as(c_int, 0), flamez_bpf_test_exit_order(0, 0));
+}
+
+test "final thread CPU includes io workers without sched fork events" {
+    if (comptime !supported()) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 0), flamez_bpf_test_exit_order(1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), flamez_bpf_test_exit_order(0, 1));
+}
+
+test "final thread CPU survives scheduling exec and PID reuse" {
+    if (comptime !supported()) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 0), flamez_bpf_test_thread_lifecycle());
+}
+
+extern fn flamez_ebpf_test_validate_object(
+    path: [*:0]const u8,
+    writable: c_int,
+    diagnostic: [*]u8,
+    diagnostic_size: usize,
+) c_int;
+
+test "loader accepts the compiled object including internal constant maps" {
+    if (comptime !supported()) return error.SkipZigTest;
+    var diagnostic: [512]u8 = @splat(0);
+    const result = flamez_ebpf_test_validate_object(
+        build_options.bpf_object ++ "\x00",
+        0,
+        &diagnostic,
+        diagnostic.len,
+    );
+    if (result != 0) std.debug.print("BPF object validation: {s}\n", .{
+        std.mem.sliceTo(&diagnostic, 0),
+    });
+    try std.testing.expectEqual(@as(c_int, 0), result);
+}
+
+test "loader rejects writable internal maps" {
+    if (comptime !supported()) return error.SkipZigTest;
+    var diagnostic: [512]u8 = @splat(0);
+    const result = flamez_ebpf_test_validate_object(
+        build_options.bpf_object ++ "\x00",
+        1,
+        &diagnostic,
+        diagnostic.len,
+    );
+    // Some compiler versions may inline every constant instead of emitting rodata.
+    if (result == -@as(c_int, @intFromEnum(std.posix.E.NOENT))) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 1), result);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.sliceTo(&diagnostic, 0), "unexpected map") != null);
 }

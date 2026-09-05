@@ -24,11 +24,12 @@ typedef void (*flamez_event_callback)(const struct flamez_event *, size_t, void 
 
 struct flamez_process_cpu_snapshot {
     uint64_t total_ns;
+    uint64_t live_threads;
 };
 
 struct flamez_running_thread_snapshot {
     uint32_t tgid;
-    uint32_t reserved;
+    uint32_t running;
     uint64_t started_at_ns;
 };
 
@@ -68,12 +69,13 @@ struct expected_program {
 
 static const struct expected_program expected_programs[] = {
     { "handle_process_fork", "raw_tp/sched_process_fork" },
+    { "handle_thread_create", "raw_tp/task_newtask" },
     { "handle_process_exec", "raw_tp/sched_process_exec" },
     { "handle_process_exit", "raw_tp/sched_process_exit" },
     { "handle_sched_switch", "raw_tp/sched_switch" },
 };
 
-enum { expected_program_count = 4 };
+enum { expected_program_count = 5 };
 
 static void set_err(char *err, size_t err_size, const char *fmt, ...)
 {
@@ -412,11 +414,24 @@ static int validate_map(struct bpf_object *object, const char *path,
     return 0;
 }
 
+static int is_readonly_internal_map(struct bpf_map *map)
+{
+    uint32_t flags = bpf_map__map_flags(map);
+
+    return bpf_map__is_internal(map) && bpf_map__type(map) == BPF_MAP_TYPE_ARRAY &&
+           bpf_map__key_size(map) == sizeof(uint32_t) &&
+           bpf_map__value_size(map) > 0 && bpf_map__max_entries(map) == 1 &&
+           (flags & BPF_F_RDONLY_PROG) &&
+           !(flags & ~(BPF_F_RDONLY_PROG | BPF_F_MMAPABLE)) &&
+           bpf_map__map_extra(map) == 0 && bpf_map__pin_path(map) == NULL &&
+           bpf_map__inner_map(map) == NULL;
+}
+
 static int validate_maps(struct bpf_object *object, const char *path,
                          char *err, size_t err_size)
 {
     static const char *const expected_maps[] = {
-        "events", "abi_v7", "tracked_pids", "process_cpu", "running_threads",
+        "events", "abi_v8", "tracked_pids", "process_cpu", "running_threads",
         "counters",
     };
     struct bpf_map *map;
@@ -426,6 +441,10 @@ static int validate_maps(struct bpf_object *object, const char *path,
         const char *name = bpf_map__name(map);
         size_t index;
 
+        /* libbpf materializes compiler constants as internal read-only arrays.
+         * Their section names and presence are not part of Flamez's map ABI. */
+        if (is_readonly_internal_map(map))
+            continue;
         for (index = 0; index < sizeof(expected_maps) / sizeof(expected_maps[0]); ++index) {
             if (name && !strcmp(name, expected_maps[index]))
                 break;
@@ -443,7 +462,7 @@ static int validate_maps(struct bpf_object *object, const char *path,
     }
     return validate_map(object, path, "events", BPF_MAP_TYPE_RINGBUF,
                         0, 0, 1U << 24, err, err_size) ||
-           validate_map(object, path, "abi_v7", BPF_MAP_TYPE_ARRAY,
+           validate_map(object, path, "abi_v8", BPF_MAP_TYPE_ARRAY,
                         sizeof(uint32_t), sizeof(uint32_t), 1, err, err_size) ||
            validate_map(object, path, "tracked_pids", BPF_MAP_TYPE_HASH,
                         sizeof(uint32_t), sizeof(uint8_t), 65536, err, err_size) ||
@@ -554,7 +573,7 @@ static struct flamez_ebpf *open_collect(int object_fd, const char *path,
         collector->links[collector->link_count++] = link;
     }
     if (collector->link_count != expected_program_count) {
-        set_err(err, err_size, "BPF object '%s' did not attach four programs", path);
+        set_err(err, err_size, "BPF object '%s' did not attach five programs", path);
         goto out_fail;
     }
     return collector;
@@ -799,7 +818,7 @@ static int add_running_cpu(struct flamez_ebpf *collector, size_t total_count,
             struct flamez_cpu_total *total = find_cpu_total(
                 collector, total_count, values[index].tgid);
 
-            if (total && now_ns >= values[index].started_at_ns)
+            if (total && values[index].running && now_ns >= values[index].started_at_ns)
                 total->total_ns += now_ns - values[index].started_at_ns;
         }
         if (result == 0) {
@@ -849,7 +868,7 @@ int flamez_ebpf_snapshot_cpu(struct flamez_ebpf *collector,
 
 static int initialize_process_cpu(struct flamez_ebpf *collector, uint32_t key)
 {
-    struct flamez_process_cpu_snapshot initial = { 0 };
+    struct flamez_process_cpu_snapshot initial = { .live_threads = 1 };
 
     if (bpf_map_update_elem(collector->process_cpu_fd, &key, &initial,
                             BPF_NOEXIST) == 0)
@@ -903,3 +922,40 @@ void flamez_ebpf_close(struct flamez_ebpf *collector)
 {
     destroy_collector(collector);
 }
+
+#if FLAMEZ_CAPTURE_TEST
+/* Opening and validating ELF metadata needs no BPF privileges. */
+int flamez_ebpf_test_validate_object(const char *path, int writable,
+                                     char *err, size_t err_size)
+{
+    struct bpf_object *object = bpf_object__open_file(path, NULL);
+    struct bpf_map *map;
+    int result;
+
+    if (!object)
+        return -errno;
+    result = (int)libbpf_get_error(object);
+    if (result)
+        return result;
+    if (writable) {
+        bpf_object__for_each_map(map, object) {
+            if (bpf_map__is_internal(map) &&
+                (bpf_map__map_flags(map) & BPF_F_RDONLY_PROG))
+                break;
+        }
+        if (!map) {
+            bpf_object__close(object);
+            return -ENOENT;
+        }
+        result = bpf_map__set_map_flags(map, bpf_map__map_flags(map) & ~BPF_F_RDONLY_PROG);
+        if (result) {
+            bpf_object__close(object);
+            return result;
+        }
+    }
+    result = validate_programs(object, path, err, err_size) ||
+             validate_maps(object, path, err, err_size);
+    bpf_object__close(object);
+    return result;
+}
+#endif

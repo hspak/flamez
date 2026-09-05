@@ -6,7 +6,7 @@
 #define FLAMEZ_COMM_LEN 16
 #define FLAMEZ_MAX_ARGS (6U * 1024U * 1024U)
 #define FLAMEZ_MAX_PATH 512
-#define FLAMEZ_EVENT_ABI_VERSION 7
+#define FLAMEZ_EVENT_ABI_VERSION 8
 
 enum flamez_event_kind {
     FLAMEZ_EVENT_FORK = 1,
