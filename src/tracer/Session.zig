@@ -1146,38 +1146,34 @@ const held_target_argv = &.{
     "kill -STOP $$",
 };
 
+// Block before fork so a release sent immediately after admission stays pending
+// until sigwait; checking a Python flag before signal.pause can miss that wakeup.
 const fork_gate_script =
     \\import os,signal,sys
-    \\released = False
-    \\def release(*_):
-    \\    global released
-    \\    released = True
-    \\signal.signal(signal.SIGUSR1, release)
+    \\release = {signal.SIGUSR1}
+    \\signal.pthread_sigmask(signal.SIG_BLOCK, release)
     \\children = []
     \\for _ in range(int(sys.argv[1])):
     \\    child = os.fork()
     \\    if child == 0:
-    \\        while not released: signal.pause()
+    \\        signal.sigwait(release)
     \\        os._exit(0)
     \\    children.append(child)
-    \\while not released: signal.pause()
+    \\signal.sigwait(release)
     \\for child in children: os.kill(child, signal.SIGUSR1)
     \\for child in children: os.waitpid(child, 0)
 ;
 
 const escaped_gate_script =
     \\import os,signal
-    \\released = False
-    \\def release(*_):
-    \\    global released
-    \\    released = True
-    \\signal.signal(signal.SIGUSR1, release)
+    \\release = {signal.SIGUSR1}
+    \\signal.pthread_sigmask(signal.SIG_BLOCK, release)
     \\child = os.fork()
     \\if child == 0:
     \\    os.setsid()
     \\    signal.pause()
     \\    os._exit(0)
-    \\while not released: signal.pause()
+    \\signal.sigwait(release)
 ;
 
 fn updateUntilStopped(session: *Session, collector: *capture.Collector) !void {
@@ -1999,14 +1995,14 @@ test "macOS collector updates one root record across exec" {
     try session.start(&collector, &.{
         "sh",
         "-c",
-        "exec /usr/bin/python3 -c 'import signal; signal.pause()'",
+        "exec /bin/sleep 60",
     }, .{});
 
     const started = std.Io.Clock.awake.now(testing.io);
     while (std.mem.indexOf(
         u8,
         session.processes.items[0].exeSlice(session.metadata.items),
-        "/Python",
+        "/bin/sleep",
     ) == null) {
         session.update(&collector);
         if (started.durationTo(std.Io.Clock.awake.now(testing.io)).nanoseconds >=
@@ -2016,10 +2012,12 @@ test "macOS collector updates one root record across exec" {
     session.stop(&collector);
     try testing.expectEqual(@as(usize, 1), session.processes.items.len);
     const root = &session.processes.items[0];
-    try testing.expect(std.mem.startsWith(u8, root.nameSlice(), "python3"));
+    try testing.expectEqualStrings("sleep", root.nameSlice());
     var args = root.argsIter(session.metadata.items);
     const arg_zero = args.next() orelse return error.TestUnexpectedResult;
-    try testing.expect(std.mem.endsWith(u8, arg_zero, "python3"));
+    try testing.expectEqualStrings("/bin/sleep", arg_zero);
+    try testing.expectEqualStrings("60", args.next() orelse return error.TestUnexpectedResult);
+    try testing.expect(args.next() == null);
     try testing.expectEqual(collector.fidelity(), session.capture_fidelity);
     switch (session.capture_fidelity) {
         .exact => try testing.expectEqual(Process.MetadataSource.kernel, root.args_source),
