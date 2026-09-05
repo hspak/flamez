@@ -60,10 +60,12 @@ last_child_scratch: std.ArrayList(?usize) = .empty,
 roots_scratch: std.ArrayList(usize) = .empty,
 jobs_scratch: std.ArrayList(JobSpan) = .empty,
 heights_scratch: std.ArrayList(u16) = .empty,
-occupied_scratch: std.ArrayList(LaneOcc) = .empty,
-free_lanes_scratch: std.ArrayList(u16) = .empty,
+occupied_scratch: std.PriorityQueue(LaneOcc, void, LaneOcc.order) = .empty,
+free_lanes_scratch: std.PriorityQueue(u16, void, laneOrder) = .empty,
 lane_offsets_scratch: std.ArrayList(usize) = .empty,
-row_heads_scratch: std.ArrayList(?usize) = .empty,
+row_trees_scratch: std.ArrayList(PackingTree) = .empty,
+/// Node addresses stay fixed for an entire rebuild; each visible process belongs to one tree.
+interval_nodes_scratch: std.ArrayList(PackingTree.Node) = .empty,
 cpu_columns: std.ArrayList(CpuColumn) = .empty,
 cpu_touched_columns: std.ArrayList(usize) = .empty,
 packed_columns: std.ArrayList(?usize) = .empty,
@@ -124,7 +126,26 @@ pub const GraphRow = union(enum) {
 pub const LaneOcc = struct {
     end_ns: u64,
     lane: u16,
+
+    fn order(_: void, a: LaneOcc, b: LaneOcc) std.math.Order {
+        if (a.end_ns != b.end_ns) return std.math.order(a.end_ns, b.end_ns);
+        return std.math.order(a.lane, b.lane);
+    }
 };
+
+pub const PackingInterval = struct {
+    start_ns: u64,
+    end_ns: u64,
+    process_index: usize,
+
+    fn order(a: PackingInterval, b: PackingInterval) std.math.Order {
+        if (a.start_ns != b.start_ns) return std.math.order(a.start_ns, b.start_ns);
+        if (a.end_ns != b.end_ns) return std.math.order(a.end_ns, b.end_ns);
+        return std.math.order(a.process_index, b.process_index);
+    }
+};
+
+pub const PackingTree = std.Treap(PackingInterval, PackingInterval.order);
 
 pub const CpuColumn = struct {
     band: u8 = 0,
@@ -157,6 +178,10 @@ pub const min_view_span_ns: u64 = 1 * std.time.ns_per_ms;
 const zoom_step: f64 = 1.25;
 // How far past a fit-to-run view Ctrl+wheel may zoom out.
 const max_zoom_out: f64 = 8;
+
+fn laneOrder(_: void, a: u16, b: u16) std.math.Order {
+    return std.math.order(a, b);
+}
 
 /// Initializes UI state and allocates reusable detail-pane storage.
 /// The returned value owns all buffers allocated with `gpa`.
@@ -192,7 +217,8 @@ pub fn deinit(self: *App) void {
     self.occupied_scratch.deinit(self.gpa);
     self.free_lanes_scratch.deinit(self.gpa);
     self.lane_offsets_scratch.deinit(self.gpa);
-    self.row_heads_scratch.deinit(self.gpa);
+    self.row_trees_scratch.deinit(self.gpa);
+    self.interval_nodes_scratch.deinit(self.gpa);
     self.cpu_columns.deinit(self.gpa);
     self.cpu_touched_columns.deinit(self.gpa);
     self.packed_columns.deinit(self.gpa);

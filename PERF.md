@@ -238,18 +238,39 @@ Security mode does not perform those discovery scans.
 - Collapse changes have their own UI revision and rebuild only the row model.
 
 The row model and scratch arrays retain capacity. Structural arrays and the
-row-head scratch reserve for the retained process count. Job, height,
+per-row interval trees and their node storage reserve for the retained process count. Job, height,
 occupied-lane, free-lane, and lane-offset scratch buffers reserve only for the
 local job or lane count instead of all being pre-grown to the total process
 count.
 
 ### Packed sibling lanes use interval partitioning
 
-`process_tree.layoutJobLanes` sorts sibling jobs by start time. One min-heap
+`process_tree.layoutJobLanes` sorts sibling jobs by start time. One `std.PriorityQueue` min-heap
 tracks occupied lanes by end time and another tracks reusable lane IDs. Lane
 assignment is therefore `O(J log J)` after sorting instead of scanning every
 existing lane for every job. Reusing the smallest available lane keeps the
 layout deterministic.
+
+Nested descendants retain depth-first placement order. Each candidate row uses
+an intrusive `std.Treap` over its disjoint intervals to find overlaps in expected
+logarithmic time. Nodes live in a retained array reserved before the rebuild,
+so inserting intervals does not allocate. Zero-width intervals and equal start
+times keep their existing placement semantics.
+
+A ReleaseSafe benchmark on the review host used two overlapping jobs, one with
+sequential nested children. One fresh tree rebuild measured:
+
+| Children | Before interval indexing | After interval indexing |
+|---:|---:|---:|
+| 2,000 | 3.6 ms | 0.29 ms |
+| 4,000 | 12.3 ms | 0.47 ms |
+| 8,000 | 47.2 ms | 1.14 ms |
+| 16,000 | 199.6 ms | 1.91 ms |
+
+These single-run results characterize this shape on this host. Placement still
+tries candidate rows in order; a large number of simultaneous intervals can
+require trying many rows. A permanent regression bounds interval probes for
+sequential children without asserting a machine-specific time limit.
 
 Packed-row members are flattened into contiguous ranges and sorted by start
 time. Rendering binary-searches the first member that can overlap the visible

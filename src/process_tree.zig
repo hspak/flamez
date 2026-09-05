@@ -1,6 +1,7 @@
 //! Process-tree row construction, collapse behavior, and packed-lane assignment.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.process_tree);
@@ -8,6 +9,8 @@ const log = std.log.scoped(.process_tree);
 const App = @import("App.zig");
 const perf = @import("perf.zig");
 const tracer = @import("tracer.zig");
+
+var packing_probe_count: usize = 0;
 
 pub fn ensureProcessTree(
     app: *App,
@@ -38,7 +41,8 @@ fn rebuildProcessTree(
     try app.slot_next.ensureTotalCapacity(app.gpa, n);
     try app.lane_height_off.ensureTotalCapacity(app.gpa, n);
     try app.last_child_scratch.ensureTotalCapacity(app.gpa, n);
-    try app.row_heads_scratch.ensureTotalCapacity(app.gpa, n);
+    try app.row_trees_scratch.ensureTotalCapacity(app.gpa, n);
+    try app.interval_nodes_scratch.resize(app.gpa, n);
     try app.bar_name_widths.ensureTotalCapacity(app.gpa, n);
     try app.bar_name_hashes.ensureTotalCapacity(app.gpa, n);
     if (app.bar_name_widths.items.len < n) {
@@ -278,7 +282,7 @@ fn collectJob(
     session: *const tracer.Session,
     job_root: usize,
 ) JobSpan {
-    app.row_heads_scratch.clearRetainingCapacity();
+    app.row_trees_scratch.clearRetainingCapacity();
     var bounds = JobBounds{
         .start_ns = session.processes.items[job_root].start_ns,
         .end_ns = packingEnd(&session.processes.items[job_root]),
@@ -302,17 +306,16 @@ fn packingEnd(process: *const tracer.Process) u64 {
 }
 
 fn overlapsPackedRow(
-    app: *const App,
-    processes: []const tracer.Process,
-    index: usize,
-    head: ?usize,
+    interval: App.PackingInterval,
+    tree: *const App.PackingTree,
 ) bool {
-    const process = &processes[index];
-    const process_end = packingEnd(process);
-    var member = head;
-    while (member) |other_index| : (member = app.slot_next.items[other_index]) {
-        const other = &processes[other_index];
-        if (process.start_ns < packingEnd(other) and other.start_ns < process_end) return true;
+    var node = tree.root;
+    while (node) |other| {
+        if (comptime builtin.is_test) packing_probe_count += 1;
+        if (interval.start_ns < other.key.end_ns and other.key.start_ns < interval.end_ns)
+            return true;
+        // Each row contains disjoint intervals, so only one subtree can overlap.
+        node = other.children[@intFromBool(interval.start_ns >= other.key.end_ns)];
     }
     return false;
 }
@@ -330,15 +333,21 @@ fn markJobTree(
     if (proc_end > walk.bounds.end_ns) walk.bounds.end_ns = proc_end;
 
     var subrow = walk.min_subrow;
-    while (subrow < app.row_heads_scratch.items.len) : (subrow += 1) {
-        if (!overlapsPackedRow(app, processes, index, app.row_heads_scratch.items[subrow])) break;
+    const interval = App.PackingInterval{
+        .start_ns = process.start_ns,
+        .end_ns = proc_end,
+        .process_index = index,
+    };
+    while (subrow < app.row_trees_scratch.items.len) : (subrow += 1) {
+        if (!overlapsPackedRow(interval, &app.row_trees_scratch.items[subrow])) break;
     }
-    if (subrow == app.row_heads_scratch.items.len) {
-        app.row_heads_scratch.appendAssumeCapacity(null);
+    if (subrow == app.row_trees_scratch.items.len) {
+        app.row_trees_scratch.appendAssumeCapacity(.{});
     }
     app.pack_subrow.items[index] = @intCast(subrow);
-    app.slot_next.items[index] = app.row_heads_scratch.items[subrow];
-    app.row_heads_scratch.items[subrow] = index;
+    var entry = app.row_trees_scratch.items[subrow].getEntryFor(interval);
+    std.debug.assert(entry.node == null);
+    entry.set(&app.interval_nodes_scratch.items[index]);
     walk.bounds.height = @max(walk.bounds.height, @as(u16, @intCast(subrow + 1)));
 
     if (isCollapsed(app, index)) return;
@@ -357,67 +366,6 @@ fn jobLessThan(_: void, a: JobSpan, b: JobSpan) bool {
     return a.root < b.root;
 }
 
-fn laneOccLess(_: void, a: App.LaneOcc, b: App.LaneOcc) bool {
-    if (a.end_ns != b.end_ns) return a.end_ns < b.end_ns;
-    return a.lane < b.lane;
-}
-
-fn siftUpOcc(items: []App.LaneOcc, start: usize) void {
-    var i = start;
-    while (i > 0) {
-        const parent = (i - 1) / 2;
-        if (!laneOccLess({}, items[i], items[parent])) break;
-        const tmp = items[i];
-        items[i] = items[parent];
-        items[parent] = tmp;
-        i = parent;
-    }
-}
-
-fn siftDownOcc(items: []App.LaneOcc, start: usize) void {
-    var i = start;
-    while (true) {
-        var best = i;
-        const left = 2 * i + 1;
-        const right = 2 * i + 2;
-        if (left < items.len and laneOccLess({}, items[left], items[best])) best = left;
-        if (right < items.len and laneOccLess({}, items[right], items[best])) best = right;
-        if (best == i) break;
-        const tmp = items[i];
-        items[i] = items[best];
-        items[best] = tmp;
-        i = best;
-    }
-}
-
-fn siftUpLane(items: []u16, start: usize) void {
-    var i = start;
-    while (i > 0) {
-        const parent = (i - 1) / 2;
-        if (items[i] >= items[parent]) break;
-        const tmp = items[i];
-        items[i] = items[parent];
-        items[parent] = tmp;
-        i = parent;
-    }
-}
-
-fn siftDownLane(items: []u16, start: usize) void {
-    var i = start;
-    while (true) {
-        var best = i;
-        const left = 2 * i + 1;
-        const right = 2 * i + 2;
-        if (left < items.len and items[left] < items[best]) best = left;
-        if (right < items.len and items[right] < items[best]) best = right;
-        if (best == i) break;
-        const tmp = items[i];
-        items[i] = items[best];
-        items[best] = tmp;
-        i = best;
-    }
-}
-
 fn layoutJobLanes(
     app: *App,
     jobs: []JobSpan,
@@ -432,30 +380,13 @@ fn layoutJobLanes(
     std.sort.pdq(JobSpan, jobs, {}, jobLessThan);
     var next_lane: u16 = 0;
     for (jobs) |*job| {
-        while (app.occupied_scratch.items.len > 0 and
-            app.occupied_scratch.items[0].end_ns <= job.start_ns)
-        {
-            const freed = app.occupied_scratch.items[0];
-            const last = app.occupied_scratch.items[app.occupied_scratch.items.len - 1];
-            app.occupied_scratch.items.len -= 1;
-            if (app.occupied_scratch.items.len > 0) {
-                app.occupied_scratch.items[0] = last;
-                siftDownOcc(app.occupied_scratch.items, 0);
-            }
-            app.free_lanes_scratch.appendAssumeCapacity(freed.lane);
-            siftUpLane(app.free_lanes_scratch.items, app.free_lanes_scratch.items.len - 1);
+        while (app.occupied_scratch.peek()) |occupied| {
+            if (occupied.end_ns > job.start_ns) break;
+            const freed = app.occupied_scratch.pop().?;
+            try app.free_lanes_scratch.push(app.gpa, freed.lane);
         }
 
-        const lane: u16 = if (app.free_lanes_scratch.items.len > 0) reused_lane: {
-            const id = app.free_lanes_scratch.items[0];
-            const last = app.free_lanes_scratch.items[app.free_lanes_scratch.items.len - 1];
-            app.free_lanes_scratch.items.len -= 1;
-            if (app.free_lanes_scratch.items.len > 0) {
-                app.free_lanes_scratch.items[0] = last;
-                siftDownLane(app.free_lanes_scratch.items, 0);
-            }
-            break :reused_lane id;
-        } else new_lane: {
+        const lane: u16 = app.free_lanes_scratch.pop() orelse new_lane: {
             const id = next_lane;
             next_lane += 1;
             app.heights_scratch.appendAssumeCapacity(0);
@@ -466,8 +397,7 @@ fn layoutJobLanes(
         {
             app.heights_scratch.items[lane] = job.height;
         }
-        app.occupied_scratch.appendAssumeCapacity(.{ .end_ns = job.end_ns, .lane = lane });
-        siftUpOcc(app.occupied_scratch.items, app.occupied_scratch.items.len - 1);
+        try app.occupied_scratch.push(app.gpa, .{ .end_ns = job.end_ns, .lane = lane });
         job.lane = lane;
     }
     return next_lane;
@@ -842,4 +772,76 @@ fn packedRowForProcess(app: *const App, target: usize) ?usize {
         },
     };
     return null;
+}
+
+test "packing scales with sequential nested children" {
+    const testing = std.testing;
+    const count = 4_000;
+    var session = tracer.Session.init(testing.allocator, testing.io);
+    defer session.deinit();
+    try session.processes.append(testing.allocator, .{
+        .pid = 2_000_000_000,
+        .end_ns = count * 10 + 10,
+    });
+    for (0..2) |job| {
+        try session.processes.append(testing.allocator, .{
+            .pid = @intCast(2_000_000_001 + job),
+            .parent_index = 0,
+            .depth = 1,
+            .end_ns = count * 10 + 10,
+        });
+    }
+    for (0..count) |index| {
+        try session.processes.append(testing.allocator, .{
+            .pid = @intCast(2_000_000_003 + index),
+            .parent_index = 1,
+            .depth = 2,
+            .start_ns = index * 10,
+            .end_ns = index * 10 + 5,
+        });
+    }
+    var app = try App.init(testing.allocator);
+    defer app.deinit();
+    packing_probe_count = 0;
+    try ensureProcessTree(&app, &session);
+    try testing.expect(packing_probe_count < count * 32);
+    for (3..session.processes.items.len) |index| {
+        try testing.expectEqual(@as(u16, 1), app.pack_subrow.items[index]);
+    }
+}
+
+test "packing handles equal starts zero width bars and out of order intervals" {
+    const testing = std.testing;
+    var session = tracer.Session.init(testing.allocator, testing.io);
+    defer session.deinit();
+    try session.processes.append(testing.allocator, .{ .pid = 1, .end_ns = 100 });
+    for (0..2) |job| {
+        try session.processes.append(testing.allocator, .{
+            .pid = @intCast(2 + job),
+            .parent_index = 0,
+            .end_ns = 100,
+        });
+    }
+    const intervals = [_][2]u64{
+        .{ 10, 10 },
+        .{ 10, 20 },
+        .{ 10, 10 },
+        .{ 15, 16 },
+        .{ 15, 15 },
+        .{ 20, 30 },
+        .{ 0, 5 },
+        .{ 4, 11 },
+    };
+    for (intervals, 0..) |interval, index| {
+        try session.processes.append(testing.allocator, .{
+            .pid = @intCast(4 + index),
+            .parent_index = 1,
+            .start_ns = interval[0],
+            .end_ns = interval[1],
+        });
+    }
+    var app = try App.init(testing.allocator);
+    defer app.deinit();
+    try ensureProcessTree(&app, &session);
+    try testing.expectEqualSlices(u16, &.{ 1, 1, 1, 2, 2, 1, 1, 2 }, app.pack_subrow.items[3..]);
 }
