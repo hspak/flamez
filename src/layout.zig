@@ -89,6 +89,7 @@ pub fn makeViewText(session: *const tracer.Session) ViewText {
         ) catch "STOPPED",
         .unknown => if (session.finished) "FINISHED" else "READY",
     };
+    std.mem.copyForwards(u8, view_text.status[0..status.len], status);
     view_text.status_len = status.len;
     const elapsed = text.formatDuration(session.timelineNs(), &view_text.elapsed);
     view_text.elapsed_len = reserveWidth(&view_text.elapsed, elapsed.len, max_elapsed_text.len);
@@ -367,4 +368,35 @@ test "footer values reserve their maximum widths" {
     @memcpy(buffer[0..2], "99");
     const active_len = reserveWidth(&buffer, 2, max_active_count_text.len);
     try testing.expectEqualStrings("  99", buffer[0..active_len]);
+}
+
+test "footer status owns static and formatted text" {
+    const testing = std.testing;
+    const Case = struct {
+        running: bool = false,
+        finished: bool = false,
+        loss_count: u64 = 0,
+        root_exit: tracer.Session.RootExit = .unknown,
+        expected: []const u8,
+    };
+    const cases: []const Case = &.{
+        .{ .expected = "READY" },
+        .{ .running = true, .expected = "RUNNING" },
+        .{ .finished = true, .expected = "FINISHED" },
+        .{ .running = true, .loss_count = 1, .expected = "INCOMPLETE" },
+        .{ .finished = true, .loss_count = 1, .expected = "INCOMPLETE" },
+        .{ .finished = true, .root_exit = .{ .exited = 2 }, .expected = "FINISHED · EXIT 2" },
+        .{ .finished = true, .root_exit = .{ .signaled = 9 }, .expected = "STOPPED · SIGNAL 9" },
+        .{ .loss_count = 1, .root_exit = .{ .exited = 2 }, .expected = "INCOMPLETE · EXIT 2" },
+    };
+    for (cases) |case| {
+        var session = tracer.Session.init(testing.allocator, testing.io);
+        defer session.deinit();
+        session.running = case.running;
+        session.finished = case.finished;
+        session.loss_count = case.loss_count;
+        session.root_exit = case.root_exit;
+        const view = makeViewText(&session);
+        try testing.expectEqualStrings(case.expected, view.statusSlice());
+    }
 }
