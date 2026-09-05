@@ -397,6 +397,7 @@ pub const Collector = struct {
     launcher_pid: ?std.posix.pid_t = null,
     tracked: std.AutoHashMapUnmanaged(std.posix.pid_t, Tracked) = .empty,
     pid_snapshot: std.ArrayList(std.posix.pid_t) = .empty,
+    discovery_parents: std.ArrayList(std.posix.pid_t) = .empty,
     identity_snapshot: std.ArrayList(IdentityCandidate) = .empty,
     pending_events: std.ArrayList(PendingEvent) = .empty,
     delivery_events: std.ArrayList(PendingEvent) = .empty,
@@ -465,6 +466,7 @@ pub const Collector = struct {
         self.delivery_events.deinit(self.gpa);
         self.cpu_targets.deinit(self.gpa);
         self.identity_snapshot.deinit(self.gpa);
+        self.discovery_parents.deinit(self.gpa);
         self.pid_snapshot.deinit(self.gpa);
         self.es_versions.deinit(self.gpa);
         self.tracked.deinit(self.gpa);
@@ -511,6 +513,7 @@ pub const Collector = struct {
         self.clearPendingEventsLocked();
         self.es_versions.clearRetainingCapacity();
         self.identity_snapshot.clearRetainingCapacity();
+        self.discovery_parents.clearRetainingCapacity();
         self.lost_events = 0;
         self.last_ring_events = 0;
         self.last_cpu_samples = 0;
@@ -619,8 +622,8 @@ pub const Collector = struct {
         if (self.root_pid == pid) self.worker_stop.store(true, .release);
     }
 
-    /// Delivers worker-owned lifecycle observations without inspecting live
-    /// processes or blocking the render thread.
+    /// Delivers queued lifecycle observations without inspecting live processes.
+    /// Fallback queue swapping waits for the collector mutex; delivery runs unlocked.
     pub fn pollEvents(self: *Collector, sink: capture.Sink) void {
         if (self.es_handle) |handle| {
             var poll = EsPoll{ .collector = self, .sink = sink };
@@ -932,6 +935,9 @@ pub const Collector = struct {
             var quiet = amount == 0;
             var drain_pass: usize = 0;
             while (escaped_scan_pending and !quiet and drain_pass < 8) : (drain_pass += 1) {
+                // Waiting for another hint needs no tracked-process state. Let
+                // the session drain the events already queued during the burst.
+                self.unlock();
                 const drained = std.c.kevent(
                     self.kqueue_fd,
                     events[0..0].ptr,
@@ -940,8 +946,10 @@ pub const Collector = struct {
                     events.len,
                     &fork_drain_timeout,
                 );
+                const drain_errno = std.c.errno(drained);
+                self.lock();
                 if (drained < 0) {
-                    if (std.c.errno(drained) != .INTR) {
+                    if (drain_errno != .INTR) {
                         self.noteLossLocked("kevent fork-burst drain failed");
                     }
                     break;
@@ -972,6 +980,8 @@ pub const Collector = struct {
         events: []const std.c.Kevent,
         timestamp_ns: u64,
     ) bool {
+        // The worker already ran periodic recovery before consuming this batch.
+        if (events.len == 0) return false;
         const fork_hint = self.hasTrackedForkHintLocked(events);
         for (events) |event| self.consumeKeventLocked(event, timestamp_ns);
         if (self.root_pid) |root| {
@@ -1027,8 +1037,8 @@ pub const Collector = struct {
     }
 
     fn discoverDescendantsLocked(self: *Collector, timestamp_ns: u64) void {
-        var parents: std.ArrayList(std.posix.pid_t) = .empty;
-        defer parents.deinit(self.gpa);
+        const parents = &self.discovery_parents;
+        parents.clearRetainingCapacity();
         var iterator = self.tracked.iterator();
         while (iterator.next()) |entry| {
             parents.append(self.gpa, entry.key_ptr.*) catch {
@@ -2702,4 +2712,44 @@ test "fallback exit preserves CPU and name when a PID belongs to another lifetim
     try testing.expectEqual(@as(u64, 42), event.cpu_ns);
     try testing.expect(!event.cpu_final);
     try testing.expectEqualStrings("old", event.name.slice());
+}
+
+test "fallback recovery reuses its parent queue between scans" {
+    const testing = std.testing;
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    var collector = Collector{ .gpa = failing.allocator() };
+    defer collector.deinit();
+    const pid = process_ops.currentPid();
+    var identity: ProcessIdentity = undefined;
+    try testing.expectEqual(@as(c_int, 0), flamez_macos_process_identity(pid, &identity));
+    try collector.tracked.put(failing.allocator(), pid, .{
+        .identity = identity,
+        .generation = 1,
+        .needs_metadata = false,
+    });
+    collector.discoverDescendantsLocked(nowNs());
+    try testing.expectEqual(@as(u64, 0), collector.worker_lost_events);
+    failing.fail_index = failing.alloc_index;
+    collector.discoverDescendantsLocked(nowNs());
+    try testing.expectEqual(@as(u64, 0), collector.worker_lost_events);
+    try testing.expectEqual(@as(usize, 1), collector.tracked.count());
+}
+
+test "empty kqueue batches do not repeat descendant recovery" {
+    const testing = std.testing;
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    var collector = Collector{ .gpa = failing.allocator() };
+    defer collector.deinit();
+    const pid = process_ops.currentPid();
+    var identity: ProcessIdentity = undefined;
+    try testing.expectEqual(@as(c_int, 0), flamez_macos_process_identity(pid, &identity));
+    try collector.tracked.put(failing.allocator(), pid, .{
+        .identity = identity,
+        .generation = 1,
+        .needs_metadata = false,
+    });
+    collector.root_pid = pid;
+    failing.fail_index = failing.alloc_index;
+    try testing.expect(!collector.consumeReadyEventsLocked(&.{}, nowNs()));
+    try testing.expectEqual(@as(u64, 0), collector.worker_lost_events);
 }

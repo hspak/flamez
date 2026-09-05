@@ -192,6 +192,12 @@ Fork bursts are handled in two stages:
 This ordering prioritizes kqueue registration during churn and avoids an
 all-system PID scan on every 4 ms recovery pass.
 
+Quiet kqueue batches use the recovery pass already performed before event
+consumption. Only nonempty batches need another pass after applying their
+lifecycle changes. The descendant parent queue retains capacity between scans.
+Fork-burst waits release the collector mutex so the main thread can drain
+already queued observations during the 250 microsecond quiet window.
+
 libproc PID lists reuse one `pid_snapshot` buffer. The collector adds sixteen
 slots to the sizing result and treats a completely full fill as possibly
 truncated. It doubles capacity for at most four attempts; a persistently full
@@ -222,6 +228,42 @@ The fallback worker performs discovery and metadata inspection while holding
 its collector mutex. That serializes worker state safely, but a large libproc
 scan can delay a main-thread queue swap or CPU-target snapshot. Exact Endpoint
 Security mode does not perform those discovery scans.
+
+### Native fallback measurements
+
+On 2026-09-04, the deferred profiling ran on an 8-core Apple M1 with 8 GiB RAM,
+macOS 26.6.2 (25G83), and Zig 0.16.0. An isolated ReleaseSafe test build timed
+worker lock holds, main-thread lock waits, discovery, metadata, CPU snapshots,
+and complete `pollEvents` calls. Instrumentation was absent from the production
+build. The harness used the C allocator, polled every 4 ms, and retained the
+normal 16 ms CPU-sample cadence.
+
+Each shape ran three times before and after the changes above. Steady cases
+forked sleeping children for 1.2 seconds; the burst case ran six waves of 32
+children sleeping for 150 ms. The table reports the median of the three
+per-run p95 queue-poll durations and the largest individual poll across them.
+Queue-poll duration includes mutex wait and event delivery, not GUI rendering.
+
+| Workload | Poll p95 before | Poll p95 after | Worst poll before | Worst poll after |
+|---|---:|---:|---:|---:|
+| 1 child | 0.233 ms | 0.192 ms | 2.080 ms | 2.499 ms |
+| 32 children | 1.478 ms | 0.844 ms | 15.376 ms | 3.843 ms |
+| 128 children | 5.673 ms | 2.950 ms | 45.627 ms | 39.756 ms |
+| Six 32-child waves | 2.051 ms | 2.453 ms | 17.619 ms | 8.925 ms |
+
+At 128 children, parent-queue allocations fell from 830–852 to three per run,
+and median worker-lock p95 fell from 6.50 ms to 3.36 ms. Every measured run
+retained the expected process count, reported zero known loss, and serialized
+successfully. Those observations do not establish fallback completeness for
+shorter or unobserved descendants.
+
+The steady workloads improve, and releasing the lock during fork waits reduces
+burst peaks; burst p95 did not improve in these trials. Wide-tree stalls near
+40 ms remain possible because discovery and metadata inspection still share
+the collector mutex. An identity index or a larger ownership redesign needs
+separate evidence; neither is implied by these measurements. The temporary
+harness and raw before/after logs are in `/tmp/flamez-macos-profile-*` for this
+workspace session.
 
 ## Tree layout and retained UI state
 
