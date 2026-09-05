@@ -568,7 +568,7 @@ fn buildChildIndex(gpa: Allocator, session: *const Session) WriteError!ChildInde
             process.end_kind == .observed_exit and
             parent.origin == .observed and
             parent.end_kind == .observed_exit and
-            (process.start_ns < parent.start_ns or process.end_ns.? > parent.end_ns.?))
+            (process.start_ns < parent.start_ns or process.start_ns > parent.end_ns.?))
         {
             return error.InvalidSession;
         }
@@ -737,7 +737,7 @@ fn writeInvariantStatus(
     try json.write("inference_separation");
     if (complete_lifecycle) {
         try json.write("command_lifetime_coverage");
-        try json.write("complete_child_containment");
+        try json.write("child_birth_within_parent_lifetime");
     }
     if (complete_cpu) try json.write("total_self_cpu");
     try json.endArray();
@@ -745,7 +745,7 @@ fn writeInvariantStatus(
     try json.beginArray();
     if (!complete_lifecycle) {
         try json.write("command_lifetime_coverage");
-        try json.write("complete_child_containment");
+        try json.write("child_birth_within_parent_lifetime");
     }
     if (!complete_cpu) try json.write("total_self_cpu");
     try json.endArray();

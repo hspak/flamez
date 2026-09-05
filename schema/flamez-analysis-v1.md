@@ -167,7 +167,10 @@ enforce:
 1. Process and command duration identities.
 2. Ordered, non-overlapping command intervals and matching interval counts.
 3. Full command coverage of each observed process lifetime.
-4. Resolving parent IDs and containment of complete child lifetimes.
+4. Resolving parent IDs and placing each observed child's birth within its parent's lifetime
+   (`child_birth_within_parent_lifetime`). A child may outlive its immediate parent; only the
+   overlap contributes to that parent's explained wall time. The former
+   `complete_child_containment` label described an invalid restriction and is no longer emitted.
 5. Total self CPU equal to the sum of final process self CPU.
 6. Total unexplained wall time equal to the sum documented above.
 7. Inclusive CPU and process counts equal to descendant traversal.

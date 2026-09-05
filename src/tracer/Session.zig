@@ -14,6 +14,7 @@ const capture = @import("capture.zig");
 const process_ops = @import("process_ops.zig");
 const perf = @import("../perf.zig");
 const session_file = @import("../session_file.zig");
+const analysis_file = @import("../analysis_file.zig");
 
 const log = std.log.scoped(.tracer);
 
@@ -2383,4 +2384,29 @@ test "root boundary restores a surviving child image after root exit" {
     try testing.expectEqual(@as(usize, 1), child.execCount());
     try testing.expectEqual(@as(?u64, 10), child.end_ns);
     try testing.expectEqualStrings("root", child.argv0(session.metadataBytes()));
+}
+
+test "analysis accepts a child outliving its intermediate parent" {
+    const testing = std.testing;
+    var session = try boundaryTestSession(testing.allocator);
+    defer session.deinit();
+    var collector = capture.Collector{};
+    const root_pid = session.root_pid.?;
+    session.consumeEvent(forkEvent(root_pid + 1, root_pid, 5, "parent"));
+    session.consumeEvent(forkEvent(root_pid + 2, root_pid + 1, 8, "child"));
+    session.consumeEvent(exitEvent(root_pid + 1, 10, "parent", 0));
+    session.consumeEvent(exitEvent(root_pid + 2, 12, "child", 0));
+    session.consumeEvent(exitEvent(root_pid, 20, "root", 0));
+    session.finishRootCapture(&collector, null);
+    try expectWritableBoundary(&session);
+    var writer: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer writer.deinit();
+    try analysis_file.write(testing.allocator, &session, &writer.writer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, writer.written(), .{});
+    defer parsed.deinit();
+    const processes = parsed.value.object.get("processes").?.array.items;
+    try testing.expectEqual(@as(i64, 2), processes[1].object.get("child_lifetime_span_ns").?.integer);
+    try testing.expectEqual(@as(i64, 4), processes[2].object.get("wall_time_ns").?.integer);
+    try testing.expectEqual(@as(i64, 3), processes[0].object.get("inclusive_process_count").?.integer);
+    try testing.expect(std.mem.indexOf(u8, writer.written(), "complete_child_containment") == null);
 }
