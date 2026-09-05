@@ -492,7 +492,7 @@ The in-repository implementation has evidence for every Linux-facing collector r
 
 | Requirement | Authoritative evidence | Status |
 |---|---|---|
-| Apple-silicon-only build | both test roots and the application compile for `aarch64-macos`; the installed artifact is Mach-O arm64 | verified |
+| Apple-silicon-only build | the complete test root and application compile for `aarch64-macos`; the installed artifact is Mach-O arm64 | verified |
 | API selection and limitations | sections 1–5 cite Apple documentation and current XNU/libproc source | verified |
 | fallback fork/exec/exit and metadata | live Session fixtures cover descendants, shebang argv, empty arguments, immediate exits, process-group escape, and immutable-parent recovery | verified on macOS 26 |
 | fallback launch and final-drain races | suspended-launch, restart, 24 immediate-exit, and root-boundary fixtures | verified on macOS 26 |
@@ -504,6 +504,36 @@ The in-repository implementation has evidence for every Linux-facing collector r
 | genuine descendant-scoped kernel delivery | requires macOS 27 and an Apple-approved restricted entitlement | not verifiable on this host |
 
 ### In-repository validation details
+
+Native validation was resumed on 2026-09-04 on macOS 26.6.2 (25G83), Apple M1,
+with Zig 0.16.0. Debug and ReleaseSafe with telemetry each passed 179 of 190
+tests, with 11 expected skips for Linux-only coverage and the unsupported
+backend. The native production executable also built successfully. A headless
+three-process capture, analysis export, and GUI replay with a saved screenshot
+completed successfully through the real kqueue/libproc fallback.
+
+The existing forced-Stop/restart regression exposed teardown exits being
+imported as natural exits. Stop now freezes observations before sending its
+signals; that regression passes unchanged. The root-exec fixture now execs
+`/bin/sleep` and checks its exact name and complete argv. The former system
+Python fixture expected an intermediate launcher, but native diagnostics showed
+additional execs into the final `Python` framework image. The replacement
+preserves the single-root, exec-update, and metadata-provenance coverage.
+
+Faster queue delivery also exposed a lost wakeup in the Python lifecycle
+fixtures: a release could arrive between checking a flag and calling
+`signal.pause()`, leaving a live target waiting forever. Those fixtures now
+block SIGUSR1 before forking and consume it with
+[`signal.sigwait`](https://docs.python.org/3.9/library/signal.html#signal.sigwait).
+The lifecycle assertions remain intact; the synchronization no longer depends
+on the collector delaying delivery until the target has entered its wait.
+
+Two allocation-failure regressions failed before the recovery optimization and
+passed unchanged afterward: the parent queue is reused, and empty kqueue
+batches do not repeat discovery. [PERF.md](PERF.md) records the native lock and
+queue-drain measurements, including remaining burst limits. This host still
+lacks the descendant Endpoint Security API; exact kernel delivery remains a
+separate macOS 27 and entitlement gate.
 
 Fallback collector tests cover worker restart, stale kqueue generations,
 immutable-parent recovery, deliberate double-fork non-adoption, queue overflow,
@@ -541,8 +571,9 @@ release-day procedure and the exact repository changes to make are specified in 
 Synthetic coverage already verifies that a generation-authenticated exec survives unavailable
 inspection without retaining inherited argv/executable metadata. Scripts/interpreters,
 post-admission `setsid()`, immutable-parent recovery, and the deliberate non-adoption boundary after
-an unseen intermediate vanishes have live fallback coverage. Planned session export should retain
-`capture_fidelity`, but export does not exist on Linux either and is not a macOS parity blocker.
+an unseen intermediate vanishes have live fallback coverage. Session export retains
+`capture_fidelity`; the native capture, analysis, and replay smoke test exercised
+that persisted fallback capture.
 
 The private inspection calls are intentionally behind one shim and are replaceable field by field.
 The shared `Session`, process tree, CPU-slice model, teardown, and UI require no ES-specific changes.
