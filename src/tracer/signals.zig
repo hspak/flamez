@@ -184,8 +184,43 @@ pub fn installFatalSignalHandlers() void {
 }
 
 test "termination signal handlers install idempotently" {
+    const testing = std.testing;
+    const termination_signals = [_]std.posix.SIG{
+        .INT,
+        .TERM,
+        .HUP,
+        .QUIT,
+    };
+    var previous_actions: [termination_signals.len]std.posix.Sigaction = undefined;
+    for (termination_signals, &previous_actions) |sig, *previous| {
+        std.posix.sigaction(sig, null, previous);
+    }
+    var previous_pipe: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.PIPE, null, &previous_pipe);
+    defer {
+        for (termination_signals, &previous_actions) |sig, *previous| {
+            std.posix.sigaction(sig, previous, null);
+        }
+        std.posix.sigaction(.PIPE, &previous_pipe, null);
+    }
+
     installFatalSignalHandlers();
     installFatalSignalHandlers();
+
+    for (termination_signals) |sig| {
+        var action: std.posix.Sigaction = undefined;
+        std.posix.sigaction(sig, null, &action);
+        try testing.expectEqual(
+            @intFromPtr(&handleTerminationSignal),
+            @intFromPtr(action.handler.handler.?),
+        );
+    }
+    var pipe_action: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.PIPE, null, &pipe_action);
+    try testing.expectEqual(
+        @intFromPtr(std.posix.SIG.IGN.?),
+        @intFromPtr(pipe_action.handler.handler.?),
+    );
 }
 
 test "only one simultaneous signal claims the cooperative stop" {

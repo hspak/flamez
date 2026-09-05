@@ -2219,7 +2219,8 @@ test "root label matches the process when argv basename equals comm" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     var comm_buf: [max_name_len]u8 = undefined;
     const self_pid = process_ops.currentPid();
-    const comm = process_ops.readName(self_pid, &comm_buf) orelse return;
+    const comm = process_ops.readName(self_pid, &comm_buf) orelse
+        return error.TestUnexpectedResult;
     var argv_buf: [max_name_len]u8 = undefined;
     @memcpy(argv_buf[0..comm.len], comm);
     const named = Session.rootLabel(self_pid, argv_buf[0..comm.len], &comm_buf);
@@ -2229,8 +2230,13 @@ test "root label matches the process when argv basename equals comm" {
 
 test "root label is other when argv basename does not match comm" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const self_pid = process_ops.currentPid();
+    var observed_buf: [max_name_len]u8 = undefined;
+    const comm = process_ops.readName(self_pid, &observed_buf) orelse
+        return error.TestUnexpectedResult;
+    const argv0 = if (std.mem.eql(u8, comm, "build.sh")) "other.sh" else "build.sh";
     var comm_buf: [max_name_len]u8 = undefined;
-    const named = Session.rootLabel(1, "build.sh", &comm_buf);
+    const named = Session.rootLabel(self_pid, argv0, &comm_buf);
     try std.testing.expectEqual(NameKind.other, named.kind);
-    try std.testing.expectEqualStrings("build.sh", named.text);
+    try std.testing.expectEqualStrings(argv0, named.text);
 }
