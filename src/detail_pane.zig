@@ -149,6 +149,43 @@ fn drawDetailCpuGraphText(
     }, size, color);
 }
 
+fn fillCpuGraphColumns(
+    slices: []const tracer.Process.CpuSlice,
+    range: CpuGraphRange,
+    plot: rl.Rectangle,
+    columns: []f32,
+) void {
+    const width = columns.len;
+    @memset(columns, -1);
+    const first = tracer.Process.firstVisibleSlice(
+        slices,
+        range.start_ns,
+        range.end_ns,
+    );
+    for (slices[first..]) |slice| {
+        if (slice.start_ns >= range.end_ns) break;
+        if (slice.end_ns <= range.start_ns) continue;
+        const start_ns = @max(slice.start_ns, range.start_ns);
+        const end_ns = @min(slice.end_ns, range.end_ns);
+        if (end_ns <= start_ns) continue;
+        const start_x = detailCpuGraphX(range, start_ns, plot);
+        const end_x = detailCpuGraphX(range, end_ns, plot);
+        var px0: usize = 0;
+        if (start_x > plot.x) {
+            px0 = @min(width, @as(usize, @intFromFloat(@floor(start_x - plot.x))));
+        }
+        var px1: usize = width;
+        if (end_x > plot.x) {
+            px1 = @min(width, @as(usize, @intFromFloat(@ceil(end_x - plot.x))));
+        }
+        if (px1 <= px0) px1 = @min(width, px0 + 1);
+        const cores: f32 = @floatCast(slice.averageCores());
+        for (px0..px1) |px| {
+            columns[px] = @max(columns[px], cores);
+        }
+    }
+}
+
 fn drawDetailCpuGraph(
     app: *App,
     process: *const tracer.Process,
@@ -249,34 +286,7 @@ fn drawDetailCpuGraph(
         app.graph_cache_width != width;
     if (rebuild_columns) {
         try app.graph_columns.resize(app.gpa, width);
-        @memset(app.graph_columns.items, -1);
-        const first = tracer.Process.firstVisibleSlice(
-            process.cpu_slices.items,
-            range.start_ns,
-            range.end_ns,
-        );
-        for (process.cpu_slices.items[first..]) |slice| {
-            if (slice.start_ns >= range.end_ns) break;
-            if (slice.end_ns <= range.start_ns) continue;
-            const start_ns = @max(slice.start_ns, range.start_ns);
-            const end_ns = @min(slice.end_ns, range.end_ns);
-            if (end_ns <= start_ns) continue;
-            const start_x = detailCpuGraphX(range, start_ns, plot);
-            const end_x = detailCpuGraphX(range, end_ns, plot);
-            var px0: usize = 0;
-            if (start_x > plot.x) {
-                px0 = @min(width, @as(usize, @intFromFloat(@floor(start_x - plot.x))));
-            }
-            var px1: usize = width;
-            if (end_x > plot.x) {
-                px1 = @min(width, @as(usize, @intFromFloat(@ceil(end_x - plot.x))));
-            }
-            if (px1 <= px0) px1 = @min(width, px0 + 1);
-            const cores: f32 = @floatCast(slice.averageCores());
-            for (px0..px1) |px| {
-                app.graph_columns.items[px] = @max(app.graph_columns.items[px], cores);
-            }
-        }
+        fillCpuGraphColumns(process.cpu_slices.items, range, plot, app.graph_columns.items);
         app.graph_cache_process = process_index;
         app.graph_cache_process_revision = process.revision;
         app.graph_cache_start_ns = range.start_ns;
@@ -897,16 +907,13 @@ pub fn render(
     }
 
     const process = &session.processes.items[index];
-    const capacities = detailCapacity(process, session.metadataBytes());
-    try app.ensureDetailCapacity(
-        capacities.store,
-        capacities.lines,
-    );
     const inner_w = @max(120, content.width - pad * 2 - scrollbar_width - 6);
     const rebuild_detail = app.detail_cache_process != selected or
         app.detail_cache_revision != process.revision or
         @abs(app.detail_cache_width - inner_w) > 0.5;
     if (rebuild_detail) {
+        const capacities = detailCapacity(process, session.metadataBytes());
+        try app.ensureDetailCapacity(capacities.store, capacities.lines);
         clearDetailTextSelection(app);
         // Heap-backed builder storage sized in App.init: rebuild only when
         // selection, metadata, lifetime state, or wrapping width changes.
@@ -1164,4 +1171,57 @@ pub fn render(
         );
     }
     drawDetailCloseButton(font, mouse, close_box);
+}
+
+test "CPU graph columns clip history and retain subpixel peaks and gaps" {
+    const slices = [_]tracer.Process.CpuSlice{
+        .{
+            .start_ns = 0,
+            .end_ns = 15,
+            .cpu_ns = 15,
+            .band = 4,
+        },
+        .{
+            .start_ns = 20,
+            .end_ns = 25,
+            .cpu_ns = 10,
+            .band = 8,
+        },
+        .{
+            .start_ns = 30,
+            .end_ns = 35,
+            .cpu_ns = 140,
+            .band = 64,
+        },
+        .{
+            .start_ns = 40,
+            .end_ns = 41,
+            .cpu_ns = 4,
+            .band = 16,
+        },
+        .{
+            .start_ns = 41,
+            .end_ns = 42,
+            .cpu_ns = 7,
+            .band = 28,
+        },
+        .{
+            .start_ns = 50,
+            .end_ns = 60,
+            .cpu_ns = 200,
+            .band = 64,
+        },
+    };
+    var columns: [8]f32 = undefined;
+    fillCpuGraphColumns(&slices, .{ .start_ns = 10, .end_ns = 50 }, .init(42, 0, 8, 100), &columns);
+    try std.testing.expectEqualSlices(f32, &.{
+        1,
+        -1,
+        2,
+        -1,
+        28,
+        -1,
+        7,
+        -1,
+    }, &columns);
 }

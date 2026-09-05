@@ -310,7 +310,7 @@ the longer summary label on narrow bars.
 Selected-process detail text is rebuilt only when the selected process
 revision, selection, or wrapping width changes. Heap-backed text, line, and
 line-height buffers are retained and grow geometrically if the builder
-overflows. The initial reservation is estimated from retained exec metadata,
+overflows. The reservation is estimated from retained exec metadata only when rebuilding,
 so selecting a process with a very large argv can still cause a correspondingly
 large one-time allocation.
 
@@ -322,6 +322,16 @@ The full-lifetime CPU detail graph is reduced to one value per plot pixel. Its
 column buffer is cached by process, process revision, lifetime range, and plot
 width. Consecutive equal columns render as one run, so unchanged frames do not
 rescan or redraw one primitive per canonical slice.
+
+A ReleaseSafe microbenchmark on the review host averaged 100 rebuilds of a
+1,000-pixel graph with alternating occupancy bands. At 1,000 / 10,000 / 100,000
+retained slices, column preparation took 4.5 / 38 / 396 microseconds. Estimating
+detail capacity for the same counts of retained execs took 1.2 / 14 / 132
+microseconds. Capacity estimation now shares the detail cache gate. These
+measurements isolate CPU preparation and exclude font shaping, drawing, and GPU
+presentation; they do not establish whole-frame cost. The graph's live end time
+still invalidates its cache, and full-range timeline rendering still scans
+retained slices. No additional history index was justified by these results.
 
 ### Static captures skip unchanged frames
 
