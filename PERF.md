@@ -395,25 +395,26 @@ Timed phases are:
 - detail rendering; and
 - `endDrawing`.
 
-The emitted counters record process, metadata, and CPU-slice counts;
-packed-lane rebuild operations; lifecycle events; CPU samples; and timeline
-slices scanned versus drawn. Periodic frame summaries include p50/p95/max over
-up to 64 retained samples. The final summary's count and maximum cover the
-session, while its p50/p95/p99 values come from the rolling 64 stored samples.
+Each periodic line covers the interval since the previous line. Logging uses
+elapsed wall time, so a second of idle polling does not require a second of
+rendering before the next report. `frames` and `max` cover all measured frames
+in that interval; `recent_p50` and `recent_p95` cover its most recent 64 frames.
+Phase fields ending in `_avg` divide accumulated phase time by the interval's
+frame count, including frames where that phase did no work.
 
-`perf.zig` also defines new-versus-coalesced slice counters, but the production
-recording path does not currently call `noteSliceGrowth`; those two values in
-the final summary remain zero. The internal `rebuild_jobs` total is likewise
-not included in the emitted log line. `main.zig` passes
-`collector.last_cpu_samples` to telemetry every live frame, while collectors
-update that field only when a cadence-triggered snapshot runs, so `cpu_n` is
-not currently an exact count of delivered samples. Phase durations in the
-periodic line are from the frame that triggered the log; only overall frame
-times have percentile histograms.
+Counters record the latest process/metadata/slice shape, rebuilds and job
+counts, delivered lifecycle events and CPU samples, and timeline slices scanned
+versus drawn. Observation counters advance where `Session` receives a record,
+including a record it cannot attribute; idle frames do not repeat a collector's
+previous snapshot count. Successful CPU slice insertion and adjacent-band
+coalescing update the final summary's `new_slices` and `coalesced` counters.
+Idle samples and failed allocations do not count as slice growth.
 
-Telemetry is shared across collectors. On Linux, lifecycle counts come from the
-ring poll and CPU counts from the borrowed batch snapshot. On macOS, they come
-from the ES queue or fallback worker and the per-PID rusage scan.
+The final summary's frame count and maximum cover the whole GUI session. Its
+`recent_p50`, `recent_p95`, and `recent_p99` explicitly describe the most recent
+64 frames, not a whole-session percentile estimate. All counters, phase totals,
+and timing samples reset together at `beginSession`. Telemetry is main-thread
+GUI instrumentation; headless capture does not emit frame summaries.
 
 `-Dfps-counter=true` is separate presentation telemetry. It can force an
 occasional completed-capture redraw so the displayed value remains current.

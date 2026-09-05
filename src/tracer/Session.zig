@@ -1001,6 +1001,7 @@ fn applyExec(
 /// under the session root so a lost backend record cannot hide that
 /// subtree.
 pub fn consumeEvent(self: *Session, event: capture.Event) void {
+    perf.noteSnapshot(0, 1);
     if (!self.running) return;
     const event_ns = self.eventElapsedNs(event.timestamp_ns);
 
@@ -1074,6 +1075,7 @@ pub fn consumeCpuSnapshot(
     cpu_ns: u64,
     timestamp_ns: u64,
 ) void {
+    perf.noteSnapshot(1, 0);
     if (!self.running) return;
     const index = self.liveIndex(pid) orelse return;
     const observed_ns = self.eventElapsedNs(timestamp_ns);

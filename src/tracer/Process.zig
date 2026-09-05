@@ -7,6 +7,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.process);
 
+const perf = @import("../perf.zig");
+
 const Process = @This();
 
 pid: std.posix.pid_t,
@@ -257,6 +259,7 @@ pub fn recordCpuSnapshot(
             self.cpu_snapshot_at_ns = end_ns;
             self.cpu_snapshot_initialized = true;
             self.cpu_peak_cores = @max(self.cpu_peak_cores, previous.averageCores());
+            perf.noteSliceGrowth(true);
             return;
         }
     }
@@ -274,6 +277,7 @@ pub fn recordCpuSnapshot(
         self.cpu_peak_cores,
         self.cpu_slices.items[self.cpu_slices.items.len - 1].averageCores(),
     );
+    perf.noteSliceGrowth(false);
 }
 
 /// Recomputes CPU slice bands and peak occupancy from canonical slice triples.

@@ -425,7 +425,6 @@ pub fn main(init: std.process.Init) !void {
 
         if (session.running) {
             session.update(&collector);
-            perf.noteSnapshot(collector.last_cpu_samples, collector.last_ring_events);
         }
         if (!session.running and collector_attached) {
             app.remapProcesses(session.process_remap.items);
