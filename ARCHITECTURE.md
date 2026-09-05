@@ -246,7 +246,9 @@ The UI is split between two rendering strategies:
    process's descendants. On a packed lane, its single control applies the
    same state to every top-level process block in the lane; collapsing the lane
    therefore rebuilds it at exactly one physical row high. Click-to-select
-   outlines and wheel scrolling operate over visible rows.
+   outlines and wheel scrolling operate over visible rows. The header control
+   collapses a fully expanded tree; if any branch is collapsed, it expands all
+   branches instead.
    This hybrid keeps the graph pixel-precise without fighting a retained-mode
    layout engine.
 

@@ -1442,7 +1442,7 @@ fn renderTimeline(
     if (clicked and over_master_button) process_tree.toggleAllRowsCollapsed(app);
     paintCollapseButton(
         master_button,
-        process_tree.allCollapsibleRowsCollapsed(app),
+        process_tree.anyCollapsibleRowCollapsed(app),
         over_master_button,
     );
     const view_span = @max(window.span_ns, 1);
@@ -2374,14 +2374,14 @@ test "master collapse button toggles every collapsible row" {
     defer app.deinit();
     try process_tree.ensureProcessTree(&app, &session);
 
-    try testing.expect(!process_tree.allCollapsibleRowsCollapsed(&app));
+    try testing.expect(!process_tree.anyCollapsibleRowCollapsed(&app));
     process_tree.toggleAllRowsCollapsed(&app);
-    try testing.expect(process_tree.allCollapsibleRowsCollapsed(&app));
+    try testing.expect(process_tree.anyCollapsibleRowCollapsed(&app));
     try testing.expect(process_tree.isCollapsed(&app, 0));
     try testing.expect(process_tree.isCollapsed(&app, 1));
 
     process_tree.toggleAllRowsCollapsed(&app);
-    try testing.expect(!process_tree.allCollapsibleRowsCollapsed(&app));
+    try testing.expect(!process_tree.anyCollapsibleRowCollapsed(&app));
     try testing.expect(!process_tree.isCollapsed(&app, 0));
     try testing.expect(!process_tree.isCollapsed(&app, 1));
 }
@@ -2567,6 +2567,7 @@ test {
     _ = @import("App.zig");
     _ = @import("text.zig");
     _ = @import("process_info.zig");
+    _ = @import("process_tree.zig");
     _ = @import("theme.zig");
     _ = @import("perf.zig");
 }
