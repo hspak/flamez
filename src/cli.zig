@@ -100,7 +100,7 @@ pub fn parse(arguments: []const []const u8) ParseError!Parsed {
         break;
     }
 
-    const mode_count = @intFromBool(output_path != null) +
+    const mode_count = @as(u2, @intFromBool(output_path != null)) +
         @intFromBool(import_path != null) +
         @intFromBool(analyze_path != null);
     if (mode_count > 1) return error.ConflictingModes;
