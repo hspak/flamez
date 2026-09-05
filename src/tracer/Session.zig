@@ -224,7 +224,7 @@ pub fn start(
     }
 }
 
-/// Terminates and reaps a live target, then reaches the normal finished boundary.
+/// Closes capture before terminating and reaping a live target.
 /// Calling this on an idle session is harmless.
 pub fn stop(self: *Session, collector: *capture.Collector) void {
     if (!self.running) return;
@@ -232,6 +232,12 @@ pub fn stop(self: *Session, collector: *capture.Collector) void {
         signals.disarmTargetGroup();
         signals.clearTrackedPids();
     }
+    // Freeze observations before our signals generate exit events. Those exits
+    // belong to teardown; live records retain partial CPU and a clipped lifetime.
+    collector.flushEvents(self.captureSink());
+    collector.snapshotCpu(self.captureSink());
+    self.mergeCollectorLoss(collector.lost_events);
+    const boundary_ns = self.observedRootEndNs() orelse self.nowElapsedNs();
     const pgid = signals.armedTargetPgid();
     signals.termTargetTree(pgid);
     // `Child.kill` sends TERM and then waits without a timeout. Sweep the
@@ -251,7 +257,9 @@ pub fn stop(self: *Session, collector: *capture.Collector) void {
             }
         }
     }
-    self.finishRootCapture(collector, null);
+    self.elapsed_ns = boundary_ns;
+    self.last_cpu_sample_ns = boundary_ns;
+    self.onRootExited(null);
 }
 
 fn abort(self: *Session) void {

@@ -110,7 +110,9 @@ Owns the capture and replay model independently of the UI and JSON formats:
     uses the same mapping to preserve selection and collapse state. Tracked-process
     state is cleared and the collector is detached.
     Natural exits distinguish a final CPU total from a partial last sample; a
-    user-forced Stop always retains the last available sample.
+    user-forced Stop flushes observations and samples CPU before sending teardown
+    signals. Processes still live at that boundary remain capture-clipped with
+    partial CPU; the exits caused by Stop are not imported as natural exits.
 
 ### Capture and process-operation boundary
 
