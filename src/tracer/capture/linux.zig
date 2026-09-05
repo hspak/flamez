@@ -116,8 +116,9 @@ fn supported() bool {
 pub const Collector = struct {
     /// Owned libbpf handle; `deinit` closes it when non-null.
     handle: ?*Handle = null,
-    /// Latest cumulative count of kernel-side event or accounting loss.
+    /// Cumulative kernel loss plus failed userspace CPU snapshots.
     lost_events: u64 = 0,
+    kernel_loss_seen: u64 = 0,
     diagnostic_buffer: [512]u8 = [_]u8{0} ** 512,
     diagnostic_len: usize = 0,
     cpu_snapshot_error: c_int = 0,
@@ -174,7 +175,7 @@ pub const Collector = struct {
         }
     }
 
-    /// Returns collector-owned initialization diagnostics.
+    /// Returns collector-owned initialization or capture diagnostics.
     pub fn diagnosticSlice(self: *const Collector) []const u8 {
         return self.diagnostic_buffer[0..self.diagnostic_len];
     }
@@ -225,12 +226,13 @@ pub const Collector = struct {
             if (self.handle) |handle| {
                 self.last_ring_events = flamez_ebpf_poll(handle);
                 const lost = flamez_ebpf_lost_events(handle);
-                if (lost > self.lost_events) {
+                if (lost > self.kernel_loss_seen) {
                     log.warn(
                         "eBPF capture dropped {d} events or accounting updates",
-                        .{lost - self.lost_events},
+                        .{lost - self.kernel_loss_seen},
                     );
-                    self.lost_events = lost;
+                    self.lost_events +|= lost - self.kernel_loss_seen;
+                    self.kernel_loss_seen = lost;
                 }
             }
         }
@@ -259,7 +261,11 @@ pub const Collector = struct {
         }
         self.cpu_snapshot_error = snapshot_result;
         self.last_cpu_samples = if (snapshot_result == 0) count else 0;
-        if (snapshot_result != 0) return;
+        if (snapshot_result != 0) {
+            self.lost_events +|= 1;
+            self.setDiagnostic("a CPU accounting snapshot failed; capture is incomplete");
+            return;
+        }
         // The C shim owns this buffer until the next snapshot or collector teardown.
         const samples = (samples_ptr orelse return)[0..count];
         for (samples) |sample| {
@@ -400,6 +406,13 @@ test "final thread CPU includes io workers without sched fork events" {
 test "final thread CPU survives scheduling exec and PID reuse" {
     if (comptime !supported()) return error.SkipZigTest;
     try std.testing.expectEqual(@as(c_int, 0), flamez_bpf_test_thread_lifecycle());
+}
+
+extern fn flamez_ebpf_test_failed_batch() c_int;
+
+test "failed CPU map batch does not consume uninitialized entries" {
+    if (comptime !supported()) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 0), flamez_ebpf_test_failed_batch());
 }
 
 extern fn flamez_ebpf_test_validate_object(

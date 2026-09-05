@@ -102,6 +102,9 @@ All lifecycle producers have a bounded queue or ring and expose known loss to
 - The macOS fallback uses a 16 MiB pending-event budget, including owned argv
   capacity.
 
+A failed Linux CPU snapshot also counts as known loss, including a failed final
+read. The persisted session retains that incompleteness after replay.
+
 These limits protect Flamez from unbounded producer memory during a fork/exec
 burst. They are correctness boundaries as well as performance bounds: overflow
 is reported rather than hidden.

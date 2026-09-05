@@ -186,7 +186,8 @@ not used because the verifier rejects it for this program type. The C shim
 batch-reads both maps (256 entries at a time), indexes process totals in a
 reusable hash table, adds still-running intervals, and delivers the borrowed
 `(tgid, cpu_ns)` array plus its snapshot timestamp to Zig. Idle thread entries
-are skipped. Snapshot scratch storage grows geometrically with the number of live
+are skipped. Only successful batches and the terminal `ENOENT` batch are
+consumed; other errors discard the snapshot before reading its output entries. Snapshot scratch storage grows geometrically with the number of live
 processes and is reused across frames.
 
 Zig samples on the session cadence, independently of rendering, and once more
@@ -213,6 +214,13 @@ the child, so a later exec, grandchild fork, or exit can recover the missing
 node. The final-exit hook always retires its own map entry. Userspace also
 recovers an unknown parent/exec/exit under the session root rather than
 silently hiding a subtree.
+
+Userspace CPU snapshot failures also increment the collector's cumulative loss
+count, separately from the kernel counter baseline. `Session` merges these
+failures immediately and at finalization, so a failed final read remains visible
+as an incomplete capture after saving and replay. The previous partial CPU total
+is retained for surviving descendants. The diagnostic explains the failure;
+repeated successful ring polls cannot erase the userspace loss count.
 
 The lifecycle callback accepts only the three known event kinds, exact sizes
 for fork/exit, and a validated header-plus-payload size for exec before passing

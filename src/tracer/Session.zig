@@ -287,6 +287,7 @@ pub fn update(self: *Session, collector: *capture.Collector) void {
     if (due) {
         perf.enter(.cpu_snapshot);
         collector.snapshotCpu(self.captureSink());
+        self.mergeCollectorLoss(collector.lost_events);
         self.last_cpu_sample_ns = self.elapsed_ns;
     }
     perf.leave();
@@ -2409,4 +2410,43 @@ test "analysis accepts a child outliving its intermediate parent" {
     try testing.expectEqual(@as(i64, 4), processes[2].object.get("wall_time_ns").?.integer);
     try testing.expectEqual(@as(i64, 3), processes[0].object.get("inclusive_process_count").?.integer);
     try testing.expect(std.mem.indexOf(u8, writer.written(), "complete_child_containment") == null);
+}
+
+extern fn flamez_ebpf_test_empty() ?*anyopaque;
+
+test "failed final CPU snapshot persists loss for surviving descendants" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var session = try boundaryTestSession(testing.allocator);
+    defer session.deinit();
+    var collector: capture.Collector = .{};
+    defer collector.deinit();
+    collector.handle = @ptrCast(flamez_ebpf_test_empty() orelse return error.OutOfMemory);
+    session.consumeEvent(forkEvent(2_000_000_001, 2_000_000_000, 2, "child"));
+    session.consumeCpuSnapshot(2_000_000_001, 3, 8);
+    session.consumeEvent(exitEvent(2_000_000_000, 10, "root", 1));
+    session.finishRootCapture(&collector, null);
+
+    try testing.expect(session.finished);
+    try testing.expect(session.isIncomplete());
+    try testing.expectEqual(@as(u64, 1), session.loss_count);
+    try testing.expectEqual(@as(usize, 0), collector.last_cpu_samples);
+    const child = session.processes.items[1];
+    try testing.expectEqual(@as(u64, 3), child.cpu_time_ns);
+    try testing.expectEqual(Process.EndKind.capture_clipped, child.end_kind);
+    try testing.expect(!child.cpu_final);
+    collector.pollEvents(session.captureSink());
+    session.mergeCollectorLoss(collector.lost_events);
+    try testing.expectEqual(@as(u64, 1), session.loss_count);
+
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+    try session_file.write(testing.allocator, &session, &output.writer);
+    var reader: std.Io.Reader = .fixed(output.written());
+    var diagnostics: session_file.Diagnostics = .{};
+    var replay = try session_file.read(testing.allocator, testing.io, &reader, &diagnostics);
+    defer replay.deinit();
+    try testing.expect(replay.isIncomplete());
+    try testing.expectEqual(@as(u64, 1), replay.loss_count);
+    try testing.expect(!replay.processes.items[1].cpu_final);
 }

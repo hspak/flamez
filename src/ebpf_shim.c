@@ -4,6 +4,7 @@
 #include <bpf/libbpf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/bpf.h>
 #include <linux/capability.h>
 #include <stdarg.h>
@@ -45,6 +46,9 @@ struct flamez_cpu_index_slot {
 };
 
 struct flamez_ebpf {
+#if FLAMEZ_CAPTURE_TEST
+    int test_empty;
+#endif
     struct bpf_object *object;
     void *object_bytes;
     struct bpf_link **links;
@@ -630,6 +634,10 @@ int flamez_ebpf_drop_capabilities(void)
 
 int flamez_ebpf_poll(struct flamez_ebpf *collector)
 {
+#if FLAMEZ_CAPTURE_TEST
+    if (collector->test_empty)
+        return 0;
+#endif
     return ring_buffer__poll(collector->ring, 0);
 }
 
@@ -761,7 +769,9 @@ static int read_process_cpu_totals(struct flamez_ebpf *collector, size_t *total_
         result = bpf_map_lookup_batch(collector->process_cpu_fd, in_batch, &out_batch,
                                       keys, values, &count, &opts);
         lookup_errno = errno;
-        if (result != 0 && lookup_errno == EFAULT)
+        /* Only ENOENT is a successful terminal batch. Other errors may leave
+         * count unchanged, so none of the output entries are safe to consume. */
+        if (result != 0 && lookup_errno != ENOENT)
             return result < 0 ? result : -lookup_errno;
         capacity_result = ensure_cpu_total_capacity(collector, *total_count + count);
         if (capacity_result != 0)
@@ -808,7 +818,9 @@ static int add_running_cpu(struct flamez_ebpf *collector, size_t total_count,
                                       in_batch, &out_batch, keys, values,
                                       &count, &opts);
         lookup_errno = errno;
-        if (result != 0 && lookup_errno == EFAULT)
+        /* Only ENOENT is a successful terminal batch. Other errors may leave
+         * count unchanged, so none of the output entries are safe to consume. */
+        if (result != 0 && lookup_errno != ENOENT)
             return result < 0 ? result : -lookup_errno;
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
             return -errno;
@@ -924,6 +936,33 @@ void flamez_ebpf_close(struct flamez_ebpf *collector)
 }
 
 #if FLAMEZ_CAPTURE_TEST
+/* A real shim with unavailable maps exercises snapshot failure without BPF
+ * privileges. Only the empty lifecycle poll is substituted. */
+struct flamez_ebpf *flamez_ebpf_test_empty(void)
+{
+    struct flamez_ebpf *collector = calloc(1, sizeof(*collector));
+
+    if (!collector)
+        return NULL;
+    collector->test_empty = 1;
+    collector->counters_fd = -1;
+    collector->process_cpu_fd = -1;
+    collector->running_threads_fd = -1;
+    collector->tracked_pids_fd = -1;
+    return collector;
+}
+
+int flamez_ebpf_test_failed_batch(void)
+{
+    struct flamez_ebpf collector = { .process_cpu_fd = INT_MAX };
+    size_t count = 0;
+    int result = read_process_cpu_totals(&collector, &count);
+    int valid = result != 0 && count == 0 && collector.cpu_totals == NULL;
+
+    free(collector.cpu_totals);
+    return valid ? 0 : 1;
+}
+
 /* Opening and validating ELF metadata needs no BPF privileges. */
 int flamez_ebpf_test_validate_object(const char *path, int writable,
                                      char *err, size_t err_size)
