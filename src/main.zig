@@ -2561,9 +2561,12 @@ test "GUI save skips an existing default without replacing it" {
     try testing.expect(imported.finished);
 }
 
-// Pull child files into this binary so their `test` blocks run here too
-// (Zig collects `test` blocks from each step's root source file only).
+// Imports used only by main are not analyzed by the test runner.
 test {
+    _ = cli;
+    _ = tracer;
+    _ = page_layout;
+    _ = detail_pane;
     _ = @import("App.zig");
     _ = @import("text.zig");
     _ = @import("process_info.zig");

@@ -638,7 +638,7 @@ an orderly boundary exists.
   Raw tracepoints do not read tracingfs IDs, so no DAC capability is granted.
   The dev
   artifact `zig-out/bin/flamez` intentionally stays unprivileged.
-- **macOS build graph**: Clay, raylib, the application, and both test roots
+- **macOS build graph**: Clay, raylib, the application, and the complete test root
   target Apple silicon (`aarch64-macos`); `src/macos_shim.c` and
   `src/macos_es_shim.c` are compiled only into macOS artifacts. The pinned
   framework package supplies Apple SDK headers and libraries.
