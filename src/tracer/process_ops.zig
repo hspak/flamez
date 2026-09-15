@@ -2,11 +2,12 @@
 
 const builtin = @import("builtin");
 
-const implementation = switch (builtin.os.tag) {
-    .linux => @import("process_ops/linux.zig"),
-    .macos => @import("process_ops/macos.zig"),
-    else => @compileError("process operations are implemented only for Linux and macOS"),
-};
+const implementation = if (builtin.os.tag == .linux)
+    @import("process_ops/linux.zig")
+else if (builtin.os.tag == .macos)
+    @import("process_ops/macos.zig")
+else
+    @compileError("process operations are implemented only for Linux and macOS");
 
 /// Result of a nonblocking root-process wait.
 pub const WaitNowait = implementation.WaitNowait;

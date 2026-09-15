@@ -11,17 +11,22 @@ payload: Payload,
 
 /// Closed set of lifecycle observations accepted by a capture session.
 pub const Payload = union(enum) {
-    fork: Fork,
+    fork: struct {
+        pid: std.posix.pid_t,
+        parent_pid: std.posix.pid_t,
+        /// Fork-time child task name, which may be inherited from a named parent thread.
+        name: []const u8,
+    },
     exec: Exec,
-    exit: Exit,
-};
-
-/// A process admitted beneath an already tracked parent.
-pub const Fork = struct {
-    pid: std.posix.pid_t,
-    parent_pid: std.posix.pid_t,
-    /// Fork-time child task name, which may be inherited from a named parent thread.
-    name: []const u8,
+    exit: struct {
+        pid: std.posix.pid_t,
+        /// Kernel process name, borrowed for the delivery callback.
+        name: []const u8,
+        /// Latest cumulative self CPU for the process and all of its threads.
+        cpu_ns: u64,
+        /// Whether `cpu_ns` is the final total observed at natural process exit.
+        cpu_final: bool = true,
+    },
 };
 
 /// Replacement of a tracked process image.
@@ -48,15 +53,4 @@ pub const Exec = struct {
 pub const MetadataSource = enum {
     kernel,
     process_inspection,
-};
-
-/// Final exit of a tracked process thread group.
-pub const Exit = struct {
-    pid: std.posix.pid_t,
-    /// Kernel process name, borrowed for the delivery callback.
-    name: []const u8,
-    /// Latest cumulative self CPU for the process and all of its threads.
-    cpu_ns: u64,
-    /// Whether `cpu_ns` is the final total observed at natural process exit.
-    cpu_final: bool = true,
 };

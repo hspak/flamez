@@ -25,8 +25,19 @@ flamez -i trace-data-output.json
 
 ## Building
 
+Use Zig 0.16.0, matching `build.zig.zon`.
+
 ```sh
 zig build
 zig build -Dfps-counter=true  # enable builtin FPS counter
 zig build -Dmsaa=true         # enable MSAAx4
+```
+
+## Checks
+
+```sh
+zig fmt --check build.zig build.zig.zon src
+zig build test
+zig build test -Doptimize=ReleaseSafe -Dperf-telemetry=true -Dfps-counter=true
+zig build test-compile -Dtarget=aarch64-macos
 ```

@@ -34,16 +34,18 @@ pub const Architecture = enum {
 pub fn capture(io: std.Io) CaptureEnvironment {
     var environment: CaptureEnvironment = .{
         .started_at_unix_seconds = std.Io.Clock.real.now(io).toSeconds(),
-        .host_os = switch (builtin.os.tag) {
-            .linux => .linux,
-            .macos => .macos,
-            else => .unknown,
-        },
-        .architecture = switch (builtin.cpu.arch) {
-            .x86_64 => .x86_64,
-            .aarch64 => .aarch64,
-            else => .unknown,
-        },
+        .host_os = if (comptime builtin.os.tag == .linux)
+            .linux
+        else if (comptime builtin.os.tag == .macos)
+            .macos
+        else
+            .unknown,
+        .architecture = if (comptime builtin.cpu.arch == .x86_64)
+            .x86_64
+        else if (comptime builtin.cpu.arch == .aarch64)
+            .aarch64
+        else
+            .unknown,
     };
     environment.setFlamezVersion(build_options.version);
     environment.setFlamezBuildZigVersion(builtin.zig_version_string);

@@ -1,7 +1,8 @@
 //! Explicit capture, output, import, and analysis command-line modes.
 
 const std = @import("std");
-const Session = @import("tracer/Session.zig");
+const tracer = @import("tracer.zig");
+const Session = tracer.Session;
 
 /// Mutually exclusive application modes selected by Flamez flags.
 pub const Mode = enum {
@@ -14,8 +15,8 @@ pub const Mode = enum {
 /// Borrowed result of parsing arguments after the executable name.
 pub const Parsed = struct {
     mode: Mode,
-    path: ?[]const u8 = null,
-    target: []const []const u8 = &.{},
+    path: ?[]const u8,
+    target: []const []const u8,
 };
 
 /// Usage failures reported before collector or GUI initialization.
@@ -107,19 +108,35 @@ pub fn parse(arguments: []const []const u8) ParseError!Parsed {
     const target = if (target_start) |start| arguments[start..] else arguments[arguments.len..];
     if (import_path) |path| {
         if (target.len != 0) return error.ImportRejectsTarget;
-        return .{ .mode = .import_file, .path = path };
+        return .{
+            .mode = .import_file,
+            .path = path,
+            .target = &.{},
+        };
     }
     if (analyze_path) |path| {
         if (target.len != 0) return error.AnalyzeRejectsTarget;
         if (std.mem.eql(u8, path, "-")) return error.AnalyzeNeedsFile;
-        return .{ .mode = .analyze_file, .path = path };
+        return .{
+            .mode = .analyze_file,
+            .path = path,
+            .target = &.{},
+        };
     }
     if (output_path) |path| {
         if (target.len == 0) return error.OutputNeedsTarget;
-        return .{ .mode = .capture_file, .path = path, .target = target };
+        return .{
+            .mode = .capture_file,
+            .path = path,
+            .target = target,
+        };
     }
     if (target.len == 0) return error.MissingTarget;
-    return .{ .mode = .capture_gui, .target = target };
+    return .{
+        .mode = .capture_gui,
+        .path = null,
+        .target = target,
+    };
 }
 
 /// Writes the sibling `analyzed-<basename>` path into caller-owned storage.
@@ -147,14 +164,33 @@ pub fn captureExitCode(session: *const Session) u8 {
 }
 
 test "output parsing stops at double dash" {
-    const parsed = try parse(&.{ "-o", "a", "--", "zig", "-o", "b" });
+    const parsed = try parse(&.{
+        "-o",
+        "a",
+        "--",
+        "zig",
+        "-o",
+        "b",
+    });
     try std.testing.expectEqual(Mode.capture_file, parsed.mode);
     try std.testing.expectEqualStrings("a", parsed.path.?);
-    try std.testing.expectEqualSlices([]const u8, &.{ "zig", "-o", "b" }, parsed.target);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{
+            "zig",
+            "-o",
+            "b",
+        },
+        parsed.target,
+    );
 }
 
 test "long output equals form selects stdout" {
-    const parsed = try parse(&.{ "--output=-", "make", "-j8" });
+    const parsed = try parse(&.{
+        "--output=-",
+        "make",
+        "-j8",
+    });
     try std.testing.expectEqual(Mode.capture_file, parsed.mode);
     try std.testing.expectEqualStrings("-", parsed.path.?);
     try std.testing.expectEqualSlices([]const u8, &.{ "make", "-j8" }, parsed.target);
@@ -163,11 +199,20 @@ test "long output equals form selects stdout" {
 test "import rejects output and extra positionals" {
     try std.testing.expectError(
         error.ConflictingModes,
-        parse(&.{ "-i", "capture.json", "-o", "other.json" }),
+        parse(&.{
+            "-i",
+            "capture.json",
+            "-o",
+            "other.json",
+        }),
     );
     try std.testing.expectError(
         error.ImportRejectsTarget,
-        parse(&.{ "-i", "capture.json", "extra" }),
+        parse(&.{
+            "-i",
+            "capture.json",
+            "extra",
+        }),
     );
 }
 
@@ -193,7 +238,11 @@ test "analyze accepts a file path and rejects targets or stdin" {
 
     try std.testing.expectError(
         error.AnalyzeRejectsTarget,
-        parse(&.{ "-a", "capture.json", "extra" }),
+        parse(&.{
+            "-a",
+            "capture.json",
+            "extra",
+        }),
     );
     try std.testing.expectError(error.AnalyzeNeedsFile, parse(&.{ "-a", "-" }));
 }
@@ -201,15 +250,31 @@ test "analyze accepts a file path and rejects targets or stdin" {
 test "analyze conflicts with other modes and rejects duplicates" {
     try std.testing.expectError(
         error.ConflictingModes,
-        parse(&.{ "-a", "capture.json", "-i", "other.json" }),
+        parse(&.{
+            "-a",
+            "capture.json",
+            "-i",
+            "other.json",
+        }),
     );
     try std.testing.expectError(
         error.ConflictingModes,
-        parse(&.{ "-o", "capture.json", "-a", "other.json", "true" }),
+        parse(&.{
+            "-o",
+            "capture.json",
+            "-a",
+            "other.json",
+            "true",
+        }),
     );
     try std.testing.expectError(
         error.DuplicateAnalyze,
-        parse(&.{ "-a", "capture.json", "--analyze", "other.json" }),
+        parse(&.{
+            "-a",
+            "capture.json",
+            "--analyze",
+            "other.json",
+        }),
     );
 }
 
@@ -236,7 +301,13 @@ test "missing mode values and targets are usage errors" {
     try std.testing.expectError(error.OutputNeedsTarget, parse(&.{ "-o", "capture.json" }));
     try std.testing.expectError(
         error.DuplicateOutput,
-        parse(&.{ "-o", "one.json", "--output", "two.json", "true" }),
+        parse(&.{
+            "-o",
+            "one.json",
+            "--output",
+            "two.json",
+            "true",
+        }),
     );
 }
 

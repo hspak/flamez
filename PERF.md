@@ -148,7 +148,7 @@ expected constant-time lookup. This replaced the earlier sort plus repeated
 binary searches.
 
 The completed array, count, and one snapshot timestamp cross into Zig once.
-`capture/linux.zig` iterates the borrowed array directly; there is no
+`capture/Linux.zig` iterates the borrowed array directly; there is no
 per-process C callback and no copy into a second Zig snapshot buffer. Lifecycle
 polling uses `ring_buffer__poll(..., 0)`, so an empty poll never blocks the UI.
 
@@ -177,7 +177,7 @@ final drain so normal frame timing cannot strand already-enqueued events.
 
 ### kqueue/libproc fallback mode
 
-`src/tracer/capture/macos.zig` runs fallback discovery on a dedicated worker
+`src/tracer/capture/Macos.zig` runs fallback discovery on a dedicated worker
 instead of the render thread. The worker blocks in `kevent` with a 4 ms
 recovery timeout and reads up to 256 events at once.
 

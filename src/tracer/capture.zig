@@ -30,14 +30,15 @@ pub const ArmLaunchError = error{
 };
 
 /// Failure to register a spawned root with the active backend.
-pub const TrackRootError = error{LaunchTrackingRejected};
+pub const TrackRootError = std.mem.Allocator.Error || error{LaunchTrackingRejected};
 
 /// Compile-time backend choice for the current target.
-pub const backend: Backend = switch (builtin.os.tag) {
-    .linux => .linux_ebpf,
-    .macos => .macos,
-    else => @compileError("capture selection is implemented only for Linux and macOS"),
-};
+pub const backend: Backend = if (builtin.os.tag == .linux)
+    .linux_ebpf
+else if (builtin.os.tag == .macos)
+    .macos
+else
+    @compileError("capture selection is implemented only for Linux and macOS");
 
 /// Fidelity shown before a runtime-selecting collector arms its first launch.
 pub const default_fidelity: Fidelity = switch (backend) {
@@ -46,17 +47,16 @@ pub const default_fidelity: Fidelity = switch (backend) {
     .unsupported => .unavailable,
 };
 
-const implementation = switch (backend) {
-    .linux_ebpf => @import("capture/linux.zig"),
-    .macos => @import("capture/macos.zig"),
-    .unsupported => @import("capture/unsupported.zig"),
+pub const Collector = switch (backend) {
+    .linux_ebpf => @import("capture/Linux.zig"),
+    .macos => @import("capture/Macos.zig"),
+    .unsupported => @import("capture/Unsupported.zig"),
 };
-
-/// Target-specific collector implementing the common session-facing contract.
-pub const Collector = implementation.Collector;
 
 /// Backend-independent delivery target. Events and borrowed slices are valid
 /// only for the duration of the callback.
+/// The C polling bridges erase the receiver type; the target is supplied after
+/// collector initialization and remains borrowed only for the synchronous poll.
 pub const Sink = struct {
     /// Opaque receiver passed unchanged to both callbacks.
     ptr: *anyopaque,
@@ -71,12 +71,7 @@ pub const Sink = struct {
     }
 
     /// Delivers a cumulative CPU total and its monotonic observation timestamp.
-    pub fn cpuSample(
-        self: Sink,
-        pid: std.posix.pid_t,
-        total_ns: u64,
-        timestamp_ns: u64,
-    ) void {
+    pub fn cpuSample(self: Sink, pid: std.posix.pid_t, total_ns: u64, timestamp_ns: u64) void {
         self.cpu_sample_fn(self.ptr, pid, total_ns, timestamp_ns);
     }
 };
@@ -85,7 +80,7 @@ extern fn flamez_macos_test_cpu_identity(by_version: c_int, scenario: c_uint) c_
 
 test {
     _ = Event;
-    _ = implementation;
+    _ = Collector;
 }
 
 test "unsupported collector reports the target operating system" {
@@ -103,13 +98,19 @@ test "unsupported collector reports the target operating system" {
 test "macOS final CPU rejects reused identities before and during the read" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     for (0..8) |scenario| {
-        try std.testing.expectEqual(@as(c_int, 0), flamez_macos_test_cpu_identity(0, @intCast(scenario)));
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            flamez_macos_test_cpu_identity(0, @intCast(scenario)),
+        );
     }
 }
 
 test "macOS final CPU binds Endpoint Security reads to the audit version" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     for (0..8) |scenario| {
-        try std.testing.expectEqual(@as(c_int, 0), flamez_macos_test_cpu_identity(1, @intCast(scenario)));
+        try std.testing.expectEqual(
+            @as(c_int, 0),
+            flamez_macos_test_cpu_identity(1, @intCast(scenario)),
+        );
     }
 }

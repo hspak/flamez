@@ -5,9 +5,7 @@
 const std = @import("std");
 const rl = @import("raylib");
 
-const log = std.log.scoped(.text);
-
-pub const text_buffer_capacity = 8192;
+pub const buffer_capacity = 8192;
 
 pub const ui_glyph_spacing: f32 = 0;
 
@@ -51,20 +49,22 @@ pub fn formatDuration(ns: u64, buffer: []u8) []const u8 {
 }
 
 /// Measures a plain slice through raylib's sentinel-based API.
-pub fn measureTextSlice(font: rl.Font, value: []const u8, size: f32) rl.Vector2 {
-    var buffer: [text_buffer_capacity]u8 = undefined;
+/// Asserts through `nullTerminate` that `value.len` is below `buffer_capacity`.
+pub fn measure(font: rl.Font, value: []const u8, size: f32) rl.Vector2 {
+    var buffer: [buffer_capacity]u8 = undefined;
     return rl.measureTextEx(font, nullTerminate(value, &buffer), size, ui_glyph_spacing);
 }
 
 /// Draws a plain slice through raylib's sentinel-based API.
-pub fn drawTextSlice(
+/// Asserts through `nullTerminate` that `value.len` is below `buffer_capacity`.
+pub fn draw(
     font: rl.Font,
     value: []const u8,
     position: rl.Vector2,
     size: f32,
     color: rl.Color,
 ) void {
-    var buffer: [text_buffer_capacity]u8 = undefined;
+    var buffer: [buffer_capacity]u8 = undefined;
     rl.drawTextEx(font, nullTerminate(value, &buffer), position, size, ui_glyph_spacing, color);
 }
 
@@ -72,7 +72,7 @@ pub fn drawTextSlice(
 pub fn drawClippedAt(value: []const u8, options: ClipLineOptions) void {
     const max_width = options.right - options.x.*;
     if (max_width <= 4 or value.len == 0) return;
-    options.x.* += drawTextSliceClippedWidth(value, .{
+    options.x.* += drawClippedWidth(value, .{
         .font = options.font,
         .position = .{ .x = options.x.*, .y = options.y },
         .size = options.size,
@@ -82,13 +82,13 @@ pub fn drawClippedAt(value: []const u8, options: ClipLineOptions) void {
 }
 
 /// Draws the longest byte prefix that fits within `options.max_width`.
-pub fn drawTextSliceClipped(value: []const u8, options: ClipOptions) void {
-    _ = drawTextSliceClippedWidth(value, options);
+pub fn drawClipped(value: []const u8, options: ClipOptions) void {
+    _ = drawClippedWidth(value, options);
 }
 
-fn drawTextSliceClippedWidth(value: []const u8, options: ClipOptions) f32 {
+fn drawClippedWidth(value: []const u8, options: ClipOptions) f32 {
     if (options.max_width <= 4 or value.len == 0) return 0;
-    var buffer: [text_buffer_capacity]u8 = undefined;
+    var buffer: [buffer_capacity]u8 = undefined;
     const max_len: usize = @min(value.len, buffer.len - 1);
     var low: usize = 0;
     var high: usize = max_len;

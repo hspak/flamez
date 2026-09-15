@@ -2,8 +2,6 @@
 
 const std = @import("std");
 
-const log = std.log.scoped(.build);
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -58,11 +56,7 @@ pub fn build(b: *std.Build) void {
         "perf-telemetry",
         "Log one performance summary line per second and a session total",
     ) orelse false;
-    const enable_msaa = b.option(
-        bool,
-        "msaa",
-        "Enable 4x multisample anti-aliasing",
-    ) orelse true;
+    const enable_msaa = b.option(bool, "msaa", "Enable 4x multisample anti-aliasing") orelse true;
     const require_macos_endpoint_security = b.option(
         bool,
         "macos-require-endpoint-security",
@@ -218,11 +212,7 @@ fn addLinuxCaptureTests(b: *std.Build, module: *std.Build.Module) void {
     });
 }
 
-fn addMacosProcessShim(
-    b: *std.Build,
-    module: *std.Build.Module,
-    test_build: bool,
-) void {
+fn addMacosProcessShim(b: *std.Build, module: *std.Build.Module, test_build: bool) void {
     module.addCSourceFile(.{
         .file = b.path("src/macos_cpu.c"),
         .flags = &.{
@@ -279,10 +269,7 @@ fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module) void {
 // Zig 0.16 then archives the resolved .so files, which LLD rejects as
 // non-relocatable archive members. Keep raylib static, but make those system
 // libraries transitive dependencies of the Zig module instead.
-fn moveRaylibLinuxLibraries(
-    artifact: *std.Build.Step.Compile,
-    module: *std.Build.Module,
-) void {
+fn moveRaylibLinuxLibraries(artifact: *std.Build.Step.Compile, module: *std.Build.Module) void {
     std.debug.assert(artifact.isStaticLibrary());
     var retained: usize = 0;
     for (artifact.root_module.link_objects.items) |object| switch (object) {
@@ -293,7 +280,13 @@ fn moveRaylibLinuxLibraries(
             .preferred_link_mode = library.preferred_link_mode,
             .search_strategy = library.search_strategy,
         }),
-        else => {
+        .static_path,
+        .other_step,
+        .assembly_file,
+        .c_source_file,
+        .c_source_files,
+        .win32_resource_file,
+        => {
             artifact.root_module.link_objects.items[retained] = object;
             retained += 1;
         },

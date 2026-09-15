@@ -3,7 +3,6 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const log = std.log.scoped(.detail_pane);
 
 const clay = @import("zclay");
 const rl = @import("raylib");
@@ -16,8 +15,8 @@ const tracer = @import("tracer.zig");
 
 const TooltipLine = process_info.TooltipLine;
 const TooltipBuilder = process_info.TooltipBuilder;
-const InfoSizes = process_info.InfoSizes;
-const buildProcessInfo = process_info.buildProcessInfo;
+const Sizes = process_info.Sizes;
+const build = process_info.build;
 const tooltip_more_marker = process_info.tooltip_more_marker;
 const tooltip_max_rows = process_info.tooltip_max_rows;
 
@@ -35,10 +34,10 @@ const ink = theme.ink;
 const muted = theme.muted;
 const toRaylibColor = theme.toRaylibColor;
 const drawClippedAt = text.drawClippedAt;
-const drawTextSlice = text.drawTextSlice;
-const drawTextSliceClipped = text.drawTextSliceClipped;
+const drawTextSlice = text.draw;
+const drawTextSliceClipped = text.drawClipped;
 const formatDuration = text.formatDuration;
-const measureTextSlice = text.measureTextSlice;
+const measureTextSlice = text.measure;
 
 pub const Input = struct {
     font: rl.Font,
@@ -65,16 +64,16 @@ const detail_resize_handle_height: f32 = 8;
 const detail_min_height: f32 = 160;
 const timeline_min_height: f32 = 180;
 
-const tooltip_sizes = InfoSizes{ .title = 14, .body = 13 };
-const detail_sizes = InfoSizes{ .title = 16, .body = 15 };
+const tooltip_sizes = Sizes{ .title = 14, .body = 13 };
+const detail_sizes = Sizes{ .title = 16, .body = 15 };
 const DetailTextPosition = App.DetailTextPosition;
 
-const DetailTextSelection = struct {
+const TextSelection = struct {
     start: DetailTextPosition,
     end: DetailTextPosition,
 };
 
-const DetailCapacity = struct {
+const Capacity = struct {
     store: usize,
     lines: usize,
 };
@@ -88,7 +87,7 @@ pub const CpuGraphRange = struct {
     }
 };
 
-fn detailCapacity(process: *const tracer.Process, metadata: []const u8) DetailCapacity {
+fn detailCapacity(process: *const tracer.Process, metadata: []const u8) Capacity {
     var store: usize = 1024;
     var lines: usize = 64;
     for (0..process.execCount()) |index| {
@@ -106,14 +105,14 @@ fn detailCapacity(process: *const tracer.Process, metadata: []const u8) DetailCa
     };
 }
 
-pub fn detailCpuGraphRange(process: *const tracer.Process, now_ns: u64) CpuGraphRange {
+pub fn cpuGraphRange(process: *const tracer.Process, now_ns: u64) CpuGraphRange {
     return .{
         .start_ns = process.start_ns,
         .end_ns = @max(process.start_ns, process.end_ns orelse now_ns),
     };
 }
 
-pub fn detailCpuGraphCoreScale(process: *const tracer.Process, host_cpu_count: usize) f64 {
+pub fn cpuGraphCoreScale(process: *const tracer.Process, host_cpu_count: usize) f64 {
     var observed_cores = process.cpu_peak_cores;
     if (observed_cores <= 0) {
         for (process.cpu_slices.items) |slice| {
@@ -124,14 +123,14 @@ pub fn detailCpuGraphCoreScale(process: *const tracer.Process, host_cpu_count: u
     return @min(@ceil(@max(observed_cores, 1)), host_cores);
 }
 
-pub fn detailCpuGraphX(range: CpuGraphRange, at_ns: u64, plot: rl.Rectangle) f32 {
+pub fn cpuGraphX(range: CpuGraphRange, at_ns: u64, plot: rl.Rectangle) f32 {
     const clipped_ns = std.math.clamp(at_ns, range.start_ns, range.end_ns);
     const offset: f64 = @floatFromInt(clipped_ns -| range.start_ns);
     const span: f64 = @floatFromInt(range.spanNs());
     return plot.x + plot.width * @as(f32, @floatCast(offset / span));
 }
 
-fn detailCpuGraphY(cores: f64, core_scale: f64, plot: rl.Rectangle) f32 {
+fn cpuGraphY(cores: f64, core_scale: f64, plot: rl.Rectangle) f32 {
     const fraction = std.math.clamp(cores / core_scale, 0, 1);
     return plot.y + plot.height * (1 - @as(f32, @floatCast(fraction)));
 }
@@ -143,10 +142,16 @@ fn drawDetailCpuGraphText(
     size: f32,
     color: rl.Color,
 ) void {
-    drawTextSlice(font, value, .{
-        .x = @round(position.x),
-        .y = @round(position.y),
-    }, size, color);
+    drawTextSlice(
+        font,
+        value,
+        .{
+            .x = @round(position.x),
+            .y = @round(position.y),
+        },
+        size,
+        color,
+    );
 }
 
 fn fillCpuGraphColumns(
@@ -157,19 +162,15 @@ fn fillCpuGraphColumns(
 ) void {
     const width = columns.len;
     @memset(columns, -1);
-    const first = tracer.Process.firstVisibleSlice(
-        slices,
-        range.start_ns,
-        range.end_ns,
-    );
+    const first = tracer.Process.firstVisibleSlice(slices, range.start_ns, range.end_ns);
     for (slices[first..]) |slice| {
         if (slice.start_ns >= range.end_ns) break;
         if (slice.end_ns <= range.start_ns) continue;
         const start_ns = @max(slice.start_ns, range.start_ns);
         const end_ns = @min(slice.end_ns, range.end_ns);
         if (end_ns <= start_ns) continue;
-        const start_x = detailCpuGraphX(range, start_ns, plot);
-        const end_x = detailCpuGraphX(range, end_ns, plot);
+        const start_x = cpuGraphX(range, start_ns, plot);
+        const end_x = cpuGraphX(range, end_ns, plot);
         var px0: usize = 0;
         if (start_x > plot.x) {
             px0 = @min(width, @as(usize, @intFromFloat(@floor(start_x - plot.x))));
@@ -205,7 +206,7 @@ fn drawDetailCpuGraph(
         detail_cpu_graph_label_size,
         toRaylibColor(ink),
     );
-    const core_scale = detailCpuGraphCoreScale(process, host_cpu_count);
+    const core_scale = cpuGraphCoreScale(process, host_cpu_count);
     var scale_buffer: [32]u8 = undefined;
     const scale_label = std.fmt.bufPrint(
         &scale_buffer,
@@ -274,7 +275,7 @@ fn drawDetailCpuGraph(
         toRaylibColor(muted),
     );
 
-    const range = detailCpuGraphRange(process, now_ns);
+    const range = cpuGraphRange(process, now_ns);
     const baseline_y = plot.y + plot.height;
     const fill_color = toRaylibColor(cpu_hot);
     const area_color = rl.Color.init(fill_color.r, fill_color.g, fill_color.b, 58);
@@ -302,29 +303,19 @@ fn drawDetailCpuGraph(
         if (cores > 0) {
             const start_x = plot.x + @as(f32, @floatFromInt(col));
             const end_x = plot.x + @as(f32, @floatFromInt(col + run));
-            const y = detailCpuGraphY(@floatCast(cores), core_scale, plot);
+            const y = cpuGraphY(@floatCast(cores), core_scale, plot);
             rl.drawRectangleRec(
                 .init(start_x, y, @max(1, end_x - start_x), baseline_y - y),
                 area_color,
             );
-            rl.drawLineEx(
-                .{ .x = start_x, .y = y },
-                .{ .x = end_x, .y = y },
-                2,
-                fill_color,
-            );
+            rl.drawLineEx(.{ .x = start_x, .y = y }, .{ .x = end_x, .y = y }, 2, fill_color);
             rl.drawLineEx(
                 .{ .x = start_x, .y = baseline_y },
                 .{ .x = start_x, .y = y },
                 2,
                 fill_color,
             );
-            rl.drawLineEx(
-                .{ .x = end_x, .y = y },
-                .{ .x = end_x, .y = baseline_y },
-                2,
-                fill_color,
-            );
+            rl.drawLineEx(.{ .x = end_x, .y = y }, .{ .x = end_x, .y = baseline_y }, 2, fill_color);
             drew_slice = true;
         }
         col += run;
@@ -413,13 +404,7 @@ pub fn renderTooltip(
             .store = &app.tooltip_store,
             .lines = &app.tooltip_lines,
         };
-        const layout = buildProcessInfo(
-            &tip,
-            session,
-            index,
-            tooltip_sizes,
-            .{},
-        );
+        const layout = build(&tip, session, index, tooltip_sizes, .{});
         app.tooltip_line_count = tip.line_count;
         app.tooltip_overflowed = tip.overflowed;
         app.tooltip_timing_line = layout.timing_line;
@@ -514,7 +499,7 @@ fn jumpToScroll(jumped: f32, travel: f32, max_scroll: f32) f32 {
     return jumped / travel * max_scroll;
 }
 
-fn clearDetailTextSelection(app: *App) void {
+fn clearTextSelection(app: *App) void {
     app.detail_selection_anchor = null;
     app.detail_selection_focus = null;
     app.detail_text_selecting = false;
@@ -576,12 +561,7 @@ fn drawDetailLinePart(
     x.* += measureTextSlice(font, value, size).x;
 }
 
-fn drawDetailLine(
-    font: rl.Font,
-    bold_font: rl.Font,
-    line: TooltipLine,
-    position: rl.Vector2,
-) void {
+fn drawDetailLine(font: rl.Font, bold_font: rl.Font, line: TooltipLine, position: rl.Vector2) void {
     var x = position.x;
     var byte_index: usize = 0;
     if (line.bold) |bold| {
@@ -623,14 +603,7 @@ fn drawDetailLine(
         );
         byte_index = highlight.end;
     }
-    drawDetailLinePart(
-        font,
-        line.text[byte_index..],
-        &x,
-        position.y,
-        line.size,
-        line.color,
-    );
+    drawDetailLinePart(font, line.text[byte_index..], &x, position.y, line.size, line.color);
 }
 
 fn detailByteAtX(font: rl.Font, bold_font: rl.Font, line: TooltipLine, x: f32) usize {
@@ -698,7 +671,7 @@ fn clampDetailPosition(app: *const App, position: DetailTextPosition) DetailText
     };
 }
 
-fn detailTextSelection(app: *const App) ?DetailTextSelection {
+fn detailTextSelection(app: *const App) ?TextSelection {
     if (app.detail_line_count == 0) return null;
     const anchor = clampDetailPosition(app, app.detail_selection_anchor orelse return null);
     const focus = clampDetailPosition(app, app.detail_selection_focus orelse return null);
@@ -709,7 +682,7 @@ fn detailTextSelection(app: *const App) ?DetailTextSelection {
         .{ .start = focus, .end = anchor };
 }
 
-fn copyDetailTextSelection(app: *App) void {
+fn copyTextSelection(app: *App) void {
     const selection = detailTextSelection(app) orelse return;
     var needed: usize = 1;
     for (selection.start.line..selection.end.line + 1) |line_index| {
@@ -726,10 +699,7 @@ fn copyDetailTextSelection(app: *App) void {
         const start = if (line_index == selection.start.line) selection.start.byte else 0;
         const end = if (line_index == selection.end.line) selection.end.byte else line.text.len;
         const amount = end - start;
-        @memcpy(
-            app.detail_clipboard[clipboard_len..][0..amount],
-            line.text[start..][0..amount],
-        );
+        @memcpy(app.detail_clipboard[clipboard_len..][0..amount], line.text[start..][0..amount]);
         clipboard_len += amount;
         if (line_index < selection.end.line and line.break_after) {
             app.detail_clipboard[clipboard_len] = '\n';
@@ -741,9 +711,9 @@ fn copyDetailTextSelection(app: *App) void {
     rl.setClipboardText(app.detail_clipboard[0..clipboard_len :0]);
 }
 
-fn drawDetailTextSelection(
+fn drawTextSelection(
     app: *const App,
-    selection: ?DetailTextSelection,
+    selection: ?TextSelection,
     font: rl.Font,
     bold_font: rl.Font,
     line_index: usize,
@@ -773,10 +743,16 @@ fn drawDetailCloseButton(font: rl.Font, mouse: rl.Vector2, box: clay.BoundingBox
 
     const label = "X";
     const measured = measureTextSlice(font, label, 11);
-    drawTextSlice(font, label, .{
-        .x = box.x + (box.width - measured.x) / 2,
-        .y = box.y + (box.height - measured.y) / 2,
-    }, 11, if (hovered) toRaylibColor(canvas) else toRaylibColor(ink));
+    drawTextSlice(
+        font,
+        label,
+        .{
+            .x = box.x + (box.width - measured.x) / 2,
+            .y = box.y + (box.height - measured.y) / 2,
+        },
+        11,
+        if (hovered) toRaylibColor(canvas) else toRaylibColor(ink),
+    );
 }
 
 fn ctrlHeld() bool {
@@ -793,11 +769,7 @@ fn rectangleRoundness(box: clay.BoundingBox, radius: f32) f32 {
     return if (shortest_side > 0) @min(1, (radius * 2) / shortest_side) else 0;
 }
 
-pub fn render(
-    app: *App,
-    session: *const tracer.Session,
-    input: Input,
-) Allocator.Error!void {
+pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator.Error!void {
     const font = input.font;
     const bold_font = input.bold_font;
     const mouse = input.mouse;
@@ -810,13 +782,13 @@ pub fn render(
         app.detail_for = null;
         app.detail_scroll_px = 0;
         app.detail_dragging = false;
-        clearDetailTextSelection(app);
+        clearTextSelection(app);
         return;
     }
     // Processes are never removed from a session, but stay defensive.
     if (selected.? >= session.processes.items.len) {
         app.selected_process = null;
-        clearDetailTextSelection(app);
+        clearTextSelection(app);
         return;
     }
     const element = clay.getElementData(.ID("DetailPane"));
@@ -869,10 +841,7 @@ pub fn render(
         .height = @max(0, box.height - header_height - 1),
     };
 
-    rl.drawRectangleRec(
-        .init(box.x, box.y, box.width, header_height),
-        toRaylibColor(panel_raised),
-    );
+    rl.drawRectangleRec(.init(box.x, box.y, box.width, header_height), toRaylibColor(panel_raised));
     rl.drawRectangleRec(
         .init(box.x, box.y - 1, box.width, 2),
         toRaylibColor(if (app.detail_resize_dragging or over_resize_handle)
@@ -903,7 +872,7 @@ pub fn render(
     if (app.detail_for != selected) {
         app.detail_for = selected;
         app.detail_scroll_px = 0;
-        clearDetailTextSelection(app);
+        clearTextSelection(app);
     }
 
     const process = &session.processes.items[index];
@@ -914,7 +883,7 @@ pub fn render(
     if (rebuild_detail) {
         const capacities = detailCapacity(process, session.metadataBytes());
         try app.ensureDetailCapacity(capacities.store, capacities.lines);
-        clearDetailTextSelection(app);
+        clearTextSelection(app);
         // Heap-backed builder storage sized in App.init: rebuild only when
         // selection, metadata, lifetime state, or wrapping width changes.
         while (true) {
@@ -924,7 +893,7 @@ pub fn render(
                 .store = app.detail_store,
                 .lines = app.detail_lines,
             };
-            const layout = buildProcessInfo(
+            const layout = build(
                 &tip,
                 session,
                 index,
@@ -946,10 +915,7 @@ pub fn render(
                 app.detail_lines.len,
                 2,
             ) catch return error.OutOfMemory;
-            try app.ensureDetailCapacity(
-                store_capacity,
-                line_capacity,
-            );
+            try app.ensureDetailCapacity(store_capacity, line_capacity);
         }
         app.detail_cache_process = selected;
         app.detail_cache_revision = process.revision;
@@ -961,11 +927,7 @@ pub fn render(
             app.detail_content_height += line_height + detail_line_gap;
         }
     }
-    const timing = process_info.formatTimingLine(
-        process,
-        session.timelineNs(),
-        &app.detail_timing,
-    );
+    const timing = process_info.formatTimingLine(process, session.timelineNs(), &app.detail_timing);
     app.detail_timing_len = timing.len;
     if (app.detail_timing_line) |timing_index| {
         if (timing_index < app.detail_line_count) {
@@ -1078,7 +1040,7 @@ pub fn render(
                 .byte = app.detail_lines[last_line].text.len,
             };
         }
-        if (rl.isKeyPressed(.c)) copyDetailTextSelection(app);
+        if (rl.isKeyPressed(.c)) copyTextSelection(app);
     }
 
     rl.beginScissorMode(
@@ -1107,22 +1069,8 @@ pub fn render(
         const line_h = app.detail_line_heights[line_index];
         if (text_y + line_h >= content.y and text_y <= content.y + content.height) {
             const text_x = content.x + pad;
-            drawDetailTextSelection(
-                app,
-                selection,
-                font,
-                bold_font,
-                line_index,
-                text_x,
-                text_y,
-                line_h,
-            );
-            drawDetailLine(
-                font,
-                bold_font,
-                line,
-                .{ .x = text_x, .y = text_y },
-            );
+            drawTextSelection(app, selection, font, bold_font, line_index, text_x, text_y, line_h);
+            drawDetailLine(font, bold_font, line, .{ .x = text_x, .y = text_y });
         }
         text_y += line_h + detail_line_gap;
         if (text_y > content.y + content.height) break;
@@ -1214,14 +1162,18 @@ test "CPU graph columns clip history and retain subpixel peaks and gaps" {
     };
     var columns: [8]f32 = undefined;
     fillCpuGraphColumns(&slices, .{ .start_ns = 10, .end_ns = 50 }, .init(42, 0, 8, 100), &columns);
-    try std.testing.expectEqualSlices(f32, &.{
-        1,
-        -1,
-        2,
-        -1,
-        28,
-        -1,
-        7,
-        -1,
-    }, &columns);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{
+            1,
+            -1,
+            2,
+            -1,
+            28,
+            -1,
+            7,
+            -1,
+        },
+        &columns,
+    );
 }

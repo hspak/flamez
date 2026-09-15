@@ -3,10 +3,13 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const CaptureEnvironment = @import("tracer/CaptureEnvironment.zig");
-const Process = @import("tracer/Process.zig");
-const Session = @import("tracer/Session.zig");
-const capture = @import("tracer/capture.zig");
+pub const ReadFileError = std.Io.File.OpenError || ReadError;
+
+const tracer = @import("tracer.zig");
+const CaptureEnvironment = tracer.CaptureEnvironment;
+const Process = tracer.Process;
+const Session = tracer.Session;
+const capture = tracer.capture;
 
 const max_argv_bytes = 6 * 1024 * 1024;
 
@@ -74,8 +77,6 @@ pub const ReadError =
         InvariantViolated,
     };
 
-pub const ReadFileError = std.Io.File.OpenError || ReadError;
-
 const max_encoded_argv_bytes = 8 * 1024 * 1024;
 
 const Text = union(enum) {
@@ -142,8 +143,10 @@ const Parser = struct {
             .true => .true,
             .false => .false,
             .null => .null,
-            .number, .allocated_number => .number,
-            .string, .allocated_string => .string,
+            .number => .number,
+            .string => .string,
+            // Reader.next borrows token bytes; allocated variants require nextAllocMax.
+            .allocated_number, .allocated_string => unreachable,
             .end_of_document => .end_of_document,
             .partial_number,
             .partial_string,
@@ -154,30 +157,30 @@ const Parser = struct {
             => return error.InvalidJson,
         };
         if (actual != expected) return error.InvalidJson;
-        switch (token) {
-            .allocated_number, .allocated_string => |bytes| self.gpa.free(bytes),
-            else => {},
-        }
     }
 
     fn text(self: *Parser, max_len: usize) ReadError!Text {
+        if (try self.peek() != .string) return error.InvalidJson;
         const token = self.tokens.nextAllocMax(self.gpa, .alloc_if_needed, max_len) catch |err|
             return mapJsonError(err);
         return switch (token) {
             .string => |bytes| .{ .borrowed = bytes },
             .allocated_string => |bytes| .{ .owned = bytes },
-            else => error.InvalidJson,
+            // The peek above restricts nextAllocMax to complete string tokens.
+            else => unreachable,
         };
     }
 
     fn integer(self: *Parser, comptime T: type) ReadError!T {
+        if (try self.peek() != .number) return error.InvalidJson;
         var value = value: {
             const token = self.tokens.nextAllocMax(self.gpa, .alloc_if_needed, 64) catch |err|
                 return mapJsonError(err);
             break :value switch (token) {
                 .number => |bytes| Text{ .borrowed = bytes },
                 .allocated_number => |bytes| Text{ .owned = bytes },
-                else => return error.InvalidJson,
+                // The peek above restricts nextAllocMax to complete number tokens.
+                else => unreachable,
             };
         };
         defer value.deinit(self.gpa);
@@ -185,11 +188,21 @@ const Parser = struct {
     }
 
     fn boolean(self: *Parser) ReadError!bool {
-        return switch (try self.next()) {
+        const value = switch (try self.peek()) {
             .true => true,
             .false => false,
-            else => error.InvalidJson,
+            .object_begin,
+            .object_end,
+            .array_begin,
+            .array_end,
+            .null,
+            .number,
+            .string,
+            .end_of_document,
+            => return error.InvalidJson,
         };
+        _ = try self.next();
+        return value;
     }
 
     fn fieldName(self: *Parser) ReadError!Text {
@@ -306,16 +319,17 @@ const Tables = struct {
             try self.argv_identity.put(gpa, range, index);
             return index;
         }
+        try self.argv_identity.ensureUnusedCapacity(gpa, 1);
         try self.argv.ensureUnusedCapacity(gpa, 1);
         const result = try self.argv_map.getOrPutContext(gpa, range, hash);
         if (result.found_existing) {
-            try self.argv_identity.put(gpa, range, result.value_ptr.*);
+            self.argv_identity.putAssumeCapacity(range, result.value_ptr.*);
             return result.value_ptr.*;
         }
         const index = self.argv.items.len;
         self.argv.appendAssumeCapacity(range);
         result.value_ptr.* = index;
-        try self.argv_identity.put(gpa, range, index);
+        self.argv_identity.putAssumeCapacity(range, index);
         return index;
     }
 
@@ -326,16 +340,17 @@ const Tables = struct {
             try self.path_identity.put(gpa, range, index);
             return index;
         }
+        try self.path_identity.ensureUnusedCapacity(gpa, 1);
         try self.paths.ensureUnusedCapacity(gpa, 1);
         const result = try self.path_map.getOrPutContext(gpa, range, hash);
         if (result.found_existing) {
-            try self.path_identity.put(gpa, range, result.value_ptr.*);
+            self.path_identity.putAssumeCapacity(range, result.value_ptr.*);
             return result.value_ptr.*;
         }
         const index = self.paths.items.len;
         self.paths.appendAssumeCapacity(range);
         result.value_ptr.* = index;
-        try self.path_identity.put(gpa, range, index);
+        self.path_identity.putAssumeCapacity(range, index);
         return index;
     }
 
@@ -350,11 +365,7 @@ const Tables = struct {
 
 /// Validates and writes one finished session as compact v1 JSON plus a newline.
 /// Validation and metadata-table preparation finish before the first output byte.
-pub fn write(
-    gpa: Allocator,
-    session: *const Session,
-    writer: *std.Io.Writer,
-) WriteError!void {
+pub fn write(gpa: Allocator, session: *const Session, writer: *std.Io.Writer) WriteError!void {
     var tables = try prepare(gpa, session);
     defer tables.deinit(gpa);
 
@@ -392,9 +403,13 @@ pub fn writeFile(
     options: WriteFileOptions,
 ) WriteFileError!void {
     const replace = options.install == .replace;
-    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
-        .replace = replace,
-    });
+    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(
+        io,
+        path,
+        .{
+            .replace = replace,
+        },
+    );
     defer atomic_file.deinit(io);
 
     var buffer: [16 * 1024]u8 = undefined;
@@ -517,7 +532,18 @@ fn readSession(parser: *Parser, io: std.Io) ReadError!Session {
 
     var checked = prepare(parser.gpa, &session) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvariantViolated,
+        error.SessionNotFinished,
+        error.InvalidSession,
+        error.UnsupportedCaptureFidelity,
+        error.InvalidTargetArgv,
+        error.InvalidProcessTopology,
+        error.InvalidProcessInterval,
+        error.InvalidProcessImage,
+        error.InvalidMetadata,
+        error.InvalidExecInterval,
+        error.InvalidCpuSlice,
+        error.StaleDerivedCache,
+        => return error.InvariantViolated,
     };
     checked.deinit(parser.gpa);
     return session;
@@ -606,7 +632,11 @@ fn parseCaptureEnvironment(parser: *Parser) ReadError!CaptureEnvironment {
 }
 
 fn parseRootExit(parser: *Parser) ReadError!Session.RootExit {
-    const Kind = enum { exited, signaled, unknown };
+    const Kind = enum {
+        exited,
+        signaled,
+        unknown,
+    };
     var kind: ?Kind = null;
     var code: ?u8 = null;
     var signal: ?u8 = null;
@@ -655,11 +685,7 @@ fn parseRootExit(parser: *Parser) ReadError!Session.RootExit {
     };
 }
 
-fn parseMetadata(
-    parser: *Parser,
-    session: *Session,
-    tables: *MetadataTables,
-) ReadError!void {
+fn parseMetadata(parser: *Parser, session: *Session, tables: *MetadataTables) ReadError!void {
     var seen: u8 = 0;
     try parser.expect(.object_begin);
     while (try parser.peek() != .object_end) {
@@ -745,7 +771,7 @@ fn parseProcesses(parser: *Parser, session: *Session) ReadError!void {
 }
 
 fn parseProcess(parser: *Parser, session: *const Session) ReadError!Process {
-    var process = Process{ .pid = 0 };
+    var process = Process.init(.{ .pid = 0, .start_ns = 0 });
     errdefer process.deinit(parser.gpa);
     var parent: ?usize = null;
     var row: ?Row = null;
@@ -858,7 +884,15 @@ fn parseRow(parser: *Parser) ReadError!Row {
             break :row .first_exec;
         },
         .object_begin => .{ .image = try parseImage(parser, false) },
-        else => error.InvalidJson,
+        .object_end,
+        .array_begin,
+        .array_end,
+        .true,
+        .false,
+        .null,
+        .number,
+        .end_of_document,
+        => error.InvalidJson,
     };
 }
 
@@ -1002,10 +1036,7 @@ fn parseMetadataSource(parser: *Parser, argv: bool) ReadError!Process.MetadataSo
     return error.InvariantViolated;
 }
 
-fn parseCpuSlices(
-    parser: *Parser,
-    slices: *std.ArrayList(Process.CpuSlice),
-) ReadError!void {
+fn parseCpuSlices(parser: *Parser, slices: *std.ArrayList(Process.CpuSlice)) ReadError!void {
     try parser.expect(.array_begin);
     while (try parser.peek() != .array_end) {
         try parser.expect(.array_begin);
@@ -1024,10 +1055,7 @@ fn parseCpuSlices(
     try parser.expect(.array_end);
 }
 
-fn resolveProcessMetadata(
-    session: *Session,
-    tables: *const MetadataTables,
-) ReadError!void {
+fn resolveProcessMetadata(session: *Session, tables: *const MetadataTables) ReadError!void {
     for (session.processes.items) |*process| {
         for (process.execs.items) |*exec| try resolveImageMetadata(exec, tables);
         var current = process.currentExec();
@@ -1079,7 +1107,15 @@ fn parseByteString(parser: *Parser, max_len: usize) ReadError![]u8 {
             return text.toOwned(parser.gpa);
         },
         .object_begin => {},
-        else => return error.InvalidJson,
+        .object_end,
+        .array_begin,
+        .array_end,
+        .true,
+        .false,
+        .null,
+        .number,
+        .end_of_document,
+        => return error.InvalidJson,
     }
 
     try parser.expect(.object_begin);
@@ -1108,13 +1144,12 @@ fn mark(seen: anytype, bit: u4) ReadError!void {
     seen.* |= mask;
 }
 
-fn mapJsonError(err: anyerror) ReadError {
+fn mapJsonError(err: std.json.Reader.AllocError) ReadError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.ReadFailed => error.ReadFailed,
         error.ValueTooLong => error.ValueTooLong,
         error.SyntaxError, error.UnexpectedEndOfInput, error.EndOfStream => error.InvalidJson,
-        else => error.InvalidJson,
     };
 }
 
@@ -1146,7 +1181,7 @@ fn prepare(gpa: Allocator, session: *const Session) (Allocator.Error || Validati
     var recovered_count: u64 = 0;
     for (session.processes.items, 0..) |process, index| {
         if (process.origin != .observed) recovered_count +|= 1;
-        try validateProcess(&tables, gpa, session, &process, index);
+        try validateProcess(gpa, &tables, session, &process, index);
     }
     if (recovered_count != session.recovered_count) return error.StaleDerivedCache;
     return tables;
@@ -1177,8 +1212,8 @@ fn validateSessionBoundary(session: *const Session) ValidationError!void {
 }
 
 fn validateProcess(
-    tables: *Tables,
     gpa: Allocator,
+    tables: *Tables,
     session: *const Session,
     process: *const Process,
     index: usize,
@@ -1228,11 +1263,11 @@ fn validateProcess(
     if (process.execCount() == 0) return error.InvalidExecInterval;
 
     const row = process.rowExec();
-    try validateImage(tables, gpa, row);
+    try validateImage(gpa, tables, row);
     var previous_end_ns: ?u64 = null;
     for (0..process.execCount()) |exec_index| {
         const exec = process.execAt(exec_index);
-        try validateImage(tables, gpa, exec);
+        try validateImage(gpa, tables, exec);
         const exec_end_ns = exec.end_ns orelse return error.InvalidExecInterval;
         if (exec.start_ns < process.start_ns or
             exec.start_ns > exec_end_ns or
@@ -1261,8 +1296,8 @@ fn validateProcess(
 }
 
 fn validateImage(
-    tables: *Tables,
     gpa: Allocator,
+    tables: *Tables,
     image: Process.Exec,
 ) (Allocator.Error || ValidationError)!void {
     if (image.name_len == 0 or image.name_len > Process.max_name_len) {
@@ -1278,25 +1313,13 @@ fn validateImage(
             _ = try tables.internArgv(gpa, range);
         },
     }
-    try validateImagePath(
-        tables,
-        gpa,
-        image.exe_offset,
-        image.exe_len,
-        image.exe_source,
-    );
-    try validateImagePath(
-        tables,
-        gpa,
-        image.cwd_offset,
-        image.cwd_len,
-        image.cwd_source,
-    );
+    try validateImagePath(gpa, tables, image.exe_offset, image.exe_len, image.exe_source);
+    try validateImagePath(gpa, tables, image.cwd_offset, image.cwd_len, image.cwd_source);
 }
 
 fn validateImagePath(
-    tables: *Tables,
     gpa: Allocator,
+    tables: *Tables,
     offset: usize,
     len: u16,
     source: Process.MetadataSource,
@@ -1386,10 +1409,7 @@ fn writeRootExit(json: *std.json.Stringify, root_exit: Session.RootExit) !void {
     try json.endObject();
 }
 
-fn writeCaptureEnvironment(
-    json: *std.json.Stringify,
-    environment: CaptureEnvironment,
-) !void {
+fn writeCaptureEnvironment(json: *std.json.Stringify, environment: CaptureEnvironment) !void {
     try json.beginObject();
     try json.objectField("started_at_unix_seconds");
     try json.write(environment.started_at_unix_seconds);
@@ -1490,11 +1510,7 @@ fn writeProcess(
     try json.endObject();
 }
 
-fn writeImageFields(
-    json: *std.json.Stringify,
-    tables: *const Tables,
-    image: Process.Exec,
-) !void {
+fn writeImageFields(json: *std.json.Stringify, tables: *const Tables, image: Process.Exec) !void {
     try json.objectField("name");
     try writeByteString(json, image.nameSlice());
     try field(json, "name_kind", @tagName(image.name_kind));
@@ -1622,11 +1638,7 @@ fn rangeBytes(metadata: []const u8, offset: usize, len: usize) []const u8 {
     return metadata[offset..][0..len];
 }
 
-fn finishedSession(
-    gpa: Allocator,
-    io: std.Io,
-    argv: []const []const u8,
-) Allocator.Error!Session {
+fn finishedSession(gpa: Allocator, io: std.Io, argv: []const []const u8) Allocator.Error!Session {
     var session = Session.init(gpa, io);
     errdefer session.deinit();
     session.elapsed_ns = 100;
@@ -1637,6 +1649,8 @@ fn finishedSession(
     session.capture_fidelity = .exact;
 
     var root = Process{
+        .exec_start_ns = 0,
+
         .pid = 42,
         .end_ns = 100,
         .end_kind = .observed_exit,
@@ -1644,11 +1658,11 @@ fn finishedSession(
     };
     errdefer root.deinit(gpa);
     root.setName("tool", .process);
-    try root.setArgsFromArgv(&session.metadata, gpa, argv);
+    try root.setArgsFromArgv(gpa, &session.metadata, argv);
     session.target_argv_offset = root.args_offset;
     session.target_argv_len = root.args_len;
     session.target_argv_count = root.args_count;
-    try root.setCwd(&session.metadata, gpa, " /tmp/project\t");
+    try root.setCwd(gpa, &session.metadata, " /tmp/project\t");
     try root.recordCpuSnapshot(gpa, 100, 25);
     try session.processes.append(gpa, root);
     session.finished = true;
@@ -1668,8 +1682,8 @@ fn appendChildWithEqualMetadata(session: *Session) Allocator.Error!void {
     };
     errdefer child.deinit(session.gpa);
     child.setName("child", .process);
-    try child.setArgsFromKernel(&session.metadata, session.gpa, "tool\x00\x00");
-    try child.setCwd(&session.metadata, session.gpa, " /tmp/project\t");
+    try child.setArgsFromKernel(session.gpa, &session.metadata, "tool\x00\x00");
+    try child.setCwd(session.gpa, &session.metadata, " /tmp/project\t");
     try session.processes.append(session.gpa, child);
 }
 
@@ -1706,10 +1720,7 @@ fn expectChangedFixtureError(
     defer testing.allocator.free(changed);
     var input: std.Io.Reader = .fixed(changed);
     var diagnostics: Diagnostics = .{};
-    try testing.expectError(
-        expected,
-        read(testing.allocator, testing.io, &input, &diagnostics),
-    );
+    try testing.expectError(expected, read(testing.allocator, testing.io, &input, &diagnostics));
     try testing.expectEqual(reason, diagnostics.reason);
 }
 
@@ -1749,18 +1760,14 @@ test "writer preserves a distinct root launch row" {
     try root.retainCurrentExecForRow(testing.allocator);
     root.setName("execed", .process);
     root.clearExecMetadata();
-    try root.setArgsFromKernel(&session.metadata, testing.allocator, "execed\x00build\x00");
+    try root.setArgsFromKernel(testing.allocator, &session.metadata, "execed\x00build\x00");
 
     var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
     try write(testing.allocator, &session, &output.writer);
     const json = output.written();
 
-    try testing.expect(std.mem.indexOf(
-        u8,
-        json,
-        "\"row\":{\"name\":\"tool\"",
-    ) != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"row\":{\"name\":\"tool\"") != null);
     try testing.expect(std.mem.indexOf(
         u8,
         json,
@@ -1778,11 +1785,7 @@ test "writer uses base64 for non-UTF-8 bytes" {
     defer output.deinit();
     try write(testing.allocator, &session, &output.writer);
 
-    try testing.expect(std.mem.indexOf(
-        u8,
-        output.written(),
-        "{\"base64\":\"/2Jpbg==\"}",
-    ) != null);
+    try testing.expect(std.mem.indexOf(u8, output.written(), "{\"base64\":\"/2Jpbg==\"}") != null);
 }
 
 test "writer validation failure emits no bytes" {
@@ -1826,11 +1829,7 @@ test "writer allocation failures release scratch storage" {
     const testing = std.testing;
     var session = try finishedSession(testing.allocator, testing.io, &.{ "tool", "build" });
     defer session.deinit();
-    try testing.checkAllAllocationFailures(
-        testing.allocator,
-        writeWithAllocator,
-        .{&session},
-    );
+    try testing.checkAllAllocationFailures(testing.allocator, writeWithAllocator, .{&session});
 }
 
 test "reader round trip preserves canonical session fields" {
@@ -1847,12 +1846,7 @@ test "reader round trip preserves canonical session fields" {
 
     var input: std.Io.Reader = .fixed(first_output.written());
     var diagnostics: Diagnostics = .{};
-    var imported = try read(
-        testing.allocator,
-        testing.io,
-        &input,
-        &diagnostics,
-    );
+    var imported = try read(testing.allocator, testing.io, &input, &diagnostics);
     defer imported.deinit();
 
     try testing.expect(imported.finished);
@@ -1903,19 +1897,19 @@ test "round trip preserves process inspection truncation partial CPU and recover
     const root = &original.processes.items[0];
     root.cpu_final = false;
     try root.setArgsFromProcessInspection(
-        &original.metadata,
         testing.allocator,
+        &original.metadata,
         "inspected\x00\x00build\x00",
     );
     try root.setExeFromProcessInspection(
-        &original.metadata,
         testing.allocator,
+        &original.metadata,
         " /usr/bin/inspected ",
     );
     const long_cwd = try testing.allocator.alloc(u8, Process.max_path_len + 1);
     defer testing.allocator.free(long_cwd);
     @memset(long_cwd, 'p');
-    try root.setCwdFromProcessInspection(&original.metadata, testing.allocator, long_cwd);
+    try root.setCwdFromProcessInspection(testing.allocator, &original.metadata, long_cwd);
     try appendChildWithEqualMetadata(&original);
     original.processes.items[1].origin = .recovered_exec;
     original.recovered_count = 1;
@@ -1933,14 +1927,8 @@ test "round trip preserves process inspection truncation partial CPU and recover
     try testing.expect(imported.isIncomplete());
     try testing.expectEqual(@as(u64, 1), imported.recovered_count);
     try testing.expect(!imported_root.cpu_final);
-    try testing.expectEqual(
-        Process.MetadataSource.process_inspection,
-        imported_root.args_source,
-    );
-    try testing.expectEqual(
-        Process.MetadataSource.process_inspection,
-        imported_root.exe_source,
-    );
+    try testing.expectEqual(Process.MetadataSource.process_inspection, imported_root.args_source);
+    try testing.expectEqual(Process.MetadataSource.process_inspection, imported_root.exe_source);
     try testing.expectEqualStrings(
         " /usr/bin/inspected ",
         imported_root.exeSlice(imported.metadata.items),
@@ -1957,7 +1945,7 @@ test "reader preserves a distinct root launch row and exec image" {
     try root.retainCurrentExecForRow(testing.allocator);
     root.setName("execed", .process);
     root.clearExecMetadata();
-    try root.setArgsFromKernel(&original.metadata, testing.allocator, "execed\x00build\x00");
+    try root.setArgsFromKernel(testing.allocator, &original.metadata, "execed\x00build\x00");
 
     var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
@@ -2018,7 +2006,11 @@ test "reader requires the v1 capture environment" {
 
 test "committed v1 fixtures stream into finished sessions" {
     const testing = std.testing;
-    inline for (.{ minimal_fixture, processes_first_fixture, exec_history_fixture }) |fixture| {
+    inline for (.{
+        minimal_fixture,
+        processes_first_fixture,
+        exec_history_fixture,
+    }) |fixture| {
         var input: std.Io.Reader = .fixed(fixture);
         var diagnostics: Diagnostics = .{};
         var session = try read(testing.allocator, testing.io, &input, &diagnostics);
@@ -2043,10 +2035,7 @@ test "committed exec-history fixture preserves its launch row and real images" {
     try testing.expectEqualStrings("sh", root.rowNameSlice());
     try testing.expectEqualStrings("dash", root.execAt(0).nameSlice());
     try testing.expectEqualStrings("clang", root.execAt(1).nameSlice());
-    try testing.expectEqualStrings(
-        "/home/user/src",
-        root.cwdSlice(session.metadata.items),
-    );
+    try testing.expectEqualStrings("/home/user/src", root.cwdSlice(session.metadata.items));
     try testing.expectEqual(@as(u64, 200000), root.cpu_time_ns);
     try testing.expect(root.cpu_final);
     try testing.expectEqual(@as(usize, 1), root.cpu_slices.items.len);
@@ -2061,12 +2050,7 @@ test "committed exec-history fixture preserves its launch row and real images" {
     defer output.deinit();
     try write(testing.allocator, &session, &output.writer);
     var round_trip_input: std.Io.Reader = .fixed(output.written());
-    var round_trip = try read(
-        testing.allocator,
-        testing.io,
-        &round_trip_input,
-        &diagnostics,
-    );
+    var round_trip = try read(testing.allocator, testing.io, &round_trip_input, &diagnostics);
     defer round_trip.deinit();
     try testing.expectEqual(@as(usize, 2), round_trip.processes.items[0].execCount());
     try testing.expectEqualStrings("sh", round_trip.processes.items[0].rowNameSlice());
@@ -2090,12 +2074,7 @@ test "reader accepts zero-width execs and gaps but rejects overlap" {
     defer testing.allocator.free(zero_width);
     var zero_input: std.Io.Reader = .fixed(zero_width);
     var diagnostics: Diagnostics = .{};
-    var zero_session = try read(
-        testing.allocator,
-        testing.io,
-        &zero_input,
-        &diagnostics,
-    );
+    var zero_session = try read(testing.allocator, testing.io, &zero_input, &diagnostics);
     defer zero_session.deinit();
     try testing.expectEqual(@as(u64, 0), zero_session.processes.items[0].execAt(0).end_ns.?);
 
@@ -2109,10 +2088,7 @@ test "reader accepts zero-width execs and gaps but rejects overlap" {
     var gap_input: std.Io.Reader = .fixed(gap);
     var gap_session = try read(testing.allocator, testing.io, &gap_input, &diagnostics);
     defer gap_session.deinit();
-    try testing.expectEqual(
-        @as(u64, 5000000),
-        gap_session.processes.items[0].execAt(0).end_ns.?,
-    );
+    try testing.expectEqual(@as(u64, 5000000), gap_session.processes.items[0].execAt(0).end_ns.?);
 
     const overlap = try changedBytes(
         testing.allocator,
@@ -2215,12 +2191,7 @@ test "reader handles escaped and base64 metadata one byte at a time" {
     });
     tiny_reader.artificial_limit = .limited(1);
     var diagnostics: Diagnostics = .{};
-    var imported = try read(
-        testing.allocator,
-        testing.io,
-        &tiny_reader.interface,
-        &diagnostics,
-    );
+    var imported = try read(testing.allocator, testing.io, &tiny_reader.interface, &diagnostics);
     defer imported.deinit();
 
     try testing.expectEqualStrings("\xffbin", imported.processes.items[0].nameSlice());
@@ -2237,11 +2208,7 @@ test "reader accepts an argument larger than the JSON default token limit" {
     defer testing.allocator.free(large_argument);
     @memset(large_argument, 'x');
 
-    var original = try finishedSession(
-        testing.allocator,
-        testing.io,
-        &.{ "tool", large_argument },
-    );
+    var original = try finishedSession(testing.allocator, testing.io, &.{ "tool", large_argument });
     defer original.deinit();
     var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
@@ -2402,9 +2369,7 @@ test "reader rejects a repeated version field and trailing JSON" {
 
 test "reader rejects duplicate and unknown top-level fields" {
     const testing = std.testing;
-    var duplicate_input: std.Io.Reader = .fixed(
-        "{\"flamez\":1,\"loss_count\":0,\"loss_count\":0}",
-    );
+    var duplicate_input: std.Io.Reader = .fixed("{\"flamez\":1,\"loss_count\":0,\"loss_count\":0}");
     var diagnostics: Diagnostics = .{};
     try testing.expectError(
         error.DuplicateField,
@@ -2462,41 +2427,38 @@ test "file APIs install exclusively, replace atomically, and stream read" {
     );
 
     var diagnostics: Diagnostics = .{};
-    var imported = try readFile(
-        testing.allocator,
-        testing.io,
-        path,
-        &diagnostics,
-    );
+    var imported = try readFile(testing.allocator, testing.io, path, &diagnostics);
     defer imported.deinit();
     try testing.expectEqual(@as(u64, 0), imported.loss_count);
 
     session.loss_count = 7;
-    try writeFile(testing.allocator, testing.io, &session, path, .{
-        .install = .replace,
-    });
-    var replaced = try readFile(
+    try writeFile(
         testing.allocator,
         testing.io,
+        &session,
         path,
-        &diagnostics,
+        .{
+            .install = .replace,
+        },
     );
+    var replaced = try readFile(testing.allocator, testing.io, path, &diagnostics);
     defer replaced.deinit();
     try testing.expectEqual(@as(u64, 7), replaced.loss_count);
 
     session.finished = false;
     try testing.expectError(
         error.SessionNotFinished,
-        writeFile(testing.allocator, testing.io, &session, path, .{
-            .install = .replace,
-        }),
+        writeFile(
+            testing.allocator,
+            testing.io,
+            &session,
+            path,
+            .{
+                .install = .replace,
+            },
+        ),
     );
-    var preserved = try readFile(
-        testing.allocator,
-        testing.io,
-        path,
-        &diagnostics,
-    );
+    var preserved = try readFile(testing.allocator, testing.io, path, &diagnostics);
     defer preserved.deinit();
     try testing.expectEqual(@as(u64, 7), preserved.loss_count);
 
@@ -2510,4 +2472,14 @@ test "file APIs install exclusively, replace atomically, and stream read" {
         try testing.expectEqualStrings("capture.json", entry.name);
     }
     try testing.expectEqual(@as(usize, 1), entry_count);
+}
+
+test "reader releases an allocated string rejected as an integer" {
+    var input: std.Io.Reader = .fixed("{\"flamez\":\"\\u0031\"}");
+    var diagnostics: Diagnostics = .{};
+    try std.testing.expectError(
+        error.InvalidJson,
+        read(std.testing.allocator, std.testing.io, &input, &diagnostics),
+    );
+    try std.testing.expectEqual(Diagnostics.Reason.invalid_json, diagnostics.reason);
 }

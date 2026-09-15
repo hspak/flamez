@@ -3,7 +3,6 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const log = std.log.scoped(.process_ops);
 
 pub const args_source = .procfs;
 
@@ -103,10 +102,7 @@ pub fn readName(pid: std.posix.pid_t, buffer: []u8) ?[]const u8 {
 
 /// Returns owned NUL-separated argv bytes, or null when procfs cannot provide them.
 /// The caller must deinitialize a returned list with `gpa`.
-pub fn readArgs(
-    gpa: Allocator,
-    pid: std.posix.pid_t,
-) Allocator.Error!?std.ArrayList(u8) {
+pub fn readArgs(gpa: Allocator, pid: std.posix.pid_t) Allocator.Error!?std.ArrayList(u8) {
     var path_buf: [64]u8 = undefined;
     const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cmdline", .{pid}) catch unreachable;
     const rc = std.os.linux.open(path, .{ .CLOEXEC = true }, 0);

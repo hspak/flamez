@@ -5,7 +5,8 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const log = std.log.scoped(.process);
+
+pub const MetadataStore = std.ArrayList(u8);
 
 const perf = @import("../perf.zig");
 
@@ -19,11 +20,11 @@ parent_pid: ?std.posix.pid_t = null,
 parent_index: ?usize = null,
 depth: u16 = 0,
 start_ns: u64 = 0,
-end_ns: ?u64 = null,
+end_ns: ?u64,
 /// How this record entered the session. Inferred starts are not exact observations.
 origin: Origin = .observed,
 /// How an open lifetime was closed. Capture-clipped ends are not observed exits.
-end_kind: EndKind = .open,
+end_kind: EndKind,
 /// Cumulative on-CPU time for every thread in this process, excluding descendants.
 cpu_time_ns: u64 = 0,
 /// True only when a natural-exit observation supplied the final cumulative total.
@@ -39,7 +40,7 @@ cpu_slices: std.ArrayList(CpuSlice) = .empty,
 /// Completed exec intervals, in execution order. The current exec remains
 /// in the fields below so timeline rendering stays allocation-free.
 execs: std.ArrayList(Exec) = .empty,
-exec_start_ns: u64 = 0,
+exec_start_ns: u64,
 name: [max_name_len]u8 = [_]u8{0} ** max_name_len,
 name_len: u8 = 0,
 name_kind: NameKind = .other,
@@ -145,6 +146,7 @@ pub const Exec = struct {
     }
 
     /// Space-joins the complete recorded argv into `dest`.
+    /// Asserts that `dest.len` is at least the recorded argv byte length.
     pub fn copyCmdline(self: *const Exec, metadata: []const u8, dest: []u8) []const u8 {
         const args = metadataSlice(metadata, self.args_offset, self.args_len);
         std.debug.assert(dest.len >= args.len);
@@ -157,8 +159,6 @@ pub const Exec = struct {
         return argSummaryFor(Exec, self, metadata, buffer);
     }
 };
-
-pub const MetadataStore = std.ArrayList(u8);
 
 pub const CpuSlice = struct {
     start_ns: u64,
@@ -217,6 +217,23 @@ const StoredPath = struct {
     len: u16,
     truncated: bool,
 };
+
+pub const InitOptions = struct {
+    pid: std.posix.pid_t,
+    start_ns: u64,
+};
+
+/// Creates an open process whose initial image begins at the process birth.
+/// The returned record owns any storage subsequently allocated by its methods.
+pub fn init(options: InitOptions) Process {
+    return .{
+        .pid = options.pid,
+        .start_ns = options.start_ns,
+        .end_ns = null,
+        .end_kind = .open,
+        .exec_start_ns = options.start_ns,
+    };
+}
 
 /// Releases CPU activity storage owned by this process and invalidates it.
 pub fn deinit(self: *Process, gpa: Allocator) void {
@@ -503,11 +520,7 @@ pub fn retainCurrentExecForRow(self: *Process, gpa: Allocator) Allocator.Error!v
 /// Closes the current exec at `at_ns` and starts a new exec interval.
 /// On allocation failure the new interval still begins, leaving a visible gap
 /// rather than assigning the replacement exec to the previous interval.
-pub fn archiveCurrentExec(
-    self: *Process,
-    gpa: Allocator,
-    at_ns: u64,
-) Allocator.Error!void {
+pub fn archiveCurrentExec(self: *Process, gpa: Allocator, at_ns: u64) Allocator.Error!void {
     const next_start_ns = @max(self.exec_start_ns, at_ns);
     var exec = self.currentExec();
     exec.end_ns = next_start_ns;
@@ -552,7 +565,8 @@ pub fn argv0(self: *const Process, metadata: []const u8) []const u8 {
     return it.next() orelse "";
 }
 
-/// Space-joined cmdline. `dest` must hold the complete recorded argv block.
+/// Space-joins the complete recorded argv into `dest`.
+/// Asserts that `dest.len` is at least the recorded argv byte length.
 pub fn copyCmdline(self: *const Process, metadata: []const u8, dest: []u8) []const u8 {
     const args = metadataSlice(metadata, self.args_offset, self.args_len);
     std.debug.assert(dest.len >= args.len);
@@ -564,6 +578,7 @@ pub fn copyCmdline(self: *const Process, metadata: []const u8, dest: []u8) []con
 }
 
 /// Space-joins argv[1..], excluding the executable identity in argv[0].
+/// Asserts that `dest.len` is at least `self.args_len`.
 pub fn copyArguments(self: *const Process, metadata: []const u8, dest: []u8) []const u8 {
     std.debug.assert(dest.len >= self.args_len);
     var args = self.argsIter(metadata);
@@ -726,8 +741,8 @@ pub fn setName(self: *Process, value: []const u8, kind: NameKind) void {
 
 fn setArgs(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     raw: []const u8,
     source: MetadataSource,
 ) Allocator.Error!void {
@@ -744,38 +759,38 @@ fn setArgs(
 /// Copies a NUL-separated procfs command line into session metadata storage.
 pub fn setArgsFromCmdline(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     raw: []const u8,
 ) Allocator.Error!void {
-    try self.setArgs(store, gpa, raw, .procfs);
+    try self.setArgs(gpa, store, raw, .procfs);
 }
 
 /// Copies a NUL-separated argument list obtained from a platform process-inspection API.
 pub fn setArgsFromProcessInspection(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     raw: []const u8,
 ) Allocator.Error!void {
-    try self.setArgs(store, gpa, raw, .process_inspection);
+    try self.setArgs(gpa, store, raw, .process_inspection);
 }
 
 /// Copies argv captured synchronously by the exec tracepoint.
 pub fn setArgsFromKernel(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     raw: []const u8,
 ) Allocator.Error!void {
-    try self.setArgs(store, gpa, raw, .kernel);
+    try self.setArgs(gpa, store, raw, .kernel);
 }
 
 /// Copies argv into session metadata storage as NUL-separated strings.
 pub fn setArgsFromArgv(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     argv: []const []const u8,
 ) Allocator.Error!void {
     var total_len: usize = 0;
@@ -798,11 +813,7 @@ pub fn setArgsFromArgv(
     self.revision +%= 1;
 }
 
-fn storePath(
-    store: *MetadataStore,
-    gpa: Allocator,
-    value: []const u8,
-) Allocator.Error!StoredPath {
+fn storePath(gpa: Allocator, store: *MetadataStore, value: []const u8) Allocator.Error!StoredPath {
     const n = @min(value.len, max_path_len);
     const offset = store.items.len;
     try store.appendSlice(gpa, value[0..n]);
@@ -823,12 +834,12 @@ fn pathUnchanged(current: []const u8, value: []const u8, truncated: bool) bool {
 /// Stores a bounded executable path in this record.
 pub fn setExe(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     value: []const u8,
 ) Allocator.Error!void {
     if (pathUnchanged(self.exeSlice(store.items), value, self.exe_truncated)) return;
-    const stored = try storePath(store, gpa, value);
+    const stored = try storePath(gpa, store, value);
     self.exe_offset = stored.offset;
     self.exe_len = stored.len;
     self.exe_truncated = stored.truncated;
@@ -839,8 +850,8 @@ pub fn setExe(
 /// Stores a bounded executable path obtained from a platform process-inspection API.
 pub fn setExeFromProcessInspection(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     value: []const u8,
 ) Allocator.Error!void {
     if (pathUnchanged(self.exeSlice(store.items), value, self.exe_truncated) and
@@ -848,7 +859,7 @@ pub fn setExeFromProcessInspection(
     {
         return;
     }
-    const stored = try storePath(store, gpa, value);
+    const stored = try storePath(gpa, store, value);
     self.exe_offset = stored.offset;
     self.exe_len = stored.len;
     self.exe_truncated = stored.truncated;
@@ -859,8 +870,8 @@ pub fn setExeFromProcessInspection(
 /// Stores an executable filename captured by the exec tracepoint.
 pub fn setExeFromKernel(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     value: []const u8,
     truncated: bool,
 ) Allocator.Error!void {
@@ -870,7 +881,7 @@ pub fn setExeFromKernel(
     {
         return;
     }
-    const stored = try storePath(store, gpa, value);
+    const stored = try storePath(gpa, store, value);
     self.exe_offset = stored.offset;
     self.exe_len = stored.len;
     self.exe_source = .kernel;
@@ -881,12 +892,12 @@ pub fn setExeFromKernel(
 /// Stores a bounded working directory in this record.
 pub fn setCwd(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     value: []const u8,
 ) Allocator.Error!void {
     if (pathUnchanged(self.cwdSlice(store.items), value, self.cwd_truncated)) return;
-    const stored = try storePath(store, gpa, value);
+    const stored = try storePath(gpa, store, value);
     self.cwd_offset = stored.offset;
     self.cwd_len = stored.len;
     self.cwd_truncated = stored.truncated;
@@ -897,8 +908,8 @@ pub fn setCwd(
 /// Stores a bounded working directory obtained from a platform process-inspection API.
 pub fn setCwdFromProcessInspection(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     value: []const u8,
 ) Allocator.Error!void {
     if (pathUnchanged(self.cwdSlice(store.items), value, self.cwd_truncated) and
@@ -906,7 +917,7 @@ pub fn setCwdFromProcessInspection(
     {
         return;
     }
-    const stored = try storePath(store, gpa, value);
+    const stored = try storePath(gpa, store, value);
     self.cwd_offset = stored.offset;
     self.cwd_len = stored.len;
     self.cwd_truncated = stored.truncated;
@@ -917,8 +928,8 @@ pub fn setCwdFromProcessInspection(
 /// Stores a working directory captured with a kernel exec event.
 pub fn setCwdFromKernel(
     self: *Process,
-    store: *MetadataStore,
     gpa: Allocator,
+    store: *MetadataStore,
     value: []const u8,
     truncated: bool,
 ) Allocator.Error!void {
@@ -928,7 +939,7 @@ pub fn setCwdFromKernel(
     {
         return;
     }
-    const stored = try storePath(store, gpa, value);
+    const stored = try storePath(gpa, store, value);
     self.cwd_offset = stored.offset;
     self.cwd_len = stored.len;
     self.cwd_truncated = truncated or stored.truncated;
@@ -1005,7 +1016,10 @@ pub fn clipToCapture(self: *Process, at_ns: u64) void {
         } else {
             // An earlier allocation failure can leave no image covering the cutoff.
             self.setCurrentExec(.{
-                .start_ns = if (previous) |image| image.end_ns orelse self.start_ns else self.start_ns,
+                .start_ns = if (previous) |image|
+                    image.end_ns orelse self.start_ns
+                else
+                    self.start_ns,
                 .end_ns = at_ns,
             });
             self.setName("process", .other);
@@ -1098,8 +1112,17 @@ fn isSourcePath(arg: []const u8) bool {
     if (arg.len < 3 or arg[0] == '-') return false;
     const ext = pathExt(arg);
     inline for (.{
-        ".rs",  ".c", ".cc", ".cpp", ".cxx", ".h",
-        ".hpp", ".s", ".S",  ".go",  ".zig",
+        ".rs",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".hpp",
+        ".s",
+        ".S",
+        ".go",
+        ".zig",
     }) |want| {
         if (std.ascii.eqlIgnoreCase(ext, want)) return true;
     }
@@ -1140,13 +1163,22 @@ fn takesValue(flag: []const u8) bool {
 }
 
 test "process duration stops at its end" {
-    var process = Process{ .pid = 7, .parent_pid = null, .depth = 0, .start_ns = 10 };
+    var process = Process{
+        .end_kind = .open,
+        .end_ns = null,
+        .exec_start_ns = 0,
+
+        .pid = 7,
+        .parent_pid = null,
+        .depth = 0,
+        .start_ns = 10,
+    };
     process.end_ns = 40;
     try std.testing.expectEqual(@as(u64, 30), process.durationNs(100));
 }
 
 test "CPU snapshots coalesce adjacent buckets in the same occupancy band" {
-    var process = Process{ .pid = 7, .start_ns = 10 };
+    var process = Process.init(.{ .pid = 7, .start_ns = 10 });
     defer process.deinit(std.testing.allocator);
 
     try process.recordCpuSnapshot(std.testing.allocator, 110, 100);
@@ -1161,7 +1193,7 @@ test "CPU snapshots coalesce adjacent buckets in the same occupancy band" {
 }
 
 test "idle CPU buckets separate busy slices" {
-    var process = Process{ .pid = 7 };
+    var process = Process.init(.{ .pid = 7, .start_ns = 0 });
     defer process.deinit(std.testing.allocator);
 
     try process.recordCpuSnapshot(std.testing.allocator, 100, 50);
@@ -1179,7 +1211,7 @@ test "idle CPU buckets separate busy slices" {
 }
 
 test "final CPU snapshot reconciles map sampling skew" {
-    var process = Process{ .pid = 7 };
+    var process = Process.init(.{ .pid = 7, .start_ns = 0 });
     defer process.deinit(std.testing.allocator);
 
     try process.recordCpuSnapshot(std.testing.allocator, 100, 105);
@@ -1196,7 +1228,7 @@ test "final CPU snapshot reconciles map sampling skew" {
 
 test "finishing clips delayed CPU samples to the process lifetime" {
     const testing = std.testing;
-    var process = Process{ .pid = 7 };
+    var process = Process.init(.{ .pid = 7, .start_ns = 0 });
     defer process.deinit(testing.allocator);
 
     try process.recordCpuSnapshot(testing.allocator, 80, 20);
@@ -1210,7 +1242,16 @@ test "finishing clips delayed CPU samples to the process lifetime" {
 }
 
 test "process names are trimmed and bounded" {
-    var process = Process{ .pid = 7, .parent_pid = null, .depth = 0, .start_ns = 0 };
+    var process = Process{
+        .end_kind = .open,
+        .end_ns = null,
+        .exec_start_ns = 0,
+
+        .pid = 7,
+        .parent_pid = null,
+        .depth = 0,
+        .start_ns = 0,
+    };
     process.setName("  compiler\n", .process);
     try std.testing.expectEqualStrings("compiler", process.nameSlice());
     try std.testing.expectEqual(NameKind.process, process.name_kind);
@@ -1227,17 +1268,27 @@ test "process names are trimmed and bounded" {
 test "fork inheritance survives exec metadata replacement" {
     var metadata = MetadataStore.empty;
     defer metadata.deinit(std.testing.allocator);
-    var parent = Process{ .pid = 1 };
-    try parent.setArgsFromArgv(&metadata, std.testing.allocator, &.{
-        "sh",
-        "-c",
-        "true",
-    });
-    try parent.setExe(&metadata, std.testing.allocator, "/usr/bin/sh");
-    try parent.setCwd(&metadata, std.testing.allocator, "/tmp/build");
+    var parent = Process.init(.{ .pid = 1, .start_ns = 0 });
+    try parent.setArgsFromArgv(
+        std.testing.allocator,
+        &metadata,
+        &.{
+            "sh",
+            "-c",
+            "true",
+        },
+    );
+    try parent.setExe(std.testing.allocator, &metadata, "/usr/bin/sh");
+    try parent.setCwd(std.testing.allocator, &metadata, "/tmp/build");
     const inherited_store_len = metadata.items.len;
 
-    var child = Process{ .pid = 2, .parent_pid = 1 };
+    var child = Process{
+        .end_kind = .open,
+        .end_ns = null,
+        .exec_start_ns = 0,
+        .pid = 2,
+        .parent_pid = 1,
+    };
     child.inheritMetadata(&parent);
     try std.testing.expectEqual(inherited_store_len, metadata.items.len);
     try std.testing.expectEqual(MetadataSource.inherited, child.args_source);
@@ -1249,12 +1300,8 @@ test "fork inheritance survives exec metadata replacement" {
     try std.testing.expectEqual(@as(u16, 0), child.exe_len);
     try std.testing.expectEqualStrings("/tmp/build", child.cwdSlice(metadata.items));
 
-    try child.setArgsFromKernel(
-        &metadata,
-        std.testing.allocator,
-        "clang\x00-c\x00source.c\x00",
-    );
-    try child.setExeFromKernel(&metadata, std.testing.allocator, "clang", false);
+    try child.setArgsFromKernel(std.testing.allocator, &metadata, "clang\x00-c\x00source.c\x00");
+    try child.setExeFromKernel(std.testing.allocator, &metadata, "clang", false);
     try std.testing.expectEqual(MetadataSource.kernel, child.args_source);
     try std.testing.expectEqual(MetadataSource.kernel, child.exe_source);
 }
@@ -1268,8 +1315,8 @@ test "launch argv storage has no fixed byte limit" {
 
     var metadata = MetadataStore.empty;
     defer metadata.deinit(gpa);
-    var process = Process{ .pid = 1 };
-    try process.setArgsFromArgv(&metadata, gpa, &.{ "tool", long_arg });
+    var process = Process.init(.{ .pid = 1, .start_ns = 0 });
+    try process.setArgsFromArgv(gpa, &metadata, &.{ "tool", long_arg });
 
     try testing.expectEqual("tool".len + 1 + long_arg.len + 1, process.args_len);
     try testing.expectEqual(@as(usize, 2), process.args_count);
@@ -1284,14 +1331,18 @@ test "argv storage preserves empty arguments" {
     const gpa = testing.allocator;
     var metadata = MetadataStore.empty;
     defer metadata.deinit(gpa);
-    var process = Process{ .pid = 1 };
+    var process = Process.init(.{ .pid = 1, .start_ns = 0 });
 
-    try process.setArgsFromArgv(&metadata, gpa, &.{
-        "tool",
-        "",
-        "value",
-        "",
-    });
+    try process.setArgsFromArgv(
+        gpa,
+        &metadata,
+        &.{
+            "tool",
+            "",
+            "value",
+            "",
+        },
+    );
 
     var args = process.argsIter(metadata.items);
     try testing.expectEqualStrings("tool", args.next().?);
@@ -1308,19 +1359,19 @@ test "identical CWD and exe paths reuse the stored offset" {
     const gpa = testing.allocator;
     var metadata = MetadataStore.empty;
     defer metadata.deinit(gpa);
-    var process = Process{ .pid = 1 };
+    var process = Process.init(.{ .pid = 1, .start_ns = 0 });
 
-    try process.setCwd(&metadata, gpa, "/tmp/build");
+    try process.setCwd(gpa, &metadata, "/tmp/build");
     const cwd_offset = process.cwd_offset;
     const store_len = metadata.items.len;
-    try process.setCwd(&metadata, gpa, "/tmp/build");
+    try process.setCwd(gpa, &metadata, "/tmp/build");
     try testing.expectEqual(cwd_offset, process.cwd_offset);
     try testing.expectEqual(store_len, metadata.items.len);
 
-    try process.setExe(&metadata, gpa, "/usr/bin/clang");
+    try process.setExe(gpa, &metadata, "/usr/bin/clang");
     const exe_offset = process.exe_offset;
     const exe_store_len = metadata.items.len;
-    try process.setExe(&metadata, gpa, "/usr/bin/clang");
+    try process.setExe(gpa, &metadata, "/usr/bin/clang");
     try testing.expectEqual(exe_offset, process.exe_offset);
     try testing.expectEqual(exe_store_len, metadata.items.len);
 }
@@ -1330,22 +1381,22 @@ test "paths preserve bytes and report only over-cap truncation" {
     const gpa = testing.allocator;
     var metadata = MetadataStore.empty;
     defer metadata.deinit(gpa);
-    var process = Process{ .pid = 1 };
+    var process = Process.init(.{ .pid = 1, .start_ns = 0 });
 
     const spaced_path = " /tmp/build\t";
-    try process.setCwd(&metadata, gpa, spaced_path);
+    try process.setCwd(gpa, &metadata, spaced_path);
     try testing.expectEqualStrings(spaced_path, process.cwdSlice(metadata.items));
     try testing.expect(!process.cwd_truncated);
 
     var exact_path: [max_path_len]u8 = undefined;
     @memset(&exact_path, 'x');
-    try process.setExe(&metadata, gpa, &exact_path);
+    try process.setExe(gpa, &metadata, &exact_path);
     try testing.expectEqual(@as(usize, max_path_len), process.exeSlice(metadata.items).len);
     try testing.expect(!process.exe_truncated);
 
     var long_path: [max_path_len + 1]u8 = undefined;
     @memset(&long_path, 'y');
-    try process.setCwd(&metadata, gpa, &long_path);
+    try process.setCwd(gpa, &metadata, &long_path);
     try testing.expectEqual(@as(usize, max_path_len), process.cwdSlice(metadata.items).len);
     try testing.expect(process.cwd_truncated);
 }
@@ -1355,19 +1406,19 @@ test "exec history retains replaced metadata" {
     const gpa = testing.allocator;
     var metadata = MetadataStore.empty;
     defer metadata.deinit(gpa);
-    var process = Process{ .pid = 7 };
+    var process = Process.init(.{ .pid = 7, .start_ns = 0 });
     defer process.deinit(gpa);
 
     process.setName("sh", .process);
-    try process.setArgsFromArgv(&metadata, gpa, &.{ "sh", "build.sh" });
-    try process.setExe(&metadata, gpa, "/usr/bin/sh");
-    try process.setCwd(&metadata, gpa, "/tmp/project");
+    try process.setArgsFromArgv(gpa, &metadata, &.{ "sh", "build.sh" });
+    try process.setExe(gpa, &metadata, "/usr/bin/sh");
+    try process.setCwd(gpa, &metadata, "/tmp/project");
     try process.archiveCurrentExec(gpa, 25);
 
     process.setName("clang", .process);
     process.clearExecMetadata();
-    try process.setArgsFromKernel(&metadata, gpa, "clang\x00-c\x00main.c\x00");
-    try process.setExeFromKernel(&metadata, gpa, "/usr/bin/clang", false);
+    try process.setArgsFromKernel(gpa, &metadata, "clang\x00-c\x00main.c\x00");
+    try process.setExeFromKernel(gpa, &metadata, "/usr/bin/clang", false);
 
     try testing.expectEqual(@as(usize, 2), process.execCount());
     const shell = process.execAt(0);
@@ -1440,11 +1491,21 @@ test "first visible slice is the lower bound on end time" {
 test "rebuild CPU caches derives bands and peak from slices" {
     const testing = std.testing;
     const gpa = testing.allocator;
-    var process = Process{ .pid = 1 };
+    var process = Process.init(.{ .pid = 1, .start_ns = 0 });
     defer process.deinit(gpa);
     try process.cpu_slices.appendSlice(gpa, &.{
-        .{ .start_ns = 0, .end_ns = 100, .cpu_ns = 25, .band = 64 },
-        .{ .start_ns = 100, .end_ns = 200, .cpu_ns = 200, .band = 1 },
+        .{
+            .start_ns = 0,
+            .end_ns = 100,
+            .cpu_ns = 25,
+            .band = 64,
+        },
+        .{
+            .start_ns = 100,
+            .end_ns = 200,
+            .cpu_ns = 200,
+            .band = 1,
+        },
     });
     process.cpu_peak_cores = 99;
 
@@ -1462,15 +1523,28 @@ test "process records keep bulk metadata out of the hot array" {
 test "arg summary extracts rustc crate and compiler sources" {
     var metadata = MetadataStore.empty;
     defer metadata.deinit(std.testing.allocator);
-    var rustc = Process{ .pid = 1, .parent_pid = null, .depth = 0, .start_ns = 0 };
+    var rustc = Process{
+        .end_kind = .open,
+        .end_ns = null,
+        .exec_start_ns = 0,
+
+        .pid = 1,
+        .parent_pid = null,
+        .depth = 0,
+        .start_ns = 0,
+    };
     rustc.setName("rustc", .process);
-    try rustc.setArgsFromArgv(&metadata, std.testing.allocator, &.{
-        "/home/user/.rustup/toolchains/stable/bin/rustc",
-        "--crate-name",
-        "serde",
-        "--edition=2021",
-        "/tmp/serde-1.0.210/src/lib.rs",
-    });
+    try rustc.setArgsFromArgv(
+        std.testing.allocator,
+        &metadata,
+        &.{
+            "/home/user/.rustup/toolchains/stable/bin/rustc",
+            "--crate-name",
+            "serde",
+            "--edition=2021",
+            "/tmp/serde-1.0.210/src/lib.rs",
+        },
+    );
     var buf: [64]u8 = undefined;
     var cmd_buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("serde", rustc.argSummary(metadata.items, &buf));
@@ -1485,8 +1559,8 @@ test "arg summary extracts rustc crate and compiler sources" {
     );
 
     try rustc.setArgsFromArgv(
-        &metadata,
         std.testing.allocator,
+        &metadata,
         &.{
             "rustc",
             "--crate-name=anyhow",
@@ -1495,11 +1569,20 @@ test "arg summary extracts rustc crate and compiler sources" {
     );
     try std.testing.expectEqualStrings("anyhow", rustc.argSummary(metadata.items, &buf));
 
-    var clang = Process{ .pid = 2, .parent_pid = null, .depth = 0, .start_ns = 0 };
+    var clang = Process{
+        .end_kind = .open,
+        .end_ns = null,
+        .exec_start_ns = 0,
+
+        .pid = 2,
+        .parent_pid = null,
+        .depth = 0,
+        .start_ns = 0,
+    };
     clang.setName("cc1plus", .process);
     try clang.setArgsFromArgv(
-        &metadata,
         std.testing.allocator,
+        &metadata,
         &.{
             "cc1plus",
             "-quiet",
@@ -1510,11 +1593,20 @@ test "arg summary extracts rustc crate and compiler sources" {
     );
     try std.testing.expectEqualStrings("engine.cpp", clang.argSummary(metadata.items, &buf));
 
-    var cargo = Process{ .pid = 3, .parent_pid = null, .depth = 0, .start_ns = 0 };
+    var cargo = Process{
+        .end_kind = .open,
+        .end_ns = null,
+        .exec_start_ns = 0,
+
+        .pid = 3,
+        .parent_pid = null,
+        .depth = 0,
+        .start_ns = 0,
+    };
     cargo.setName("cargo", .process);
     try cargo.setArgsFromArgv(
-        &metadata,
         std.testing.allocator,
+        &metadata,
         &.{
             "cargo",
             "build",
@@ -1525,11 +1617,20 @@ test "arg summary extracts rustc crate and compiler sources" {
     );
     try std.testing.expectEqualStrings("build serde", cargo.argSummary(metadata.items, &buf));
 
-    var ld = Process{ .pid = 4, .parent_pid = null, .depth = 0, .start_ns = 0 };
+    var ld = Process{
+        .end_kind = .open,
+        .end_ns = null,
+        .exec_start_ns = 0,
+
+        .pid = 4,
+        .parent_pid = null,
+        .depth = 0,
+        .start_ns = 0,
+    };
     ld.setName("collect2", .process);
     try ld.setArgsFromArgv(
-        &metadata,
         std.testing.allocator,
+        &metadata,
         &.{
             "collect2",
             "-o",

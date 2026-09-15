@@ -4,7 +4,6 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const log = std.log.scoped(.process_ops);
 
 pub const args_source = .process_inspection;
 
@@ -26,21 +25,9 @@ extern "c" fn flamez_macos_spawn_suspended(
 ) c_int;
 extern "c" fn flamez_macos_resume_process(pid: std.posix.pid_t) c_int;
 
-extern "c" fn flamez_macos_read_cwd(
-    pid: i32,
-    buffer: [*]u8,
-    buffer_size: usize,
-) c_int;
-extern "c" fn flamez_macos_read_executable(
-    pid: i32,
-    buffer: [*]u8,
-    buffer_size: usize,
-) c_int;
-extern "c" fn flamez_macos_read_procargs(
-    pid: i32,
-    buffer: ?*anyopaque,
-    buffer_size: *usize,
-) c_int;
+extern "c" fn flamez_macos_read_cwd(pid: i32, buffer: [*]u8, buffer_size: usize) c_int;
+extern "c" fn flamez_macos_read_executable(pid: i32, buffer: [*]u8, buffer_size: usize) c_int;
+extern "c" fn flamez_macos_read_procargs(pid: i32, buffer: ?*anyopaque, buffer_size: *usize) c_int;
 
 /// Result of a nonblocking wait on the target root.
 pub const WaitNowait = union(enum) {
@@ -152,10 +139,7 @@ pub fn readName(pid: std.posix.pid_t, buffer: []u8) ?[]const u8 {
 
 /// Returns owned NUL-separated argv bytes from `KERN_PROCARGS2`, or null when
 /// process inspection is denied or races process exit.
-pub fn readArgs(
-    gpa: Allocator,
-    pid: std.posix.pid_t,
-) Allocator.Error!?std.ArrayList(u8) {
+pub fn readArgs(gpa: Allocator, pid: std.posix.pid_t) Allocator.Error!?std.ArrayList(u8) {
     var raw_size: usize = 0;
     if (flamez_macos_read_procargs(pid, null, &raw_size) != 0 or
         raw_size < @sizeOf(c_int)) return null;

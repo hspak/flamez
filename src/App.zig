@@ -9,7 +9,6 @@ const Allocator = std.mem.Allocator;
 const process_info = @import("process_info.zig");
 
 const TooltipLine = process_info.TooltipLine;
-const log = std.log.scoped(.app);
 
 const App = @This();
 
@@ -264,6 +263,8 @@ fn remapIndex(index: ?usize, indices: []const ?usize) ?usize {
 }
 
 /// Grows selected-process text storage so builders never drop arguments.
+/// Growth invalidates text slices borrowed from `detail_store`. Rebuild the
+/// lines before reading them again, including after a partially completed error.
 pub fn ensureDetailCapacity(
     self: *App,
     store_capacity: usize,
@@ -276,10 +277,7 @@ pub fn ensureDetailCapacity(
         self.detail_lines = try self.gpa.realloc(self.detail_lines, line_capacity);
     }
     if (self.detail_line_heights.len < line_capacity) {
-        self.detail_line_heights = try self.gpa.realloc(
-            self.detail_line_heights,
-            line_capacity,
-        );
+        self.detail_line_heights = try self.gpa.realloc(self.detail_line_heights, line_capacity);
     }
 }
 
@@ -297,6 +295,7 @@ pub fn ensureClipboardCapacity(self: *App, capacity: usize) Allocator.Error!void
 /// exceeds its internal buffer.
 pub fn setMessage(self: *App, comptime format: []const u8, args: anytype) void {
     const value = std.fmt.bufPrint(&self.message, format, args) catch "Unable to format status";
+    std.mem.copyForwards(u8, self.message[0..value.len], value);
     self.message_len = value.len;
 }
 
@@ -446,19 +445,48 @@ test "capture compaction preserves selected process and collapse identity" {
     const testing = std.testing;
     var app = try App.init(testing.allocator);
     defer app.deinit();
-    try app.collapsed.appendSlice(testing.allocator, &.{ false, false, true, false });
+    try app.collapsed.appendSlice(testing.allocator, &.{
+        false,
+        false,
+        true,
+        false,
+    });
     app.selected_process = 2;
     app.detail_for = 2;
     app.detail_cache_process = 2;
     app.graph_cache_process = 1;
     app.tooltip_cache_process = 3;
-    app.remapProcesses(&.{ 0, null, 1, 2 });
+    app.remapProcesses(&.{
+        0,
+        null,
+        1,
+        2,
+    });
     try testing.expectEqual(@as(?usize, 1), app.selected_process);
     try testing.expectEqual(@as(?usize, 1), app.detail_for);
-    try testing.expectEqualSlices(bool, &.{ false, true, false }, app.collapsed.items);
+    try testing.expectEqualSlices(
+        bool,
+        &.{
+            false,
+            true,
+            false,
+        },
+        app.collapsed.items,
+    );
     try testing.expect(app.detail_cache_process == null);
     try testing.expect(app.graph_cache_process == null);
     try testing.expect(app.tooltip_cache_process == null);
-    app.remapProcesses(&.{ 0, null, 1 });
+    app.remapProcesses(&.{
+        0,
+        null,
+        1,
+    });
     try testing.expect(app.selected_process == null);
+}
+
+test "oversized status messages retain the fallback text" {
+    var app = try App.init(std.testing.allocator);
+    defer app.deinit();
+    app.setMessage("{s}", .{"x" ** 256});
+    try std.testing.expectEqualStrings("Unable to format status", app.messageSlice());
 }

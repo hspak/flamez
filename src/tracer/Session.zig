@@ -6,7 +6,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.tracer);
 const CaptureEnvironment = @import("CaptureEnvironment.zig");
 const signals = @import("signals.zig");
 const Process = @import("Process.zig");
@@ -16,7 +18,10 @@ const perf = @import("../perf.zig");
 const session_file = @import("../session_file.zig");
 const analysis_file = @import("../analysis_file.zig");
 
-const log = std.log.scoped(.tracer);
+const NameKind = Process.NameKind;
+const Named = Process.Named;
+const max_name_len = Process.max_name_len;
+const max_path_len = Process.max_path_len;
 
 const Session = @This();
 
@@ -85,11 +90,6 @@ pub const TargetStdout = enum {
 pub const StartOptions = struct {
     target_stdout: TargetStdout = .inherit,
 };
-
-const NameKind = Process.NameKind;
-const Named = Process.Named;
-const max_name_len = Process.max_name_len;
-const max_path_len = Process.max_path_len;
 
 /// Errors from `start`. `MissingTarget` means argv was empty; `StopRequested`
 /// prevents a termination signal observed before launch completion from
@@ -179,12 +179,17 @@ pub fn start(
     defer collector.untrack(launcher_pid);
     if (signals.stopRequested()) return error.StopRequested;
 
-    var child = try process_ops.spawnTarget(self.gpa, self.io, argv, .{
-        .target_stdout = switch (options.target_stdout) {
-            .inherit => .inherit,
-            .stderr => .stderr,
+    var child = try process_ops.spawnTarget(
+        self.gpa,
+        self.io,
+        argv,
+        .{
+            .target_stdout = switch (options.target_stdout) {
+                .inherit => .inherit,
+                .stderr => .stderr,
+            },
         },
-    });
+    );
     errdefer child.kill(self.io);
 
     const pid = child.id.?;
@@ -204,7 +209,7 @@ pub fn start(
         .pid = pid,
         .named = Session.rootLabel(pid, argv[0], &comm_buf),
     });
-    try self.processes.items[root_index].setArgsFromArgv(&self.metadata, self.gpa, argv);
+    try self.processes.items[root_index].setArgsFromArgv(self.gpa, &self.metadata, argv);
     const root = self.processes.items[root_index];
     self.target_argv_offset = root.args_offset;
     self.target_argv_len = root.args_len;
@@ -216,12 +221,7 @@ pub fn start(
     self.child = child;
     self.root_pid = pid;
     self.running = true;
-    errdefer {
-        self.finishOpenProcesses(0);
-        self.child = null;
-        self.root_pid = null;
-        self.running = false;
-    }
+    errdefer comptime unreachable;
 }
 
 /// Closes capture before terminating and reaping a live target.
@@ -378,6 +378,9 @@ fn addProcess(self: *Session, spec: ProcessSpec) !usize {
 
     const index = self.processes.items.len;
     var process = Process{
+        .end_kind = .open,
+        .end_ns = null,
+
         .pid = spec.pid,
         .parent_pid = spec.parent_pid,
         .depth = spec.depth,
@@ -402,8 +405,10 @@ fn addProcess(self: *Session, spec: ProcessSpec) !usize {
     }
     process.setName(named.text, named.kind);
     process.signal_slot = signals.rememberPid(spec.pid);
-    if (process.signal_slot == null and comptime !builtin.is_test) {
-        log.warn("teardown pid table is full; pid {d} may survive Stop/Ctrl+C", .{spec.pid});
+    if (comptime !builtin.is_test) {
+        if (process.signal_slot == null) {
+            log.warn("teardown pid table is full; pid {d} may survive Stop/Ctrl+C", .{spec.pid});
+        }
     }
     self.processes.appendAssumeCapacity(process);
     self.by_pid.putAssumeCapacity(spec.pid, index);
@@ -429,10 +434,10 @@ fn refreshCwd(self: *Session, index: usize) Allocator.Error!void {
     var buf: [max_path_len + 1]u8 = undefined;
     if (process_ops.readCwd(pid, &buf)) |cwd| {
         switch (process_ops.args_source) {
-            .procfs => try self.processes.items[index].setCwd(&self.metadata, self.gpa, cwd),
+            .procfs => try self.processes.items[index].setCwd(self.gpa, &self.metadata, cwd),
             .process_inspection => try self.processes.items[index].setCwdFromProcessInspection(
-                &self.metadata,
                 self.gpa,
+                &self.metadata,
                 cwd,
             ),
             else => comptime unreachable,
@@ -448,13 +453,13 @@ fn captureMissingMetadata(self: *Session, index: usize) Allocator.Error!void {
             defer owned.deinit(self.gpa);
             switch (process_ops.args_source) {
                 .procfs => try self.processes.items[index].setArgsFromCmdline(
-                    &self.metadata,
                     self.gpa,
+                    &self.metadata,
                     owned.items,
                 ),
                 .process_inspection => try self.processes.items[index].setArgsFromProcessInspection(
-                    &self.metadata,
                     self.gpa,
+                    &self.metadata,
                     owned.items,
                 ),
                 else => comptime unreachable,
@@ -465,14 +470,10 @@ fn captureMissingMetadata(self: *Session, index: usize) Allocator.Error!void {
     if (self.processes.items[index].exe_len == 0) {
         if (process_ops.readExecutable(pid, &path_buf)) |exe| {
             switch (process_ops.args_source) {
-                .procfs => try self.processes.items[index].setExe(
-                    &self.metadata,
-                    self.gpa,
-                    exe,
-                ),
+                .procfs => try self.processes.items[index].setExe(self.gpa, &self.metadata, exe),
                 .process_inspection => try self.processes.items[index].setExeFromProcessInspection(
-                    &self.metadata,
                     self.gpa,
+                    &self.metadata,
                     exe,
                 ),
                 else => comptime unreachable,
@@ -482,14 +483,10 @@ fn captureMissingMetadata(self: *Session, index: usize) Allocator.Error!void {
     if (self.processes.items[index].cwd_len == 0) {
         if (process_ops.readCwd(pid, &path_buf)) |cwd| {
             switch (process_ops.args_source) {
-                .procfs => try self.processes.items[index].setCwd(
-                    &self.metadata,
-                    self.gpa,
-                    cwd,
-                ),
+                .procfs => try self.processes.items[index].setCwd(self.gpa, &self.metadata, cwd),
                 .process_inspection => try self.processes.items[index].setCwdFromProcessInspection(
-                    &self.metadata,
                     self.gpa,
+                    &self.metadata,
                     cwd,
                 ),
                 else => comptime unreachable,
@@ -570,11 +567,7 @@ fn pollSession(self: *Session, collector: *capture.Collector) void {
     }
 }
 
-fn finishRootCapture(
-    self: *Session,
-    collector: *capture.Collector,
-    status: ?u32,
-) void {
+fn finishRootCapture(self: *Session, collector: *capture.Collector, status: ?u32) void {
     // The exit is already enqueued by both kernels, but delivery can race the
     // ordinary poll at the start of this update. Flush that boundary before
     // closing open intervals, then sample descendants that remain alive at
@@ -712,49 +705,13 @@ fn compactMetadata(self: *Session) Allocator.Error!void {
     );
     for (self.processes.items) |*process| {
         for (process.execs.items) |*exec| {
-            remapMetadata(
-                &next,
-                &remap,
-                self.metadata.items,
-                &exec.args_offset,
-                exec.args_len,
-            );
-            remapMetadata(
-                &next,
-                &remap,
-                self.metadata.items,
-                &exec.exe_offset,
-                exec.exe_len,
-            );
-            remapMetadata(
-                &next,
-                &remap,
-                self.metadata.items,
-                &exec.cwd_offset,
-                exec.cwd_len,
-            );
+            remapMetadata(&next, &remap, self.metadata.items, &exec.args_offset, exec.args_len);
+            remapMetadata(&next, &remap, self.metadata.items, &exec.exe_offset, exec.exe_len);
+            remapMetadata(&next, &remap, self.metadata.items, &exec.cwd_offset, exec.cwd_len);
         }
-        remapMetadata(
-            &next,
-            &remap,
-            self.metadata.items,
-            &process.args_offset,
-            process.args_len,
-        );
-        remapMetadata(
-            &next,
-            &remap,
-            self.metadata.items,
-            &process.exe_offset,
-            process.exe_len,
-        );
-        remapMetadata(
-            &next,
-            &remap,
-            self.metadata.items,
-            &process.cwd_offset,
-            process.cwd_len,
-        );
+        remapMetadata(&next, &remap, self.metadata.items, &process.args_offset, process.args_len);
+        remapMetadata(&next, &remap, self.metadata.items, &process.exe_offset, process.exe_len);
+        remapMetadata(&next, &remap, self.metadata.items, &process.cwd_offset, process.cwd_len);
     }
 
     self.metadata.deinit(self.gpa);
@@ -835,12 +792,7 @@ fn ensureParent(self: *Session, parent_pid: std.posix.pid_t, at_ns: u64) ?usize 
 
 // Lost fork of this pid: create it under the root and let applyExec fill
 // kernel metadata.
-fn recoverFromExec(
-    self: *Session,
-    pid: std.posix.pid_t,
-    name: []const u8,
-    at_ns: u64,
-) ?usize {
+fn recoverFromExec(self: *Session, pid: std.posix.pid_t, name: []const u8, at_ns: u64) ?usize {
     const parent_index = self.rootIndex();
     const named: Named = if (name.len > 0) .fromComm(name) else .fromOther("process");
     const index = self.addProcess(.{
@@ -868,12 +820,7 @@ fn recoverFromExec(
 
 // Lost fork of a process that never exec'd: keep a zero-width bar at death
 // so the tgid is not invisible. Duplicate exits of a known pid are ignored.
-fn recoverFromExit(
-    self: *Session,
-    pid: std.posix.pid_t,
-    name: []const u8,
-    at_ns: u64,
-) ?usize {
+fn recoverFromExit(self: *Session, pid: std.posix.pid_t, name: []const u8, at_ns: u64) ?usize {
     if (self.liveIndex(pid) != null) return null;
     if (self.latestIndex(pid)) |index| {
         if (self.processes.items[index].end_ns == at_ns) return null;
@@ -936,14 +883,14 @@ fn applyExec(
     if (event.exe) |exe| {
         (switch (event.metadata_source) {
             .kernel => self.processes.items[index].setExeFromKernel(
-                &self.metadata,
                 self.gpa,
+                &self.metadata,
                 exe,
                 event.exe_truncated,
             ),
             .process_inspection => self.processes.items[index].setExeFromProcessInspection(
-                &self.metadata,
                 self.gpa,
+                &self.metadata,
                 exe,
             ),
         }) catch |err| {
@@ -955,13 +902,13 @@ fn applyExec(
     if (event.args) |args| {
         (switch (event.metadata_source) {
             .kernel => self.processes.items[index].setArgsFromKernel(
-                &self.metadata,
                 self.gpa,
+                &self.metadata,
                 args,
             ),
             .process_inspection => self.processes.items[index].setArgsFromProcessInspection(
-                &self.metadata,
                 self.gpa,
+                &self.metadata,
                 args,
             ),
         }) catch |err| {
@@ -973,14 +920,14 @@ fn applyExec(
     if (event.cwd) |cwd| {
         (switch (event.metadata_source) {
             .kernel => self.processes.items[index].setCwdFromKernel(
-                &self.metadata,
                 self.gpa,
+                &self.metadata,
                 cwd,
                 event.cwd_truncated,
             ),
             .process_inspection => self.processes.items[index].setCwdFromProcessInspection(
-                &self.metadata,
                 self.gpa,
+                &self.metadata,
                 cwd,
             ),
         }) catch |err| {
@@ -1025,10 +972,7 @@ pub fn consumeEvent(self: *Session, event: capture.Event) void {
             }) catch |err| {
                 @branchHint(.cold);
                 self.noteLoss();
-                log.warn(
-                    "dropped process record for pid {d}: {s}",
-                    .{ fork.pid, @errorName(err) },
-                );
+                log.warn("dropped process record for pid {d}: {s}", .{ fork.pid, @errorName(err) });
                 return;
             };
         },
@@ -1087,11 +1031,7 @@ pub fn consumeCpuSnapshot(
     if (!self.running) return;
     const index = self.liveIndex(pid) orelse return;
     const observed_ns = self.eventElapsedNs(timestamp_ns);
-    self.processes.items[index].recordCpuSnapshot(
-        self.gpa,
-        observed_ns,
-        cpu_ns,
-    ) catch |err| {
+    self.processes.items[index].recordCpuSnapshot(self.gpa, observed_ns, cpu_ns) catch |err| {
         @branchHint(.cold);
         self.noteLoss();
         log.warn("could not store CPU slice for pid {d}: {s}", .{ pid, @errorName(err) });
@@ -1132,12 +1072,7 @@ fn execEvent(
     };
 }
 
-fn exitEvent(
-    pid: std.posix.pid_t,
-    timestamp_ns: u64,
-    name: []const u8,
-    cpu_ns: u64,
-) capture.Event {
+fn exitEvent(pid: std.posix.pid_t, timestamp_ns: u64, name: []const u8, cpu_ns: u64) capture.Event {
     return .{
         .timestamp_ns = timestamp_ns,
         .payload = .{ .exit = .{
@@ -1183,6 +1118,14 @@ const escaped_gate_script =
     \\    os._exit(0)
     \\signal.sigwait(release)
 ;
+
+// Model tests consume synthetic events without opening a platform collector.
+fn inertCollector() capture.Collector {
+    return if (comptime capture.backend == .macos)
+        .{ .gpa = std.testing.allocator }
+    else
+        .{};
+}
 
 fn updateUntilStopped(session: *Session, collector: *capture.Collector) !void {
     const started = std.Io.Clock.awake.now(session.io);
@@ -1270,17 +1213,22 @@ test "terminateTargetGroup tears down the whole spawned group" {
         ".zig-cache/tmp/{s}/ready",
         .{temporary.sub_path[0..]},
     );
-    var collector = capture.Collector{}; // Default collector does not load the kernel backend.
+    var collector = inertCollector();
+    defer collector.deinit(); // Default collector does not load the kernel backend.
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "sh",
-        "-c",
-        "sh -c 'kill -STOP $$' & sh -c 'kill -STOP $$' & : > \"$1\"; " ++
-            "kill -STOP $$; wait",
-        "sh",
-        ready_path,
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "sh",
+            "-c",
+            "sh -c 'kill -STOP $$' & sh -c 'kill -STOP $$' & : > \"$1\"; " ++
+                "kill -STOP $$; wait",
+            "sh",
+            ready_path,
+        },
+        .{},
+    );
     const root_pid = session.root_pid.?;
 
     try waitForFile(temporary.dir, testing.io, "ready");
@@ -1303,16 +1251,21 @@ test "stop reaps a job-control-stopped target" {
         ".zig-cache/tmp/{s}/ready",
         .{temporary.sub_path[0..]},
     );
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "sh",
-        "-c",
-        "trap '' TERM; : > \"$1\"; kill -STOP $$",
-        "sh",
-        ready_path,
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "sh",
+            "-c",
+            "trap '' TERM; : > \"$1\"; kill -STOP $$",
+            "sh",
+            ready_path,
+        },
+        .{},
+    );
 
     try waitForFile(temporary.dir, testing.io, "ready");
     session.stop(&collector);
@@ -1335,14 +1288,19 @@ test "stop reaps a job-control-stopped target" {
 
 test "session stops when the root exits while a descendant is still running" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "sh",
-        "-c",
-        "sh -c 'kill -STOP $$' & exec true",
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "sh",
+            "-c",
+            "sh -c 'kill -STOP $$' & exec true",
+        },
+        .{},
+    );
     const root_pid = session.root_pid.?;
     defer signals.terminateTargetGroup(root_pid);
 
@@ -1355,19 +1313,26 @@ test "session stops when the root exits while a descendant is still running" {
 
 test "session ends cleanly across a build-like churn of children" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "sh", "-c",
-        \\i=0
-        \\while [ "$i" -lt 200 ]; do
-        \\  sh -c 'exec true' &
-        \\  sh -c 'exit 0' &
-        \\  i=$((i+1))
-        \\done
-        \\wait
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "sh",
+            "-c",
+            \\i=0
+            \\while [ "$i" -lt 200 ]; do
+            \\  sh -c 'exec true' &
+            \\  sh -c 'exit 0' &
+            \\  i=$((i+1))
+            \\done
+            \\wait
+            ,
+        },
+        .{},
+    );
     try updateUntilStopped(&session, &collector);
     try std.testing.expect(!session.running);
     try std.testing.expect(session.finished);
@@ -1379,7 +1344,8 @@ test "session ends cleanly across a build-like churn of children" {
 }
 
 test "capture events drive the process tree" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
@@ -1406,12 +1372,7 @@ test "capture events drive the process tree" {
     );
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
-    const fork_event = forkEvent(
-        4242,
-        root_pid,
-        base_ns + 10 * std.time.ns_per_ms,
-        "io",
-    );
+    const fork_event = forkEvent(4242, root_pid, base_ns + 10 * std.time.ns_per_ms, "io");
     session.consumeEvent(fork_event);
 
     try std.testing.expectEqual(@as(usize, 2), session.processes.items.len);
@@ -1473,16 +1434,8 @@ test "capture events drive the process tree" {
         session.processes.items[child_index].rowNameSlice(),
     );
 
-    session.consumeCpuSnapshot(
-        4242,
-        2 * std.time.ns_per_ms,
-        base_ns + 13 * std.time.ns_per_ms,
-    );
-    session.consumeCpuSnapshot(
-        4242,
-        4 * std.time.ns_per_ms,
-        base_ns + 14 * std.time.ns_per_ms,
-    );
+    session.consumeCpuSnapshot(4242, 2 * std.time.ns_per_ms, base_ns + 13 * std.time.ns_per_ms);
+    session.consumeCpuSnapshot(4242, 4 * std.time.ns_per_ms, base_ns + 14 * std.time.ns_per_ms);
     session.consumeEvent(execEvent(
         4242,
         base_ns + 14 * std.time.ns_per_ms,
@@ -1514,7 +1467,8 @@ test "capture events drive the process tree" {
 }
 
 test "root exec history coalesces launch and survives metadata compaction" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
@@ -1576,28 +1530,19 @@ test "root exec history coalesces launch and survives metadata compaction" {
 }
 
 test "fork after exit reuses a tgid as a new record" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
     const root_pid = session.root_pid.?;
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
-    var fork_event = forkEvent(
-        4242,
-        root_pid,
-        base_ns + 10 * std.time.ns_per_ms,
-        "cc1plus",
-    );
+    var fork_event = forkEvent(4242, root_pid, base_ns + 10 * std.time.ns_per_ms, "cc1plus");
     session.consumeEvent(fork_event);
     const first_index = session.by_pid.get(4242).?;
 
-    session.consumeEvent(exitEvent(
-        4242,
-        base_ns + 15 * std.time.ns_per_ms,
-        "cc1plus",
-        0,
-    ));
+    session.consumeEvent(exitEvent(4242, base_ns + 15 * std.time.ns_per_ms, "cc1plus", 0));
 
     fork_event.timestamp_ns = base_ns + 20 * std.time.ns_per_ms;
     session.consumeEvent(fork_event);
@@ -1614,19 +1559,15 @@ test "fork after exit reuses a tgid as a new record" {
 }
 
 test "exit closes a live tgid immediately" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
     const root_pid = session.root_pid.?;
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
-    session.consumeEvent(exitEvent(
-        root_pid,
-        base_ns + 5 * std.time.ns_per_ms,
-        "worker",
-        0,
-    ));
+    session.consumeEvent(exitEvent(root_pid, base_ns + 5 * std.time.ns_per_ms, "worker", 0));
 
     try std.testing.expectEqual(
         @as(u64, 5 * std.time.ns_per_ms),
@@ -1635,7 +1576,8 @@ test "exit closes a live tgid immediately" {
 }
 
 test "partial exit CPU preserves the latest cumulative snapshot" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
@@ -1643,12 +1585,7 @@ test "partial exit CPU preserves the latest cumulative snapshot" {
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
     session.consumeCpuSnapshot(root_pid, 10, base_ns + 2 * std.time.ns_per_ms);
-    var exit_event = exitEvent(
-        root_pid,
-        base_ns + 5 * std.time.ns_per_ms,
-        "worker",
-        7,
-    );
+    var exit_event = exitEvent(root_pid, base_ns + 5 * std.time.ns_per_ms, "worker", 7);
     exit_event.payload.exit.cpu_final = false;
     session.consumeEvent(exit_event);
 
@@ -1659,7 +1596,8 @@ test "partial exit CPU preserves the latest cumulative snapshot" {
 }
 
 test "exec can clear inherited metadata without inspecting the live PID" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
@@ -1684,19 +1622,15 @@ test "exec can clear inherited metadata without inspecting the live PID" {
 }
 
 test "fork with unknown parent recovers a stub under the root" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
     const root_pid = session.root_pid.?;
     const base_ns: u64 = @intCast(@max(0, session.started_at.nanoseconds));
 
-    session.consumeEvent(forkEvent(
-        9999,
-        7777,
-        base_ns + 4 * std.time.ns_per_ms,
-        "cc1",
-    ));
+    session.consumeEvent(forkEvent(9999, 7777, base_ns + 4 * std.time.ns_per_ms, "cc1"));
 
     try std.testing.expectEqual(@as(usize, 3), session.processes.items.len);
     const stub_index = session.by_pid.get(7777).?;
@@ -1714,7 +1648,8 @@ test "fork with unknown parent recovers a stub under the root" {
 }
 
 test "exec without a fork recovers the process under the root" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
@@ -1766,7 +1701,8 @@ test "exec without a fork recovers the process under the root" {
 }
 
 test "exit without a fork recovers a zero-duration process" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
@@ -1817,11 +1753,15 @@ test "kernel fork events reach a live collector" {
 
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "sh",
-        "-c",
-        "sh -c 'kill -STOP $$' & wait",
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "sh",
+            "-c",
+            "sh -c 'kill -STOP $$' & wait",
+        },
+        .{},
+    );
 
     try updateUntilProcessCount(&session, &collector, 2);
     try std.testing.expect(session.processes.items.len >= 2);
@@ -1839,12 +1779,16 @@ test "macOS collector captures descendant lifecycle and metadata" {
 
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "/usr/bin/python3",
-        "-c",
-        fork_gate_script,
-        "1",
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "/usr/bin/python3",
+            "-c",
+            fork_gate_script,
+            "1",
+        },
+        .{},
+    );
     try testing.expectEqual(collector.fidelity(), session.capture_fidelity);
 
     try updateUntilProcessCount(&session, &collector, 2);
@@ -1886,12 +1830,16 @@ test "macOS fallback preserves shebang interpreter metadata" {
     defer collector.deinit();
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        script_path,
-        "alpha",
-        "",
-        "omega",
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            script_path,
+            "alpha",
+            "",
+            "omega",
+        },
+        .{},
+    );
 
     const started = std.Io.Clock.awake.now(testing.io);
     while (true) {
@@ -1928,11 +1876,15 @@ test "macOS fallback retains an admitted descendant after setsid" {
     defer collector.deinit();
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "/usr/bin/python3",
-        "-c",
-        escaped_gate_script,
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "/usr/bin/python3",
+            "-c",
+            escaped_gate_script,
+        },
+        .{},
+    );
     try updateUntilProcessCount(&session, &collector, 2);
     process_ops.safeKill(session.root_pid.?, .USR1);
     try updateUntilStopped(&session, &collector);
@@ -1968,11 +1920,15 @@ test "macOS fallback recovers a reparented setsid child by original parent" {
     defer collector.deinit();
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "/usr/bin/python3",
-        "-c",
-        daemon_script,
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "/usr/bin/python3",
+            "-c",
+            daemon_script,
+        },
+        .{},
+    );
 
     try updateUntilStopped(&session, &collector);
     const boundary_ns = session.timelineNs();
@@ -2000,11 +1956,15 @@ test "macOS collector updates one root record across exec" {
 
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "sh",
-        "-c",
-        "exec /bin/sleep 60",
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "sh",
+            "-c",
+            "exec /bin/sleep 60",
+        },
+        .{},
+    );
 
     const started = std.Io.Clock.awake.now(testing.io);
     while (std.mem.indexOf(
@@ -2048,23 +2008,21 @@ test "macOS final flush preserves immediate root exits" {
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
     for (0..24) |_| {
-        try session.start(&collector, &.{
-            "sh",
-            "-c",
-            "exit 37",
-        }, .{});
+        try session.start(
+            &collector,
+            &.{
+                "sh",
+                "-c",
+                "exit 37",
+            },
+            .{},
+        );
         try updateUntilStopped(&session, &collector);
         try testing.expectEqual(RootExit{ .exited = 37 }, session.root_exit);
         try testing.expect(session.finished);
         try testing.expectEqual(@as(usize, 1), session.processes.items.len);
-        try testing.expectEqual(
-            Process.EndKind.observed_exit,
-            session.processes.items[0].end_kind,
-        );
-        try testing.expectEqual(
-            session.processes.items[0].end_ns.?,
-            session.timelineNs(),
-        );
+        try testing.expectEqual(Process.EndKind.observed_exit, session.processes.items[0].end_kind);
+        try testing.expectEqual(session.processes.items[0].end_ns.?, session.timelineNs());
     }
 }
 
@@ -2078,11 +2036,15 @@ test "macOS root exit clips surviving descendants to the event boundary" {
 
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "/usr/bin/python3",
-        "-c",
-        escaped_gate_script,
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "/usr/bin/python3",
+            "-c",
+            escaped_gate_script,
+        },
+        .{},
+    );
     const root_pid = session.root_pid.?;
     defer process_ops.safeKill(-root_pid, .KILL);
 
@@ -2116,12 +2078,16 @@ test "macOS fallback tracks a concurrent descendant burst" {
 
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "/usr/bin/python3",
-        "-c",
-        fork_gate_script,
-        "32",
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "/usr/bin/python3",
+            "-c",
+            fork_gate_script,
+            "32",
+        },
+        .{},
+    );
 
     try updateUntilProcessCount(&session, &collector, 33);
     process_ops.safeKill(session.root_pid.?, .USR1);
@@ -2145,12 +2111,16 @@ test "macOS collector restarts immediately after forced Stop" {
 
     var session = Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.start(&collector, &.{
-        "/usr/bin/python3",
-        "-c",
-        fork_gate_script,
-        "1",
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "/usr/bin/python3",
+            "-c",
+            fork_gate_script,
+            "1",
+        },
+        .{},
+    );
 
     try updateUntilProcessCount(&session, &collector, 2);
     try testing.expect(session.processes.items.len >= 2);
@@ -2161,12 +2131,16 @@ test "macOS collector restarts immediately after forced Stop" {
         try testing.expectEqual(Process.EndKind.capture_clipped, process.end_kind);
     }
 
-    try session.start(&collector, &.{
-        "/usr/bin/python3",
-        "-c",
-        fork_gate_script,
-        "1",
-    }, .{});
+    try session.start(
+        &collector,
+        &.{
+            "/usr/bin/python3",
+            "-c",
+            fork_gate_script,
+            "1",
+        },
+        .{},
+    );
     try updateUntilProcessCount(&session, &collector, 2);
     process_ops.safeKill(session.root_pid.?, .USR1);
     try updateUntilStopped(&session, &collector);
@@ -2175,7 +2149,8 @@ test "macOS collector restarts immediately after forced Stop" {
 }
 
 test "exec does not rebuild tree topology" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
@@ -2184,57 +2159,42 @@ test "exec does not rebuild tree topology" {
     const topology = session.topology_revision;
     const interval = session.interval_revision;
 
-    session.consumeEvent(forkEvent(
-        4242,
-        root_pid,
-        base_ns + 10 * std.time.ns_per_ms,
-        "process",
-    ));
+    session.consumeEvent(forkEvent(4242, root_pid, base_ns + 10 * std.time.ns_per_ms, "process"));
     try std.testing.expect(session.topology_revision != topology);
     const after_fork_topology = session.topology_revision;
     const after_fork_labels = session.label_revision;
 
-    session.consumeEvent(execEvent(
-        4242,
-        base_ns + 12 * std.time.ns_per_ms,
-        "clang",
-        null,
-        null,
-    ));
+    session.consumeEvent(execEvent(4242, base_ns + 12 * std.time.ns_per_ms, "clang", null, null));
     try std.testing.expectEqual(after_fork_topology, session.topology_revision);
     try std.testing.expect(session.label_revision != after_fork_labels);
     try std.testing.expectEqual(interval, session.interval_revision);
 
-    session.consumeEvent(exitEvent(
-        4242,
-        base_ns + 15 * std.time.ns_per_ms,
-        "clang",
-        0,
-    ));
+    session.consumeEvent(exitEvent(4242, base_ns + 15 * std.time.ns_per_ms, "clang", 0));
     try std.testing.expectEqual(after_fork_topology, session.topology_revision);
     try std.testing.expect(session.interval_revision != interval);
     try std.testing.expect(session.by_pid.get(4242) == null);
 }
 
 test "metadata compaction keeps target argv and drops superseded bytes" {
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     var session = Session.init(std.testing.allocator, std.testing.io);
     defer session.deinit();
     try session.start(&collector, held_target_argv, .{});
     const before = session.metadata.items.len;
     try session.processes.items[0].setArgsFromArgv(
-        &session.metadata,
         std.testing.allocator,
+        &session.metadata,
         &.{ "replaced", "argv" },
     );
     try session.processes.items[0].setExe(
-        &session.metadata,
         std.testing.allocator,
+        &session.metadata,
         "/superseded/path",
     );
     try session.processes.items[0].setExe(
-        &session.metadata,
         std.testing.allocator,
+        &session.metadata,
         "/retained/path",
     );
     const after_replace = session.metadata.items.len;
@@ -2288,8 +2248,11 @@ fn boundaryTestSession(gpa: Allocator) !Session {
     errdefer session.deinit();
     session.running = true;
     session.root_pid = 2_000_000_000;
-    const root = try session.addProcess(.{ .pid = session.root_pid.?, .named = .fromOther("root") });
-    try session.processes.items[root].setArgsFromArgv(&session.metadata, gpa, &.{"root"});
+    const root = try session.addProcess(.{
+        .pid = session.root_pid.?,
+        .named = .fromOther("root"),
+    });
+    try session.processes.items[root].setArgsFromArgv(gpa, &session.metadata, &.{"root"});
     session.target_argv_offset = session.processes.items[root].args_offset;
     session.target_argv_len = session.processes.items[root].args_len;
     session.target_argv_count = session.processes.items[root].args_count;
@@ -2306,7 +2269,8 @@ test "root boundary clips a later child exit and its CPU" {
     const testing = std.testing;
     var session = try boundaryTestSession(testing.allocator);
     defer session.deinit();
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     const child_pid = session.root_pid.? + 1;
     session.consumeEvent(forkEvent(child_pid, session.root_pid.?, 2, "child"));
     session.consumeCpuSnapshot(child_pid, 6, 8);
@@ -2338,7 +2302,8 @@ test "root boundary restores the image before later child execs" {
     const testing = std.testing;
     var session = try boundaryTestSession(testing.allocator);
     defer session.deinit();
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     const child_pid = session.root_pid.? + 1;
     session.consumeEvent(forkEvent(child_pid, session.root_pid.?, 2, "child"));
     session.consumeEvent(execEvent(child_pid, 3, "before", "/bin/before", "before\x00"));
@@ -2361,7 +2326,8 @@ test "root boundary removes later births and remaps retained parents without all
     var failing: testing.FailingAllocator = .init(testing.allocator, .{});
     var session = try boundaryTestSession(failing.allocator());
     defer session.deinit();
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     const root_pid = session.root_pid.?;
     session.consumeEvent(forkEvent(root_pid + 1, root_pid, 12, "discard"));
     session.consumeEvent(forkEvent(root_pid + 2, root_pid, 4, "keep"));
@@ -2382,7 +2348,8 @@ test "root boundary restores a surviving child image after root exit" {
     const testing = std.testing;
     var session = try boundaryTestSession(testing.allocator);
     defer session.deinit();
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     const child_pid = session.root_pid.? + 1;
     session.consumeEvent(forkEvent(child_pid, session.root_pid.?, 2, "child"));
     session.consumeEvent(exitEvent(session.root_pid.?, 10, "root", 0));
@@ -2399,7 +2366,8 @@ test "analysis accepts a child outliving its intermediate parent" {
     const testing = std.testing;
     var session = try boundaryTestSession(testing.allocator);
     defer session.deinit();
-    var collector = capture.Collector{};
+    var collector = inertCollector();
+    defer collector.deinit();
     const root_pid = session.root_pid.?;
     session.consumeEvent(forkEvent(root_pid + 1, root_pid, 5, "parent"));
     session.consumeEvent(forkEvent(root_pid + 2, root_pid + 1, 8, "child"));
@@ -2411,12 +2379,23 @@ test "analysis accepts a child outliving its intermediate parent" {
     var writer: std.Io.Writer.Allocating = .init(testing.allocator);
     defer writer.deinit();
     try analysis_file.write(testing.allocator, &session, &writer.writer);
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, writer.written(), .{});
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        writer.written(),
+        .{},
+    );
     defer parsed.deinit();
     const processes = parsed.value.object.get("processes").?.array.items;
-    try testing.expectEqual(@as(i64, 2), processes[1].object.get("child_lifetime_span_ns").?.integer);
+    try testing.expectEqual(
+        @as(i64, 2),
+        processes[1].object.get("child_lifetime_span_ns").?.integer,
+    );
     try testing.expectEqual(@as(i64, 4), processes[2].object.get("wall_time_ns").?.integer);
-    try testing.expectEqual(@as(i64, 3), processes[0].object.get("inclusive_process_count").?.integer);
+    try testing.expectEqual(
+        @as(i64, 3),
+        processes[0].object.get("inclusive_process_count").?.integer,
+    );
     try testing.expect(std.mem.indexOf(u8, writer.written(), "complete_child_containment") == null);
 }
 

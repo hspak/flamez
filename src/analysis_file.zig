@@ -3,10 +3,10 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const Process = @import("tracer/Process.zig");
-const Session = @import("tracer/Session.zig");
 
-const log = std.log.scoped(.analysis_file);
+const tracer = @import("tracer.zig");
+const Process = tracer.Process;
+const Session = tracer.Session;
 
 const max_preview_head_args: usize = 4;
 const max_preview_tail_args: usize = 4;
@@ -169,11 +169,7 @@ const Ranking = enum {
 };
 
 /// Writes an analysis view of a validated, finished session.
-pub fn write(
-    gpa: Allocator,
-    session: *const Session,
-    writer: *std.Io.Writer,
-) WriteError!void {
+pub fn write(gpa: Allocator, session: *const Session, writer: *std.Io.Writer) WriteError!void {
     return writeWithOptions(gpa, session, writer, .{});
 }
 
@@ -244,14 +240,7 @@ pub fn writeWithOptions(
     try json.objectField("parallelism");
     try writeParallelism(&json, session, &analysis);
     try json.objectField("hotspots");
-    try writeRanking(
-        &json,
-        session,
-        analysis.processes,
-        analysis.totals,
-        .self_cpu_time,
-        redact,
-    );
+    try writeRanking(&json, session, analysis.processes, analysis.totals, .self_cpu_time, redact);
     try json.objectField("stall_candidates");
     try writeRanking(
         &json,
@@ -514,7 +503,10 @@ fn buildCommandIndex(
             const digest = commandDigest(process.execAt(exec_index), session.metadata.items);
             const entry = try by_digest.getOrPut(gpa, digest);
             if (!entry.found_existing) {
-                errdefer std.debug.assert(by_digest.remove(digest));
+                errdefer {
+                    const removed = by_digest.remove(digest);
+                    std.debug.assert(removed);
+                }
                 entry.value_ptr.* = items.items.len;
                 try items.append(gpa, .{
                     .process_id = process_id,
@@ -700,11 +692,7 @@ fn writeCapture(json: *std.json.Stringify, session: *const Session, totals: Tota
     try field(json, "incomplete", session.isIncomplete());
     try field(json, "loss_count", session.loss_count);
     try field(json, "recovered_process_count", totals.recovered_process_count);
-    try field(
-        json,
-        "capture_clipped_process_count",
-        totals.capture_clipped_process_count,
-    );
+    try field(json, "capture_clipped_process_count", totals.capture_clipped_process_count);
     try field(json, "partial_cpu_process_count", totals.partial_cpu_process_count);
     try field(json, "elapsed_ns", session.elapsed_ns);
     try field(json, "cpu_sample_period_ns", session.sample_period_ns);
@@ -716,11 +704,7 @@ fn writeCapture(json: *std.json.Stringify, session: *const Session, totals: Tota
     try json.endObject();
 }
 
-fn writeInvariantStatus(
-    json: *std.json.Stringify,
-    session: *const Session,
-    totals: Totals,
-) !void {
+fn writeInvariantStatus(json: *std.json.Stringify, session: *const Session, totals: Totals) !void {
     const complete_lifecycle = !session.isIncomplete() and
         totals.capture_clipped_process_count == 0;
     const complete_cpu = !session.isIncomplete() and totals.partial_cpu_process_count == 0;
@@ -763,11 +747,7 @@ fn writeTotals(json: *std.json.Stringify, session: *const Session, totals: Total
         try json.write(@as(?usize, null));
     }
     try field(json, "observed_exec_transition_count", totals.exec_transition_count);
-    try field(
-        json,
-        "exec_transition_count_complete",
-        totals.exec_transition_count_complete,
-    );
+    try field(json, "exec_transition_count_complete", totals.exec_transition_count_complete);
     try field(json, "self_cpu_time_ns", totals.self_cpu_time_ns);
     try field(
         json,
@@ -778,11 +758,7 @@ fn writeTotals(json: *std.json.Stringify, session: *const Session, totals: Total
     try json.endObject();
 }
 
-fn writeEnvironment(
-    json: *std.json.Stringify,
-    session: *const Session,
-    redact: bool,
-) !void {
+fn writeEnvironment(json: *std.json.Stringify, session: *const Session, redact: bool) !void {
     const environment = session.environment;
     try json.beginObject();
     try json.objectField("generated_at");
@@ -882,11 +858,7 @@ fn writeTarget(
     try json.objectField("observed");
     try json.beginObject();
     try field(json, "process_id", @as(usize, 0));
-    try field(
-        json,
-        "final_command_id",
-        analysis.commandId(0, root.execCount() - 1),
-    );
+    try field(json, "final_command_id", analysis.commandId(0, root.execCount() - 1));
     try json.objectField("command");
     try writeCommand(json, observed, session.metadata.items, redact);
     try json.endObject();
@@ -904,9 +876,7 @@ fn writeCommands(
         var id_buffer: [32]u8 = undefined;
         const id = std.fmt.bufPrint(&id_buffer, "{d}", .{command_id}) catch unreachable;
         try json.objectField(id);
-        const exec = session.processes.items[command_ref.process_id].execAt(
-            command_ref.exec_index,
-        );
+        const exec = session.processes.items[command_ref.process_id].execAt(command_ref.exec_index);
         try writeCommand(json, exec, session.metadata.items, redact);
     }
     try json.endObject();
@@ -1134,11 +1104,7 @@ fn componentName(component: Component) []const u8 {
     return @tagName(component);
 }
 
-fn writeDiagnostics(
-    json: *std.json.Stringify,
-    session: *const Session,
-    totals: Totals,
-) !void {
+fn writeDiagnostics(json: *std.json.Stringify, session: *const Session, totals: Totals) !void {
     try json.beginArray();
     const environment = session.environment;
     if (environment.started_at_unix_seconds == null or
@@ -1261,14 +1227,7 @@ fn writeBottlenecks(
     try json.endArray();
     try json.endObject();
     try json.objectField("wall_time_stragglers");
-    try writeRanking(
-        json,
-        session,
-        analysis.processes,
-        analysis.totals,
-        .wall_time,
-        redact,
-    );
+    try writeRanking(json, session, analysis.processes, analysis.totals, .wall_time, redact);
     try json.endObject();
 }
 
@@ -1424,11 +1383,7 @@ fn writeProcess(
     } else {
         try json.write(@as(?usize, null));
     }
-    try field(
-        json,
-        "final_command_id",
-        analysis.commandId(derived.id, process.execCount() - 1),
-    );
+    try field(json, "final_command_id", analysis.commandId(derived.id, process.execCount() - 1));
     try json.objectField("command_intervals");
     try json.beginArray();
     for (0..process.execCount()) |exec_index| {
@@ -1524,7 +1479,11 @@ fn writeAnalysisLabel(
 fn classifyCommand(exec: Process.Exec, metadata: []const u8) Classification {
     const tool = normalizedTool(exec, metadata);
     if (std.mem.eql(u8, tool, "unknown")) {
-        return .{ .tool = tool, .action = "unknown", .method = "unknown" };
+        return .{
+            .tool = tool,
+            .action = "unknown",
+            .method = "unknown",
+        };
     }
 
     var result = Classification{
@@ -1674,11 +1633,7 @@ fn sourceLanguage(path: []const u8) ?[]const u8 {
     return null;
 }
 
-fn zigOutputKind(
-    subcommand: []const u8,
-    exec: Process.Exec,
-    metadata: []const u8,
-) ?[]const u8 {
+fn zigOutputKind(subcommand: []const u8, exec: Process.Exec, metadata: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, subcommand, "build-lib")) return "library";
     if (std.mem.eql(u8, subcommand, "build-exe")) return "executable";
     if (std.mem.eql(u8, subcommand, "build-obj")) return "object";
@@ -1703,11 +1658,7 @@ fn hasArgumentPrefix(exec: Process.Exec, metadata: []const u8, prefix: []const u
     return false;
 }
 
-fn argumentValue(
-    exec: Process.Exec,
-    metadata: []const u8,
-    expected: []const u8,
-) ?[]const u8 {
+fn argumentValue(exec: Process.Exec, metadata: []const u8, expected: []const u8) ?[]const u8 {
     var args = exec.argsIter(metadata);
     _ = args.next();
     while (args.next()) |arg| {
@@ -1752,11 +1703,7 @@ fn classifyComponent(primary_input: ?[]const u8) ?[]const u8 {
     return null;
 }
 
-fn writeCommandLabel(
-    json: *std.json.Stringify,
-    exec: Process.Exec,
-    metadata: []const u8,
-) !void {
+fn writeCommandLabel(json: *std.json.Stringify, exec: Process.Exec, metadata: []const u8) !void {
     var specialized_buffer: [label_bytes]u8 = undefined;
     if (zigCompilerLabel(exec, metadata, &specialized_buffer)) |label| {
         _ = try writeDisplay(json, label, label_bytes);
@@ -1780,25 +1727,17 @@ fn analysisExec(process: *const Process) Process.Exec {
     return process.execAt(process.execCount() - 1);
 }
 
-fn commandIntervalKind(
-    process: *const Process,
-    exec: Process.Exec,
-    exec_index: usize,
-) []const u8 {
+fn commandIntervalKind(process: *const Process, exec: Process.Exec, exec_index: usize) []const u8 {
     if (process.origin != .observed) return "recovered";
     if (exec_index != 0) return "exec";
     return switch (exec.args_source) {
         .inherited => "inherited",
         .launch => "launch",
-        else => "initial_observation",
+        .unavailable, .kernel, .procfs, .process_inspection => "initial_observation",
     };
 }
 
-fn zigCompilerLabel(
-    exec: Process.Exec,
-    metadata: []const u8,
-    output: []u8,
-) ?[]const u8 {
+fn zigCompilerLabel(exec: Process.Exec, metadata: []const u8, output: []u8) ?[]const u8 {
     if (!std.mem.eql(u8, exec.nameSlice(), "zig")) return null;
     var args = exec.argsIter(metadata);
     _ = args.next();
@@ -1866,11 +1805,7 @@ fn writeArgv(
     try json.endObject();
 }
 
-fn writeArgvDigest(
-    json: *std.json.Stringify,
-    exec: Process.Exec,
-    metadata: []const u8,
-) !void {
+fn writeArgvDigest(json: *std.json.Stringify, exec: Process.Exec, metadata: []const u8) !void {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var args = exec.argsIter(metadata);
     while (args.next()) |arg| {
@@ -1898,11 +1833,7 @@ fn writeOptionalPath(
     _ = try writeDisplay(json, path, Process.max_path_len);
 }
 
-fn writeDisplay(
-    json: *std.json.Stringify,
-    bytes: []const u8,
-    comptime max_bytes: usize,
-) !bool {
+fn writeDisplay(json: *std.json.Stringify, bytes: []const u8, comptime max_bytes: usize) !bool {
     const truncated = bytes.len > max_bytes;
     const source = bytes[0..@min(bytes.len, max_bytes)];
     var buffer: [max_bytes * 4 + 3]u8 = undefined;
@@ -2021,11 +1952,7 @@ test "writer emits pretty v1 derived data without canonical bulk" {
     try testing.expect(std.mem.endsWith(u8, json, "}\n"));
     try testing.expect(std.mem.indexOf(u8, json, "\"version\": 1") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"self_cpu_time_ns\": 200000") != null);
-    try testing.expect(std.mem.indexOf(
-        u8,
-        json,
-        "\"self_average_cpu_millicores\": 13",
-    ) != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"self_average_cpu_millicores\": 13") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"wall_time_ns\": 15000000") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"command_interval_count\": 2") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"label\": \"clang source.c\"") != null);
@@ -2043,9 +1970,14 @@ test "writer optionally emits minified transport JSON" {
 
     var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
-    try writeWithOptions(testing.allocator, &session, &output.writer, .{
-        .formatting = .minified,
-    });
+    try writeWithOptions(
+        testing.allocator,
+        &session,
+        &output.writer,
+        .{
+            .formatting = .minified,
+        },
+    );
     try testing.expect(std.mem.startsWith(u8, output.written(), "{\"$schema\":"));
     try testing.expectEqual(
         output.written().len - 1,
@@ -2131,10 +2063,7 @@ test "writer interns classified commands and keeps argument head tail and digest
         .get("component_aggregates").?.object
         .get("items").?.array.items;
     try testing.expectEqual(@as(usize, 1), component_items.len);
-    try testing.expectEqualStrings(
-        "raylib",
-        component_items[0].object.get("component").?.string,
-    );
+    try testing.expectEqualStrings("raylib", component_items[0].object.get("component").?.string);
     try testing.expectEqual(
         @as(i64, 20),
         component_items[0].object.get("self_cpu_sum_ns").?.integer,
@@ -2159,19 +2088,13 @@ test "writer interns classified commands and keeps argument head tail and digest
         root.get("environment").?.object.get("optimize_mode").?.string,
     );
     const cache = root.get("cache").?.object;
-    try testing.expectEqualStrings(
-        ".zig-cache",
-        cache.get("local_directory").?.string,
-    );
-    try testing.expectEqualStrings(
-        "/cache/zig",
-        cache.get("global_directory").?.string,
-    );
+    try testing.expectEqualStrings(".zig-cache", cache.get("local_directory").?.string);
+    try testing.expectEqualStrings("/cache/zig", cache.get("global_directory").?.string);
 }
 
 test "redacted export removes captured paths previews digests and host fingerprints" {
     const testing = std.testing;
-    const CaptureEnvironment = @import("tracer/CaptureEnvironment.zig");
+    const CaptureEnvironment = tracer.CaptureEnvironment;
     const session_file = @import("session_file.zig");
     var input: std.Io.Reader = .fixed(classification_fixture);
     var diagnostics: session_file.Diagnostics = .{};
@@ -2181,9 +2104,14 @@ test "redacted export removes captured paths previews digests and host fingerpri
 
     var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
-    try writeWithOptions(testing.allocator, &session, &output.writer, .{
-        .privacy = .redacted,
-    });
+    try writeWithOptions(
+        testing.allocator,
+        &session,
+        &output.writer,
+        .{
+            .privacy = .redacted,
+        },
+    );
     const bytes = output.written();
     try testing.expect(std.mem.indexOf(u8, bytes, "/deps/raylib") == null);
     try testing.expect(std.mem.indexOf(u8, bytes, "/workspace/flamez") == null);

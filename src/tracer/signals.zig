@@ -5,8 +5,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const process_ops = @import("process_ops.zig");
 
-const log = std.log.scoped(.signals);
-
 /// Arms the escape hatch for `pid`'s process group.
 pub fn armTargetGroup(pid: std.posix.pid_t) void {
     live_target_pgid.store(pid, .release);
@@ -253,8 +251,5 @@ test "tracked pid slots are released without a table scan" {
     try std.testing.expectEqual(first, rememberPid(20_003).?);
     // A stale owner cannot clear a slot that has already been reused.
     forgetPid(first, 20_001);
-    try std.testing.expectEqual(
-        @as(std.posix.pid_t, 20_003),
-        tracked_pids[first].load(.monotonic),
-    );
+    try std.testing.expectEqual(@as(std.posix.pid_t, 20_003), tracked_pids[first].load(.monotonic));
 }

@@ -3,8 +3,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-const log = std.log.scoped(.layout);
-
 const clay = @import("zclay");
 const rl = @import("raylib");
 const App = @import("App.zig");
@@ -20,8 +18,10 @@ pub const process_row_height: f32 = 28;
 pub const detail_pane_fraction: f32 = 0.6;
 
 pub const ViewText = struct {
-    fps: [32]u8 = [_]u8{0} ** 32,
-    fps_len: usize = 0,
+    fps: if (build_options.fps_counter) [32]u8 else void =
+        if (build_options.fps_counter) [_]u8{0} ** 32 else {},
+    fps_len: if (build_options.fps_counter) usize else void =
+        if (build_options.fps_counter) 0 else {},
     status: [64]u8 = [_]u8{0} ** 64,
     status_len: usize = 0,
     elapsed: [32]u8 = [_]u8{0} ** 32,
@@ -34,6 +34,7 @@ pub const ViewText = struct {
     dropped_len: usize = 0,
 
     fn fpsSlice(self: *const ViewText) []const u8 {
+        if (comptime !build_options.fps_counter) return "";
         return self.fps[0..self.fps_len];
     }
     fn statusSlice(self: *const ViewText) []const u8 {
@@ -345,7 +346,7 @@ test "FPS counter build option controls footer text" {
         try testing.expect(std.mem.endsWith(u8, view_text.fpsSlice(), " FPS"));
         try testing.expect(view_text.fps_len > " FPS".len);
     } else {
-        try testing.expectEqual(@as(usize, 0), view_text.fps_len);
+        try testing.expectEqualStrings("", view_text.fpsSlice());
     }
 }
 
@@ -383,11 +384,31 @@ test "footer status owns static and formatted text" {
         .{ .expected = "READY" },
         .{ .running = true, .expected = "RUNNING" },
         .{ .finished = true, .expected = "FINISHED" },
-        .{ .running = true, .loss_count = 1, .expected = "INCOMPLETE" },
-        .{ .finished = true, .loss_count = 1, .expected = "INCOMPLETE" },
-        .{ .finished = true, .root_exit = .{ .exited = 2 }, .expected = "FINISHED · EXIT 2" },
-        .{ .finished = true, .root_exit = .{ .signaled = 9 }, .expected = "STOPPED · SIGNAL 9" },
-        .{ .loss_count = 1, .root_exit = .{ .exited = 2 }, .expected = "INCOMPLETE · EXIT 2" },
+        .{
+            .running = true,
+            .loss_count = 1,
+            .expected = "INCOMPLETE",
+        },
+        .{
+            .finished = true,
+            .loss_count = 1,
+            .expected = "INCOMPLETE",
+        },
+        .{
+            .finished = true,
+            .root_exit = .{ .exited = 2 },
+            .expected = "FINISHED · EXIT 2",
+        },
+        .{
+            .finished = true,
+            .root_exit = .{ .signaled = 9 },
+            .expected = "STOPPED · SIGNAL 9",
+        },
+        .{
+            .loss_count = 1,
+            .root_exit = .{ .exited = 2 },
+            .expected = "INCOMPLETE · EXIT 2",
+        },
     };
     for (cases) |case| {
         var session = tracer.Session.init(testing.allocator, testing.io);

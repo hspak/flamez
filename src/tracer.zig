@@ -2,27 +2,26 @@
 //! ingests backend-neutral lifecycle events and CPU snapshots, and maintains
 //! process lifetimes and activity slices for the UI.
 
-const process_mod = @import("tracer/Process.zig");
-const capture = @import("tracer/capture.zig");
+pub const Process = @import("tracer/Process.zig");
+pub const capture = @import("tracer/capture.zig");
 const signals = @import("tracer/signals.zig");
 
 /// Spawn orchestration and the process timeline.
 pub const Session = @import("tracer/Session.zig");
+pub const CaptureEnvironment = @import("tracer/CaptureEnvironment.zig");
 /// Finished-session JSON import and export.
 pub const session_file = @import("session_file.zig");
 /// Compact derived JSON for automated performance analysis.
 pub const analysis_file = @import("analysis_file.zig");
-/// One captured process record.
-pub const Process = process_mod;
 /// How a record's display name was derived (kernel comm vs. fallback label).
-pub const NameKind = process_mod.NameKind;
+pub const NameKind = Process.NameKind;
 /// How a process record entered the session (observed vs recovered).
-pub const Origin = process_mod.Origin;
+pub const Origin = Process.Origin;
 /// How a lifetime ended (observed exit vs capture boundary).
-pub const EndKind = process_mod.EndKind;
+pub const EndKind = Process.EndKind;
 
-pub const max_name_len = process_mod.max_name_len;
-pub const max_path_len = process_mod.max_path_len;
+pub const max_name_len = Process.max_name_len;
+pub const max_path_len = Process.max_path_len;
 pub const cpu_sample_period_ns = Session.default_cpu_sample_period_ns;
 
 /// Process-event collector selected for the target operating system.

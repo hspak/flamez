@@ -3,11 +3,26 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+
+const log = std.log.scoped(.ebpf);
 const build_options = @import("build_options");
 const capture = @import("../capture.zig");
 const Event = capture.Event;
 
-const log = std.log.scoped(.ebpf);
+const Linux = @This();
+
+/// Owned libbpf handle; `deinit` closes it when non-null.
+handle: ?*Handle = null,
+/// Cumulative kernel loss plus failed userspace CPU snapshots.
+lost_events: u64 = 0,
+kernel_loss_seen: u64 = 0,
+diagnostic_buffer: [512]u8 = [_]u8{0} ** 512,
+diagnostic_len: usize = 0,
+cpu_snapshot_error: c_int = 0,
+/// Result of the latest nonblocking ring-buffer poll.
+last_ring_events: i32 = 0,
+/// Number of samples delivered by the latest successful CPU snapshot.
+last_cpu_samples: usize = 0,
 
 const Kind = enum(u32) {
     fork = 1,
@@ -112,212 +127,191 @@ fn supported() bool {
     return builtin.os.tag == .linux and build_options.ebpf;
 }
 
-/// Owns one attached eBPF capture and normalizes its records for `Session`.
-pub const Collector = struct {
-    /// Owned libbpf handle; `deinit` closes it when non-null.
-    handle: ?*Handle = null,
-    /// Cumulative kernel loss plus failed userspace CPU snapshots.
-    lost_events: u64 = 0,
-    kernel_loss_seen: u64 = 0,
-    diagnostic_buffer: [512]u8 = [_]u8{0} ** 512,
-    diagnostic_len: usize = 0,
-    cpu_snapshot_error: c_int = 0,
-    /// Result of the latest nonblocking ring-buffer poll.
-    last_ring_events: i32 = 0,
-    /// Number of samples delivered by the latest successful CPU snapshot.
-    last_cpu_samples: usize = 0,
+// Rendering and collection share one thread, so the callback target only
+// needs to remain set while the ring buffer is polled.
+var active_sink: ?capture.Sink = null;
 
-    // Rendering and collection share one thread, so the callback target only
-    // needs to remain set while the ring buffer is polled.
-    var active_sink: ?capture.Sink = null;
-
-    /// Loads the BPF object. On failure `available()` returns false and
-    /// `diagnosticSlice()` explains why; callers are expected to abort startup.
-    pub fn init(_: std.mem.Allocator) Collector {
-        var self = Collector{};
-        if (comptime !supported()) {
-            self.setDiagnostic("the Linux eBPF collector is not included in this build");
-            return self;
-        }
-        if (comptime builtin.is_test) pointShimAtCompiledObject();
-        self.handle = flamez_ebpf_open(
-            onEvent,
-            null,
-            &self.diagnostic_buffer,
-            self.diagnostic_buffer.len,
-        );
-        if (self.handle == null) {
-            const nul = std.mem.indexOfScalar(u8, &self.diagnostic_buffer, 0);
-            self.diagnostic_len = nul orelse self.diagnostic_buffer.len;
-        }
+/// Loads the BPF object. On failure `available()` returns false and
+/// `diagnosticSlice()` explains why; callers are expected to abort startup.
+pub fn init(_: std.mem.Allocator) Linux {
+    var self = Linux{};
+    if (comptime !supported()) {
+        self.setDiagnostic("the Linux eBPF collector is not included in this build");
         return self;
     }
+    if (comptime builtin.is_test) pointShimAtCompiledObject();
+    self.handle = flamez_ebpf_open(
+        onEvent,
+        null,
+        &self.diagnostic_buffer,
+        self.diagnostic_buffer.len,
+    );
+    if (self.handle == null) {
+        const nul = std.mem.indexOfScalar(u8, &self.diagnostic_buffer, 0);
+        self.diagnostic_len = nul orelse self.diagnostic_buffer.len;
+    }
+    return self;
+}
 
-    /// Detaches every program, closes the BPF object, and invalidates `self`.
-    pub fn deinit(self: *Collector) void {
-        if (comptime supported()) {
-            if (self.handle) |handle| flamez_ebpf_close(handle);
+/// Detaches every program, closes the BPF object, and invalidates `self`.
+pub fn deinit(self: *Linux) void {
+    if (comptime supported()) {
+        if (self.handle) |handle| flamez_ebpf_close(handle);
+    }
+    self.* = undefined;
+}
+
+/// Returns whether initialization produced a live collector handle.
+pub fn available(self: *const Linux) bool {
+    return self.handle != null;
+}
+
+/// Clears the process's effective, permitted, and inheritable capability
+/// sets after the programs attach and before the target is spawned.
+pub fn dropPrivileges(self: *const Linux) capture.DropPrivilegesError!void {
+    if (comptime supported()) {
+        if (self.handle != null and flamez_ebpf_drop_capabilities() != 0)
+            return error.PrivilegeDropRejected;
+    }
+}
+
+/// Returns collector-owned initialization or capture diagnostics.
+pub fn diagnosticSlice(self: *const Linux) []const u8 {
+    return self.diagnostic_buffer[0..self.diagnostic_len];
+}
+
+/// Linux eBPF delivers every admitted lifecycle transition or reports loss.
+pub fn fidelity(_: *const Linux) capture.Fidelity {
+    return .exact;
+}
+
+/// Ensures the spawned root belongs to this capture.
+pub fn trackRoot(self: *Linux, pid: std.posix.pid_t) capture.TrackRootError!void {
+    if (comptime supported()) {
+        if (self.handle) |handle| {
+            if (flamez_ebpf_track_pid(handle, pid) != 0)
+                return error.LaunchTrackingRejected;
         }
-        self.* = undefined;
     }
+}
 
-    /// Returns whether initialization produced a live collector handle.
-    pub fn available(self: *const Collector) bool {
-        return self.handle != null;
-    }
-
-    /// Clears the process's effective, permitted, and inheritable capability
-    /// sets after the programs attach and before the target is spawned.
-    pub fn dropPrivileges(self: *const Collector) capture.DropPrivilegesError!void {
-        if (comptime supported()) {
-            if (self.handle != null and flamez_ebpf_drop_capabilities() != 0)
-                return error.PrivilegeDropRejected;
+/// Arms exactly the next process spawned by `pid` as a tracked root.
+pub fn armLaunch(self: *Linux, pid: std.posix.pid_t) capture.ArmLaunchError!void {
+    if (comptime supported()) {
+        if (self.handle) |handle| {
+            if (flamez_ebpf_seed_parent(handle, pid) != 0)
+                return error.LaunchTrackingRejected;
         }
     }
+}
 
-    /// Returns collector-owned initialization or capture diagnostics.
-    pub fn diagnosticSlice(self: *const Collector) []const u8 {
-        return self.diagnostic_buffer[0..self.diagnostic_len];
+/// Removes a launcher or process from backend tracking.
+pub fn untrack(self: *Linux, pid: std.posix.pid_t) void {
+    if (comptime supported()) {
+        if (self.handle) |handle| flamez_ebpf_untrack_pid(handle, pid);
     }
+}
 
-    /// Linux eBPF delivers every admitted lifecycle transition or reports loss.
-    pub fn fidelity(_: *const Collector) capture.Fidelity {
-        return .exact;
-    }
+fn setDiagnostic(self: *Linux, value: []const u8) void {
+    const amount = @min(value.len, self.diagnostic_buffer.len);
+    @memcpy(self.diagnostic_buffer[0..amount], value[0..amount]);
+    self.diagnostic_len = amount;
+}
 
-    /// Ensures the spawned root belongs to this capture.
-    pub fn trackRoot(self: *Collector, pid: std.posix.pid_t) capture.TrackRootError!void {
-        if (comptime supported()) {
-            if (self.handle) |handle| {
-                if (flamez_ebpf_track_pid(handle, pid) != 0)
-                    return error.LaunchTrackingRejected;
+/// Drains pending lifecycle events without blocking and delivers them to `sink`.
+pub fn pollEvents(self: *Linux, sink: capture.Sink) void {
+    if (comptime supported()) {
+        active_sink = sink;
+        defer active_sink = null;
+        if (self.handle) |handle| {
+            self.last_ring_events = flamez_ebpf_poll(handle);
+            const lost = flamez_ebpf_lost_events(handle);
+            if (lost > self.kernel_loss_seen) {
+                log.warn(
+                    "eBPF capture dropped {d} events or accounting updates",
+                    .{lost - self.kernel_loss_seen},
+                );
+                self.lost_events +|= lost - self.kernel_loss_seen;
+                self.kernel_loss_seen = lost;
             }
         }
     }
+}
 
-    /// Arms exactly the next process spawned by `pid` as a tracked root.
-    pub fn armLaunch(self: *Collector, pid: std.posix.pid_t) capture.ArmLaunchError!void {
-        if (comptime supported()) {
-            if (self.handle) |handle| {
-                if (flamez_ebpf_seed_parent(handle, pid) != 0)
-                    return error.LaunchTrackingRejected;
-            }
-        }
+/// Drains lifecycle records enqueued before the root was observed reaped.
+pub fn flushEvents(self: *Linux, sink: capture.Sink) void {
+    self.pollEvents(sink);
+}
+
+/// Reads cumulative process CPU totals once and delivers them to `sink`.
+pub fn snapshotCpu(self: *Linux, sink: capture.Sink) void {
+    if (comptime !supported()) return;
+    const handle = self.handle orelse return;
+    var samples_ptr: ?[*]const RawCpuTotal = null;
+    var count: usize = 0;
+    var timestamp_ns: u64 = 0;
+    const snapshot_result = flamez_ebpf_snapshot_cpu(handle, &samples_ptr, &count, &timestamp_ns);
+    if (snapshot_result != 0 and snapshot_result != self.cpu_snapshot_error) {
+        log.warn("could not snapshot process CPU accounting: {d}", .{snapshot_result});
     }
-
-    /// Removes a launcher or process from backend tracking.
-    pub fn untrack(self: *Collector, pid: std.posix.pid_t) void {
-        if (comptime supported()) {
-            if (self.handle) |handle| flamez_ebpf_untrack_pid(handle, pid);
-        }
+    self.cpu_snapshot_error = snapshot_result;
+    self.last_cpu_samples = if (snapshot_result == 0) count else 0;
+    if (snapshot_result != 0) {
+        self.lost_events +|= 1;
+        self.setDiagnostic("a CPU accounting snapshot failed; capture is incomplete");
+        return;
     }
-
-    fn setDiagnostic(self: *Collector, value: []const u8) void {
-        const amount = @min(value.len, self.diagnostic_buffer.len);
-        @memcpy(self.diagnostic_buffer[0..amount], value[0..amount]);
-        self.diagnostic_len = amount;
+    // The C shim owns this buffer until the next snapshot or collector teardown.
+    const samples = (samples_ptr orelse return)[0..count];
+    for (samples) |sample| {
+        sink.cpuSample(@intCast(sample.tgid), sample.total_ns, timestamp_ns);
     }
+}
 
-    /// Drains pending lifecycle events without blocking and delivers them to `sink`.
-    pub fn pollEvents(self: *Collector, sink: capture.Sink) void {
-        if (comptime supported()) {
-            active_sink = sink;
-            defer active_sink = null;
-            if (self.handle) |handle| {
-                self.last_ring_events = flamez_ebpf_poll(handle);
-                const lost = flamez_ebpf_lost_events(handle);
-                if (lost > self.kernel_loss_seen) {
-                    log.warn(
-                        "eBPF capture dropped {d} events or accounting updates",
-                        .{lost - self.kernel_loss_seen},
-                    );
-                    self.lost_events +|= lost - self.kernel_loss_seen;
-                    self.kernel_loss_seen = lost;
-                }
-            }
-        }
-    }
-
-    /// Drains lifecycle records enqueued before the root was observed reaped.
-    pub fn flushEvents(self: *Collector, sink: capture.Sink) void {
-        self.pollEvents(sink);
-    }
-
-    /// Reads cumulative process CPU totals once and delivers them to `sink`.
-    pub fn snapshotCpu(self: *Collector, sink: capture.Sink) void {
-        if (comptime !supported()) return;
-        const handle = self.handle orelse return;
-        var samples_ptr: ?[*]const RawCpuTotal = null;
-        var count: usize = 0;
-        var timestamp_ns: u64 = 0;
-        const snapshot_result = flamez_ebpf_snapshot_cpu(
-            handle,
-            &samples_ptr,
-            &count,
-            &timestamp_ns,
-        );
-        if (snapshot_result != 0 and snapshot_result != self.cpu_snapshot_error) {
-            log.warn("could not snapshot process CPU accounting: {d}", .{snapshot_result});
-        }
-        self.cpu_snapshot_error = snapshot_result;
-        self.last_cpu_samples = if (snapshot_result == 0) count else 0;
-        if (snapshot_result != 0) {
-            self.lost_events +|= 1;
-            self.setDiagnostic("a CPU accounting snapshot failed; capture is incomplete");
-            return;
-        }
-        // The C shim owns this buffer until the next snapshot or collector teardown.
-        const samples = (samples_ptr orelse return)[0..count];
-        for (samples) |sample| {
-            sink.cpuSample(@intCast(sample.tgid), sample.total_ns, timestamp_ns);
-        }
-    }
-
-    fn onEvent(raw: *const RawEvent, record_size: usize, _: ?*anyopaque) callconv(.c) void {
-        const sink = active_sink orelse return;
-        const name = std.mem.sliceTo(&raw.comm, 0);
-        const payload: Event.Payload = switch (raw.kind) {
-            .fork => .{ .fork = .{
+fn onEvent(raw: *const RawEvent, record_size: usize, _: ?*anyopaque) callconv(.c) void {
+    const sink = active_sink orelse return;
+    const name = std.mem.sliceTo(&raw.comm, 0);
+    const payload: Event.Payload = switch (raw.kind) {
+        .fork => .{ .fork = .{
+            .pid = raw.pid,
+            .parent_pid = raw.parent_pid,
+            .name = name,
+        } },
+        .exec => exec: {
+            const metadata = execMetadata(raw, record_size);
+            break :exec .{ .exec = .{
                 .pid = raw.pid,
-                .parent_pid = raw.parent_pid,
                 .name = name,
-            } },
-            .exec => exec: {
-                const metadata = execMetadata(raw, record_size);
-                break :exec .{ .exec = .{
-                    .pid = raw.pid,
-                    .name = name,
-                    .exe = if (metadata) |value| value.exe else null,
-                    .args = if (metadata) |value| value.args else null,
-                    .exe_truncated = if (metadata) |value| value.exe_truncated else false,
-                } };
-            },
-            .exit => .{ .exit = .{
-                .pid = raw.pid,
-                .name = name,
-                .cpu_ns = raw.cpu_ns,
-                .cpu_final = true,
-            } },
-        };
-        sink.event(.{ .timestamp_ns = raw.timestamp_ns, .payload = payload });
-    }
+                .exe = if (metadata) |value| value.exe else null,
+                .args = if (metadata) |value| value.args else null,
+                .exe_truncated = if (metadata) |value| value.exe_truncated else false,
+            } };
+        },
+        .exit => .{ .exit = .{
+            .pid = raw.pid,
+            .name = name,
+            .cpu_ns = raw.cpu_ns,
+            .cpu_final = true,
+        } },
+    };
+    sink.event(.{ .timestamp_ns = raw.timestamp_ns, .payload = payload });
+}
 
-    // Test binaries live in the cache, not next to share/flamez.
-    fn pointShimAtCompiledObject() void {
-        if (comptime !@hasDecl(build_options, "bpf_object")) return;
-        const path = build_options.bpf_object;
-        if (path.len == 0) return;
-        const path_z: [:0]const u8 = path ++ "\x00";
-        const setenv = struct {
-            extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-        }.setenv;
-        _ = setenv("FLAMEZ_BPF_OBJECT", path_z, 1);
-    }
-};
+// Test binaries live in the cache, not next to share/flamez.
+fn pointShimAtCompiledObject() void {
+    if (comptime !@hasDecl(build_options, "bpf_object")) return;
+    const path = build_options.bpf_object;
+    if (path.len == 0) return;
+    const path_z: [:0]const u8 = path ++ "\x00";
+    const setenv = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+    }.setenv;
+    _ = setenv("FLAMEZ_BPF_OBJECT", path_z, 1);
+}
 
 test "collector attaches when privileges and object are present" {
-    if (!supported()) return error.SkipZigTest;
-    var collector = Collector.init(std.testing.allocator);
+    if (comptime !supported()) return error.SkipZigTest;
+    var collector = Linux.init(std.testing.allocator);
     defer collector.deinit();
     if (collector.available()) return;
     if (std.mem.startsWith(
@@ -449,5 +443,9 @@ test "loader rejects writable internal maps" {
     // Some compiler versions may inline every constant instead of emitting rodata.
     if (result == -@as(c_int, @intFromEnum(std.posix.E.NOENT))) return error.SkipZigTest;
     try std.testing.expectEqual(@as(c_int, 1), result);
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.sliceTo(&diagnostic, 0), "unexpected map") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        std.mem.sliceTo(&diagnostic, 0),
+        "unexpected map",
+    ) != null);
 }

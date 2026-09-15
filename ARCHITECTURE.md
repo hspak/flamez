@@ -29,8 +29,8 @@ src/cli.zig → src/main.zig
 Collector
     ├── process_ops.zig → platform spawn, wait, inspect, and signal operations
     └── capture.zig → normalized lifecycle events, CPU snapshots, and fidelity
-          ├── Linux: capture/linux.zig → ebpf_shim.c → flamez.bpf.c
-          └── macOS: capture/macos.zig
+          ├── Linux: capture/Linux.zig → ebpf_shim.c → flamez.bpf.c
+          └── macOS: capture/Macos.zig
                 ├── exact: macos_es_shim.c → Endpoint Security
                 └── fallback worker: kqueue/libproc → macos_shim.c
 ```
@@ -144,7 +144,7 @@ The collectors provide the same model from different operating-system sources:
 
 ### Linux collector
 
-`src/tracer/capture/linux.zig` wraps `src/ebpf_shim.c`, which loads the trusted
+`src/tracer/capture/Linux.zig` wraps `src/ebpf_shim.c`, which loads the trusted
 BPF object, drains lifecycle records, reads cumulative CPU snapshots, and
 reports loss. `src/flamez.bpf.c` performs descendant admission and CPU
 accounting in the kernel. Linux has no lifecycle fallback: initialization or
@@ -157,7 +157,7 @@ map, ABI, privilege, and loader details.
 The macOS backend supports Apple silicon and is split across five implementation
 boundaries:
 
-- `src/tracer/capture/macos.zig` selects exact or fallback capture for each
+- `src/tracer/capture/Macos.zig` selects exact or fallback capture for each
   launch, owns platform process identities, and normalizes both paths into the
   shared collector contract.
 - `src/macos_es_shim.c` and `.h` isolate Endpoint Security and copy borrowed

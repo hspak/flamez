@@ -4,7 +4,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
-const log = std.log.scoped(.process_tree);
 
 const App = @import("App.zig");
 const perf = @import("perf.zig");
@@ -12,10 +11,7 @@ const tracer = @import("tracer.zig");
 
 var packing_probe_count: usize = 0;
 
-pub fn ensureProcessTree(
-    app: *App,
-    session: *const tracer.Session,
-) Allocator.Error!void {
+pub fn ensure(app: *App, session: *const tracer.Session) Allocator.Error!void {
     const topology_stale = app.topology_revision_seen != session.topology_revision;
     const collapse_stale = app.collapse_revision_seen != app.collapse_revision;
     const pack_stale = topology_stale or collapse_stale or
@@ -29,10 +25,7 @@ pub fn ensureProcessTree(
     app.collapse_revision_seen = app.collapse_revision;
 }
 
-fn rebuildProcessTree(
-    app: *App,
-    session: *const tracer.Session,
-) Allocator.Error!void {
+fn rebuildProcessTree(app: *App, session: *const tracer.Session) Allocator.Error!void {
     const n = session.processes.items.len;
     try app.first_child.ensureTotalCapacity(app.gpa, n);
     try app.next_sibling.ensureTotalCapacity(app.gpa, n);
@@ -207,11 +200,7 @@ const JobWalk = struct {
     bounds: *JobBounds,
 };
 
-fn appendSubtree(
-    app: *App,
-    session: *const tracer.Session,
-    index: usize,
-) Allocator.Error!void {
+fn appendSubtree(app: *App, session: *const tracer.Session, index: usize) Allocator.Error!void {
     try app.row_order.append(app.gpa, .{ .process = index });
     if (isCollapsed(app, index)) return;
     const first = if (index < app.first_child.items.len) app.first_child.items[index] else null;
@@ -277,20 +266,21 @@ fn appendSubtree(
     try flattenPackedMembers(app, session, row_base, slot_rows);
 }
 
-fn collectJob(
-    app: *App,
-    session: *const tracer.Session,
-    job_root: usize,
-) JobSpan {
+fn collectJob(app: *App, session: *const tracer.Session, job_root: usize) JobSpan {
     app.row_trees_scratch.clearRetainingCapacity();
     var bounds = JobBounds{
         .start_ns = session.processes.items[job_root].start_ns,
         .end_ns = packingEnd(&session.processes.items[job_root]),
     };
-    markJobTree(app, session, job_root, .{
-        .min_subrow = 0,
-        .bounds = &bounds,
-    });
+    markJobTree(
+        app,
+        session,
+        job_root,
+        .{
+            .min_subrow = 0,
+            .bounds = &bounds,
+        },
+    );
     return .{
         .root = job_root,
         .start_ns = bounds.start_ns,
@@ -305,10 +295,7 @@ fn packingEnd(process: *const tracer.Process) u64 {
     return process.end_ns orelse std.math.maxInt(u64);
 }
 
-fn overlapsPackedRow(
-    interval: App.PackingInterval,
-    tree: *const App.PackingTree,
-) bool {
+fn overlapsPackedRow(interval: App.PackingInterval, tree: *const App.PackingTree) bool {
     var node = tree.root;
     while (node) |other| {
         if (comptime builtin.is_test) packing_probe_count += 1;
@@ -320,12 +307,7 @@ fn overlapsPackedRow(
     return false;
 }
 
-fn markJobTree(
-    app: *App,
-    session: *const tracer.Session,
-    index: usize,
-    walk: JobWalk,
-) void {
+fn markJobTree(app: *App, session: *const tracer.Session, index: usize, walk: JobWalk) void {
     const processes = session.processes.items;
     const process = &processes[index];
     if (process.start_ns < walk.bounds.start_ns) walk.bounds.start_ns = process.start_ns;
@@ -353,10 +335,15 @@ fn markJobTree(
     if (isCollapsed(app, index)) return;
     var child = if (index < app.first_child.items.len) app.first_child.items[index] else null;
     while (child) |child_index| {
-        markJobTree(app, session, child_index, .{
-            .min_subrow = subrow + 1,
-            .bounds = walk.bounds,
-        });
+        markJobTree(
+            app,
+            session,
+            child_index,
+            .{
+                .min_subrow = subrow + 1,
+                .bounds = walk.bounds,
+            },
+        );
         child = app.next_sibling.items[child_index];
     }
 }
@@ -366,10 +353,7 @@ fn jobLessThan(_: void, a: JobSpan, b: JobSpan) bool {
     return a.root < b.root;
 }
 
-fn layoutJobLanes(
-    app: *App,
-    jobs: []JobSpan,
-) Allocator.Error!u16 {
+fn layoutJobLanes(app: *App, jobs: []JobSpan) Allocator.Error!u16 {
     app.occupied_scratch.clearRetainingCapacity();
     app.free_lanes_scratch.clearRetainingCapacity();
     app.heights_scratch.clearRetainingCapacity();
@@ -403,10 +387,7 @@ fn layoutJobLanes(
     return next_lane;
 }
 
-fn assignJobSlots(
-    app: *App,
-    jobs: []JobSpan,
-) Allocator.Error!u16 {
+fn assignJobSlots(app: *App, jobs: []JobSpan) Allocator.Error!u16 {
     const lanes = try layoutJobLanes(app, jobs);
     for (jobs) |job| setSubtreeSlot(app, job.root, job.lane);
     perf.noteRebuild(jobs.len);
@@ -522,8 +503,16 @@ test "overlapping packed descendants move down until the row is clear" {
 
     var session = tracer.Session.init(gpa, testing.io);
     defer session.deinit();
-    try session.processes.append(gpa, .{ .pid = 1, .end_ns = 200 });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+        .pid = 1,
+        .end_ns = 200,
+    });
+    try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 2,
         .parent_pid = 1,
         .parent_index = 0,
@@ -531,6 +520,9 @@ test "overlapping packed descendants move down until the row is clear" {
         .end_ns = 150,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 3,
         .parent_pid = 1,
         .parent_index = 0,
@@ -538,6 +530,9 @@ test "overlapping packed descendants move down until the row is clear" {
         .end_ns = 150,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 4,
         .parent_pid = 2,
         .parent_index = 1,
@@ -546,6 +541,9 @@ test "overlapping packed descendants move down until the row is clear" {
         .end_ns = 100,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 5,
         .parent_pid = 2,
         .parent_index = 1,
@@ -554,6 +552,9 @@ test "overlapping packed descendants move down until the row is clear" {
         .end_ns = 110,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 6,
         .parent_pid = 2,
         .parent_index = 1,
@@ -564,7 +565,7 @@ test "overlapping packed descendants move down until the row is clear" {
 
     var app = try App.init(gpa);
     defer app.deinit();
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
 
     const first_row = packedRowForProcess(&app, 3).?;
     const second_row = packedRowForProcess(&app, 4).?;
@@ -579,8 +580,16 @@ test "collapsed descendants remain toggleable on deeper packed rows" {
 
     var session = tracer.Session.init(gpa, testing.io);
     defer session.deinit();
-    try session.processes.append(gpa, .{ .pid = 1, .end_ns = 200 });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+        .pid = 1,
+        .end_ns = 200,
+    });
+    try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 2,
         .parent_pid = 1,
         .parent_index = 0,
@@ -588,6 +597,9 @@ test "collapsed descendants remain toggleable on deeper packed rows" {
         .end_ns = 100,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 3,
         .parent_pid = 1,
         .parent_index = 0,
@@ -596,6 +608,9 @@ test "collapsed descendants remain toggleable on deeper packed rows" {
         .end_ns = 180,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 4,
         .parent_pid = 2,
         .parent_index = 1,
@@ -604,6 +619,9 @@ test "collapsed descendants remain toggleable on deeper packed rows" {
         .end_ns = 90,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 5,
         .parent_pid = 4,
         .parent_index = 3,
@@ -614,16 +632,16 @@ test "collapsed descendants remain toggleable on deeper packed rows" {
 
     var app = try App.init(gpa);
     defer app.deinit();
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     toggleAllRowsCollapsed(&app);
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
 
     toggleRowCollapsed(&app, collapseTarget(&app, app.row_order.items[0]).?);
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expectEqual(@as(usize, 2), app.row_order.items.len);
 
     toggleRowCollapsed(&app, collapseTarget(&app, app.row_order.items[1]).?);
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expectEqual(@as(usize, 3), app.row_order.items.len);
     switch (app.row_order.items[2]) {
         .process => return error.TestExpectedEqual,
@@ -631,7 +649,7 @@ test "collapsed descendants remain toggleable on deeper packed rows" {
     }
 
     toggleRowCollapsed(&app, collapseTarget(&app, app.row_order.items[2]).?);
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expectEqual(@as(usize, 4), app.row_order.items.len);
 }
 
@@ -641,8 +659,16 @@ test "master toggle expands a partially expanded tree" {
 
     var session = tracer.Session.init(gpa, testing.io);
     defer session.deinit();
-    try session.processes.append(gpa, .{ .pid = 1, .end_ns = 200 });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+        .pid = 1,
+        .end_ns = 200,
+    });
+    try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 2,
         .parent_pid = 1,
         .parent_index = 0,
@@ -650,6 +676,9 @@ test "master toggle expands a partially expanded tree" {
         .end_ns = 100,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 3,
         .parent_pid = 1,
         .parent_index = 0,
@@ -658,6 +687,9 @@ test "master toggle expands a partially expanded tree" {
         .end_ns = 180,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 4,
         .parent_pid = 2,
         .parent_index = 1,
@@ -668,18 +700,18 @@ test "master toggle expands a partially expanded tree" {
 
     var app = try App.init(gpa);
     defer app.deinit();
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expectEqual(@as(usize, 3), app.row_order.items.len);
 
     toggleAllRowsCollapsed(&app);
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expectEqual(@as(usize, 1), app.row_order.items.len);
     toggleRowCollapsed(&app, collapseTarget(&app, app.row_order.items[0]).?);
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expectEqual(@as(usize, 2), app.row_order.items.len);
 
     toggleAllRowsCollapsed(&app);
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expectEqual(@as(usize, 3), app.row_order.items.len);
 }
 
@@ -690,8 +722,11 @@ test "expanding a live packed row uses the tallest block" {
     var session = tracer.Session.init(gpa, testing.io);
     defer session.deinit();
     session.running = true;
-    try session.processes.append(gpa, .{ .pid = 1 });
+    try session.processes.append(gpa, .init(.{ .pid = 1, .start_ns = 0 }));
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 2,
         .parent_pid = 1,
         .parent_index = 0,
@@ -699,6 +734,9 @@ test "expanding a live packed row uses the tallest block" {
         .end_ns = 40,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 3,
         .parent_pid = 1,
         .parent_index = 0,
@@ -707,6 +745,9 @@ test "expanding a live packed row uses the tallest block" {
         .end_ns = 100,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 4,
         .parent_pid = 2,
         .parent_index = 1,
@@ -715,6 +756,9 @@ test "expanding a live packed row uses the tallest block" {
         .end_ns = 20,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 5,
         .parent_pid = 3,
         .parent_index = 2,
@@ -725,17 +769,21 @@ test "expanding a live packed row uses the tallest block" {
 
     var app = try App.init(gpa);
     defer app.deinit();
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     const lane = app.pack_slot.items[1];
     try testing.expectEqual(lane, app.pack_slot.items[2]);
     try testing.expectEqual(@as(u16, 2), laneHeight(&app, 0, lane));
 
     toggleRowCollapsed(&app, .{ .packed_row = 1 });
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expect(isRowCollapsed(&app, .{ .packed_row = 1 }));
     try testing.expectEqual(@as(u16, 1), laneHeight(&app, 0, lane));
 
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .end_ns = null,
+        .exec_start_ns = 0,
+
         .pid = 6,
         .parent_pid = 3,
         .parent_index = 2,
@@ -743,6 +791,10 @@ test "expanding a live packed row uses the tallest block" {
         .start_ns = 65,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .end_ns = null,
+        .exec_start_ns = 0,
+
         .pid = 7,
         .parent_pid = 3,
         .parent_index = 2,
@@ -750,13 +802,13 @@ test "expanding a live packed row uses the tallest block" {
         .start_ns = 70,
     });
     session.topology_revision +%= 1;
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expectEqual(lane, app.pack_slot.items[2]);
     try testing.expect(isRowCollapsed(&app, .{ .packed_row = 1 }));
     try testing.expectEqual(@as(u16, 1), laneHeight(&app, 0, lane));
 
     toggleRowCollapsed(&app, .{ .packed_row = 1 });
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
 
     try testing.expectEqual(lane, app.pack_slot.items[2]);
     try testing.expectEqual(@as(u16, 4), laneHeight(&app, 0, lane));
@@ -780,11 +832,17 @@ test "packing scales with sequential nested children" {
     var session = tracer.Session.init(testing.allocator, testing.io);
     defer session.deinit();
     try session.processes.append(testing.allocator, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 2_000_000_000,
         .end_ns = count * 10 + 10,
     });
     for (0..2) |job| {
         try session.processes.append(testing.allocator, .{
+            .end_kind = .open,
+            .exec_start_ns = 0,
+
             .pid = @intCast(2_000_000_001 + job),
             .parent_index = 0,
             .depth = 1,
@@ -793,6 +851,9 @@ test "packing scales with sequential nested children" {
     }
     for (0..count) |index| {
         try session.processes.append(testing.allocator, .{
+            .end_kind = .open,
+            .exec_start_ns = 0,
+
             .pid = @intCast(2_000_000_003 + index),
             .parent_index = 1,
             .depth = 2,
@@ -803,7 +864,7 @@ test "packing scales with sequential nested children" {
     var app = try App.init(testing.allocator);
     defer app.deinit();
     packing_probe_count = 0;
-    try ensureProcessTree(&app, &session);
+    try ensure(&app, &session);
     try testing.expect(packing_probe_count < count * 32);
     for (3..session.processes.items.len) |index| {
         try testing.expectEqual(@as(u16, 1), app.pack_subrow.items[index]);
@@ -814,9 +875,17 @@ test "packing handles equal starts zero width bars and out of order intervals" {
     const testing = std.testing;
     var session = tracer.Session.init(testing.allocator, testing.io);
     defer session.deinit();
-    try session.processes.append(testing.allocator, .{ .pid = 1, .end_ns = 100 });
+    try session.processes.append(testing.allocator, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+        .pid = 1,
+        .end_ns = 100,
+    });
     for (0..2) |job| {
         try session.processes.append(testing.allocator, .{
+            .end_kind = .open,
+            .exec_start_ns = 0,
+
             .pid = @intCast(2 + job),
             .parent_index = 0,
             .end_ns = 100,
@@ -834,6 +903,9 @@ test "packing handles equal starts zero width bars and out of order intervals" {
     };
     for (intervals, 0..) |interval, index| {
         try session.processes.append(testing.allocator, .{
+            .end_kind = .open,
+            .exec_start_ns = 0,
+
             .pid = @intCast(4 + index),
             .parent_index = 1,
             .start_ns = interval[0],
@@ -842,6 +914,19 @@ test "packing handles equal starts zero width bars and out of order intervals" {
     }
     var app = try App.init(testing.allocator);
     defer app.deinit();
-    try ensureProcessTree(&app, &session);
-    try testing.expectEqualSlices(u16, &.{ 1, 1, 1, 2, 2, 1, 1, 2 }, app.pack_subrow.items[3..]);
+    try ensure(&app, &session);
+    try testing.expectEqualSlices(
+        u16,
+        &.{
+            1,
+            1,
+            1,
+            2,
+            2,
+            1,
+            1,
+            2,
+        },
+        app.pack_subrow.items[3..],
+    );
 }

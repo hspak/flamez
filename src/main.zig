@@ -1,7 +1,9 @@
 //! Flamez entry point and raylib/Clay renderer for live process timelines.
 
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.flamez);
 const build_options = @import("build_options");
 const cli = @import("cli.zig");
 const clay = @import("zclay");
@@ -15,8 +17,6 @@ const process_tree = @import("process_tree.zig");
 const theme = @import("theme.zig");
 const text = @import("text.zig");
 const perf = @import("perf.zig");
-
-const log = std.log.scoped(.flamez);
 
 const canvas = theme.canvas;
 const panel_raised = theme.panel_raised;
@@ -32,13 +32,13 @@ const muted = theme.muted;
 const faint = theme.faint;
 const toRaylibColor = theme.toRaylibColor;
 
-const text_buffer_capacity = text.text_buffer_capacity;
+const text_buffer_capacity = text.buffer_capacity;
 const ui_glyph_spacing = text.ui_glyph_spacing;
 const nullTerminate = text.nullTerminate;
 const formatDuration = text.formatDuration;
-const measureTextSlice = text.measureTextSlice;
-const drawTextSlice = text.drawTextSlice;
-const drawTextSliceClipped = text.drawTextSliceClipped;
+const measureTextSlice = text.measure;
+const drawTextSlice = text.draw;
+const drawTextSliceClipped = text.drawClipped;
 
 const min_view_span_ns = App.min_view_span_ns;
 const TimeWindow = App.TimeWindow;
@@ -205,10 +205,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             collector.dropPrivileges() catch {
-                std.debug.print(
-                    "flamez: could not drop capture privileges after attach\n",
-                    .{},
-                );
+                std.debug.print("flamez: could not drop capture privileges after attach\n", .{});
                 collector.deinit();
                 std.process.exit(1);
             };
@@ -464,14 +461,18 @@ pub fn main(init: std.process.Init) !void {
         const hovered = tooltip_hold.update(timeline_hover);
         perf.leave();
         perf.enter(.detail);
-        try detail_pane.render(&app, &session, .{
-            .font = frame_input.font,
-            .bold_font = frame_input.row_font,
-            .mouse = frame_input.mouse,
-            .wheel = frame_input.wheel,
-            .clicked = frame_input.clicked,
-            .host_cpu_count = frame_input.host_cpu_count,
-        });
+        try detail_pane.render(
+            &app,
+            &session,
+            .{
+                .font = frame_input.font,
+                .bold_font = frame_input.row_font,
+                .mouse = frame_input.mouse,
+                .wheel = frame_input.wheel,
+                .clicked = frame_input.clicked,
+                .host_cpu_count = frame_input.host_cpu_count,
+            },
+        );
         perf.leave();
         // Draw last so the hover tooltip is never covered by the detail pane.
         if (hovered) |target| {
@@ -495,11 +496,7 @@ pub fn main(init: std.process.Init) !void {
     perf.sessionSummary();
 }
 
-fn runHeadless(
-    init: std.process.Init,
-    target: []const []const u8,
-    output_path: []const u8,
-) u8 {
+fn runHeadless(init: std.process.Init, target: []const []const u8, output_path: []const u8) u8 {
     var collector = tracer.Collector.init(init.gpa);
     var collector_attached = true;
     defer if (collector_attached) collector.deinit();
@@ -518,9 +515,13 @@ fn runHeadless(
 
     var session = tracer.Session.init(init.gpa, init.io);
     defer session.deinit();
-    session.start(&collector, target, .{
-        .target_stdout = if (std.mem.eql(u8, output_path, "-")) .stderr else .inherit,
-    }) catch |err| {
+    session.start(
+        &collector,
+        target,
+        .{
+            .target_stdout = if (std.mem.eql(u8, output_path, "-")) .stderr else .inherit,
+        },
+    ) catch |err| {
         printStartFailure(&collector, err);
         return 1;
     };
@@ -555,9 +556,15 @@ fn runHeadless(
             return 1;
         };
     } else {
-        tracer.session_file.writeFile(init.gpa, init.io, &session, output_path, .{
-            .install = .replace,
-        }) catch |err| {
+        tracer.session_file.writeFile(
+            init.gpa,
+            init.io,
+            &session,
+            output_path,
+            .{
+                .install = .replace,
+            },
+        ) catch |err| {
             std.debug.print(
                 "flamez: could not write {s}: {s}\n",
                 .{ output_path, @errorName(err) },
@@ -612,10 +619,7 @@ fn runAnalysis(init: std.process.Init, input_path: []const u8) u8 {
         return 1;
     };
     tracer.analysis_file.writeFile(init.gpa, init.io, &session, output_path) catch |err| {
-        std.debug.print(
-            "flamez: could not write {s}: {s}\n",
-            .{ output_path, @errorName(err) },
-        );
+        std.debug.print("flamez: could not write {s}: {s}\n", .{ output_path, @errorName(err) });
         return 1;
     };
     std.debug.print("flamez: wrote {s}\n", .{output_path});
@@ -626,10 +630,7 @@ fn displayImportPath(path: []const u8) []const u8 {
     return if (std.mem.eql(u8, path, "-")) "stdin" else path;
 }
 
-fn printStartFailure(
-    collector: *const tracer.Collector,
-    err: tracer.Session.StartError,
-) void {
+fn printStartFailure(collector: *const tracer.Collector, err: tracer.Session.StartError) void {
     if (comptime tracer.capture_backend == .macos) {
         if (err == error.ExactCaptureUnavailable) {
             std.debug.print(
@@ -734,12 +735,7 @@ fn targetSaveStem(args: *tracer.Process.ArgIter, buffer: []u8) []const u8 {
     return buffer[0..fallback.len];
 }
 
-fn guiSavePath(
-    directory: []const u8,
-    stem: []const u8,
-    index: usize,
-    buffer: []u8,
-) ![]const u8 {
+fn guiSavePath(directory: []const u8, stem: []const u8, index: usize, buffer: []u8) ![]const u8 {
     if (std.mem.eql(u8, directory, ".")) {
         return if (index == 0)
             std.fmt.bufPrint(buffer, "flamez-{s}.json", .{stem})
@@ -749,7 +745,15 @@ fn guiSavePath(
     return if (index == 0)
         std.fmt.bufPrint(buffer, "{s}/flamez-{s}.json", .{ directory, stem })
     else
-        std.fmt.bufPrint(buffer, "{s}/flamez-{s}-{d}.json", .{ directory, stem, index });
+        std.fmt.bufPrint(
+            buffer,
+            "{s}/flamez-{s}-{d}.json",
+            .{
+                directory,
+                stem,
+                index,
+            },
+        );
 }
 
 fn hasKeyboardActivity() bool {
@@ -880,11 +884,7 @@ fn lifetimeBar(process: *const tracer.Process, now_ns: u64, layout: BarLayout) ?
     return rl.Rectangle.init(bar_x, layout.y, bar_width, layout.row_height - process_row_gap);
 }
 
-fn cpuSliceHeight(
-    slice: tracer.Process.CpuSlice,
-    row_height: f32,
-    host_cpu_count: usize,
-) f32 {
+fn cpuSliceHeight(slice: tracer.Process.CpuSlice, row_height: f32, host_cpu_count: usize) f32 {
     const available_height = @max(@as(f32, 1), row_height - process_row_gap);
     const host_cores: f64 = @floatFromInt(@max(host_cpu_count, 1));
     const full_at_cores = @max(host_cores * cpu_bar_full_core_fraction, 1);
@@ -906,14 +906,8 @@ fn cpuSliceRect(
     const clipped_end = @min(slice.end_ns, view_end_ns);
     if (clipped_end <= clipped_start) return null;
     const span: f64 = @floatFromInt(layout.view_span);
-    const start_fraction = @as(
-        f64,
-        @floatFromInt(clipped_start - layout.window.start_ns),
-    ) / span;
-    const end_fraction = @as(
-        f64,
-        @floatFromInt(clipped_end - layout.window.start_ns),
-    ) / span;
+    const start_fraction = @as(f64, @floatFromInt(clipped_start - layout.window.start_ns)) / span;
+    const end_fraction = @as(f64, @floatFromInt(clipped_end - layout.window.start_ns)) / span;
     const x = layout.timeline_x +
         layout.timeline_width * @as(f32, @floatCast(start_fraction));
     const width = @max(
@@ -922,12 +916,7 @@ fn cpuSliceRect(
     );
     const height = cpuSliceHeight(slice, layout.row_height, host_cpu_count);
     const bar_height = layout.row_height - process_row_gap;
-    return .init(
-        x,
-        layout.y + bar_height - height,
-        width,
-        height,
-    );
+    return .init(x, layout.y + bar_height - height, width, height);
 }
 
 fn paintCpuSlice(slice: tracer.Process.CpuSlice, rect: rl.Rectangle) void {
@@ -1054,12 +1043,7 @@ const collapse_button_size: f32 = 20;
 const collapse_button_hit_width: f32 = 28;
 const collapse_button_padding: f32 = 8;
 
-fn timelineTickLabelX(
-    tick_x: f32,
-    label_width: f32,
-    timeline_x: f32,
-    timeline_width: f32,
-) f32 {
+fn timelineTickLabelX(tick_x: f32, label_width: f32, timeline_x: f32, timeline_width: f32) f32 {
     const centered_x = tick_x - label_width / 2;
     const rightmost_x = @max(timeline_x, timeline_x + timeline_width - label_width);
     return std.math.clamp(centered_x, timeline_x, rightmost_x);
@@ -1101,13 +1085,7 @@ fn collapseButton(gutter: rl.Rectangle) CollapseButton {
 
 fn paintCollapseButton(button: CollapseButton, collapsed: bool, hovered: bool) void {
     if (hovered) {
-        rl.drawRectangleRoundedLinesEx(
-            button.visual_box,
-            0.25,
-            4,
-            1,
-            toRaylibColor(accent),
-        );
+        rl.drawRectangleRoundedLinesEx(button.visual_box, 0.25, 4, 1, toRaylibColor(accent));
     }
 
     const center = rl.Vector2{
@@ -1170,11 +1148,7 @@ fn paintLifetimeBar(bar: rl.Rectangle, look: BarLook) void {
     }
 }
 
-fn paintSelectedBarBorder(
-    app: *const App,
-    index: usize,
-    bar: rl.Rectangle,
-) void {
+fn paintSelectedBarBorder(app: *const App, index: usize, bar: rl.Rectangle) void {
     if (app.selected_process != index) return;
     rl.drawRectangleLinesEx(bar, selected_bar_border_width, rl.Color.white);
 }
@@ -1242,7 +1216,7 @@ fn renderTimeline(
     const box = element.bounding_box;
     if (box.width < 100 or box.height < 80) return .{};
 
-    try process_tree.ensureProcessTree(app, session);
+    try process_tree.ensure(app, session);
     var row_count = app.row_order.items.len;
 
     const inside = pointInBox(mouse, box);
@@ -1275,10 +1249,7 @@ fn renderTimeline(
     const h_thumb_width: f32 = if (needs_hscroll and total_ns > 0)
         @min(
             h_track.width,
-            @max(
-                scrollbar_min_thumb_size,
-                h_track.width * ratio(window.span_ns, total_ns),
-            ),
+            @max(scrollbar_min_thumb_size, h_track.width * ratio(window.span_ns, total_ns)),
         )
     else
         h_track.width;
@@ -1416,7 +1387,7 @@ fn renderTimeline(
             }
         }
     }
-    try process_tree.ensureProcessTree(app, session);
+    try process_tree.ensure(app, session);
     row_count = app.row_order.items.len;
     app.graph_scroll = @min(app.graph_scroll, row_count -| visible_rows);
 
@@ -1426,16 +1397,8 @@ fn renderTimeline(
         @intFromFloat(box.width),
         @intFromFloat(box.height),
     );
-    rl.drawRectangleRec(
-        .init(box.x, box.y, box.width, header_height),
-        toRaylibColor(panel_raised),
-    );
-    const master_button = collapseButton(.init(
-        box.x,
-        box.y,
-        timeline_x - box.x,
-        header_height,
-    ));
+    rl.drawRectangleRec(.init(box.x, box.y, box.width, header_height), toRaylibColor(panel_raised));
+    const master_button = collapseButton(.init(box.x, box.y, timeline_x - box.x, header_height));
     const over_master_button = !app.scrollbar_dragging and
         !app.hscroll_dragging and
         pointInRect(mouse, master_button.hit_box);
@@ -1472,10 +1435,16 @@ fn renderTimeline(
     if (row_count == 0) {
         const empty = "Waiting for target process data";
         const size = measureTextSlice(font, empty, 17);
-        drawTextSlice(font, empty, .{
-            .x = box.x + (box.width - size.x) / 2,
-            .y = box.y + header_height + (box.height - header_height - size.y) / 2,
-        }, 17, toRaylibColor(faint));
+        drawTextSlice(
+            font,
+            empty,
+            .{
+                .x = box.x + (box.width - size.x) / 2,
+                .y = box.y + header_height + (box.height - header_height - size.y) / 2,
+            },
+            17,
+            toRaylibColor(faint),
+        );
         rl.endScissorMode();
         return .{};
     }
@@ -1519,18 +1488,19 @@ fn renderTimeline(
                 const process = &session.processes.items[index];
                 const has_children = process_tree.hasChildren(app, index);
                 const color = processColor(has_children, process.end_ns == null);
-                const bar = lifetimeBar(process, now_ns, .{
-                    .window = window,
-                    .view_span = view_span,
-                    .timeline_x = timeline_x,
-                    .timeline_width = timeline_width,
-                    .y = y,
-                    .row_height = row_height,
-                });
-                const collapse_target = process_tree.collapseTarget(
-                    app,
-                    app.row_order.items[row],
+                const bar = lifetimeBar(
+                    process,
+                    now_ns,
+                    .{
+                        .window = window,
+                        .view_span = view_span,
+                        .timeline_x = timeline_x,
+                        .timeline_width = timeline_width,
+                        .y = y,
+                        .row_height = row_height,
+                    },
                 );
+                const collapse_target = process_tree.collapseTarget(app, app.row_order.items[row]);
                 const button = if (collapse_target != null)
                     collapseButton(collapse_gutter)
                 else
@@ -1571,14 +1541,19 @@ fn renderTimeline(
                         .rounded = b.width >= 8,
                     };
                     paintLifetimeBar(b, look);
-                    try paintCpuSlices(app, process, .{
-                        .window = window,
-                        .view_span = view_span,
-                        .timeline_x = timeline_x,
-                        .timeline_width = timeline_width,
-                        .y = y,
-                        .row_height = row_height,
-                    }, input.host_cpu_count);
+                    try paintCpuSlices(
+                        app,
+                        process,
+                        .{
+                            .window = window,
+                            .view_span = view_span,
+                            .timeline_x = timeline_x,
+                            .timeline_width = timeline_width,
+                            .y = y,
+                            .row_height = row_height,
+                        },
+                        input.host_cpu_count,
+                    );
                     paintBarLabel(app, process, index, session.metadataBytes(), b, look);
                     paintSelectedBarBorder(app, index, b);
                 }
@@ -1628,10 +1603,7 @@ fn renderTimeline(
                     app.packed_columns.items[px] = null;
                 }
                 app.packed_touched_columns.clearRetainingCapacity();
-                const packed_width = @max(
-                    1,
-                    @as(usize, @intFromFloat(@floor(timeline_width))),
-                );
+                const packed_width = @max(1, @as(usize, @intFromFloat(@floor(timeline_width))));
                 const old_packed_width = app.packed_columns.items.len;
                 try app.packed_columns.resize(app.gpa, packed_width);
                 if (packed_width > old_packed_width) {
@@ -1651,14 +1623,18 @@ fn renderTimeline(
                     const has_kids = process_tree.hasChildren(app, index);
                     // Same bar geometry as regular process rows; lanes keep
                     // their normal row spacing instead of stretching bars.
-                    const bar = lifetimeBar(process, now_ns, .{
-                        .window = window,
-                        .view_span = view_span,
-                        .timeline_x = timeline_x,
-                        .timeline_width = timeline_width,
-                        .y = y,
-                        .row_height = row_height,
-                    });
+                    const bar = lifetimeBar(
+                        process,
+                        now_ns,
+                        .{
+                            .window = window,
+                            .view_span = view_span,
+                            .timeline_x = timeline_x,
+                            .timeline_width = timeline_width,
+                            .y = y,
+                            .row_height = row_height,
+                        },
+                    );
                     if (bar) |b| {
                         if (b.width <= 2) {
                             const px_f = @floor(b.x - timeline_x);
@@ -1681,14 +1657,19 @@ fn renderTimeline(
                             .rounded = !multi and b.width >= 8,
                         };
                         paintLifetimeBar(b, look);
-                        try paintCpuSlices(app, process, .{
-                            .window = window,
-                            .view_span = view_span,
-                            .timeline_x = timeline_x,
-                            .timeline_width = timeline_width,
-                            .y = y,
-                            .row_height = row_height,
-                        }, input.host_cpu_count);
+                        try paintCpuSlices(
+                            app,
+                            process,
+                            .{
+                                .window = window,
+                                .view_span = view_span,
+                                .timeline_x = timeline_x,
+                                .timeline_width = timeline_width,
+                                .y = y,
+                                .row_height = row_height,
+                            },
+                            input.host_cpu_count,
+                        );
                         paintBarLabel(app, process, index, session.metadataBytes(), b, look);
                         paintSelectedBarBorder(app, index, b);
                         if (over_slot and pointInRect(mouse, b)) {
@@ -1712,10 +1693,7 @@ fn renderTimeline(
                     );
                 }
 
-                const collapse_target = process_tree.collapseTarget(
-                    app,
-                    app.row_order.items[row],
-                );
+                const collapse_target = process_tree.collapseTarget(app, app.row_order.items[row]);
                 const button = if (collapse_target != null)
                     collapseButton(collapse_gutter)
                 else
@@ -1946,10 +1924,7 @@ fn renderBorder(box: clay.BoundingBox, data: clay.BorderRenderData) void {
         return;
     }
     if (width.left > 0) {
-        rl.drawRectangleRec(
-            .init(box.x, box.y, @floatFromInt(width.left), box.height),
-            color,
-        );
+        rl.drawRectangleRec(.init(box.x, box.y, @floatFromInt(width.left), box.height), color);
     }
     if (width.right > 0) {
         const thickness: f32 = @floatFromInt(width.right);
@@ -1959,10 +1934,7 @@ fn renderBorder(box: clay.BoundingBox, data: clay.BorderRenderData) void {
         );
     }
     if (width.top > 0) {
-        rl.drawRectangleRec(
-            .init(box.x, box.y, box.width, @floatFromInt(width.top)),
-            color,
-        );
+        rl.drawRectangleRec(.init(box.x, box.y, box.width, @floatFromInt(width.top)), color);
     }
     if (width.bottom > 0) {
         const thickness: f32 = @floatFromInt(width.bottom);
@@ -2024,12 +1996,7 @@ fn loadEmbeddedFont(ttf: []const u8, font_size: i32) rl.Font {
         codepoints[count] = extra;
         count += 1;
     }
-    const font = rl.loadFontFromMemory(
-        ".ttf",
-        ttf,
-        font_size,
-        codepoints[0..count],
-    ) catch {
+    const font = rl.loadFontFromMemory(".ttf", ttf, font_size, codepoints[0..count]) catch {
         return rl.getFontDefault() catch unreachable;
     };
     rl.setTextureFilter(font.texture, .bilinear);
@@ -2083,10 +2050,7 @@ test "tooltip hold bridges one missed frame and switches immediately" {
     const second = TimelineHover{ .process_index = 8 };
     var hold: TooltipHold = .{};
 
-    try testing.expectEqual(
-        first.process_index,
-        hold.update(.{ .target = first }).?.process_index,
-    );
+    try testing.expectEqual(first.process_index, hold.update(.{ .target = first }).?.process_index);
     try testing.expectEqual(
         first.process_index,
         hold.update(.{ .can_retain_previous = true }).?.process_index,
@@ -2191,36 +2155,39 @@ test "CPU slice alpha saturates without integer overflow" {
 
 test "detail CPU graph spans the selected process lifetime" {
     const process = tracer.Process{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 7,
         .start_ns = 100,
         .end_ns = 500,
     };
 
-    const range = detail_pane.detailCpuGraphRange(&process, 900);
+    const range = detail_pane.cpuGraphRange(&process, 900);
     try std.testing.expectEqual(@as(u64, 100), range.start_ns);
     try std.testing.expectEqual(@as(u64, 500), range.end_ns);
     try std.testing.expectEqual(@as(u64, 400), range.spanNs());
     try std.testing.expectEqual(
         @as(f32, 60),
-        detail_pane.detailCpuGraphX(range, 300, .init(10, 0, 100, 50)),
+        detail_pane.cpuGraphX(range, 300, .init(10, 0, 100, 50)),
     );
 }
 
 test "detail CPU graph rounds its scale and caps it to the host" {
     const testing = std.testing;
     const gpa = testing.allocator;
-    var process = tracer.Process{ .pid = 7 };
+    var process = tracer.Process.init(.{ .pid = 7, .start_ns = 0 });
     defer process.deinit(gpa);
 
-    try testing.expectEqual(@as(f64, 1), detail_pane.detailCpuGraphCoreScale(&process, 8));
+    try testing.expectEqual(@as(f64, 1), detail_pane.cpuGraphCoreScale(&process, 8));
     try process.cpu_slices.append(gpa, .{
         .start_ns = 0,
         .end_ns = 100,
         .cpu_ns = 250,
         .band = 10,
     });
-    try testing.expectEqual(@as(f64, 3), detail_pane.detailCpuGraphCoreScale(&process, 8));
-    try testing.expectEqual(@as(f64, 2), detail_pane.detailCpuGraphCoreScale(&process, 2));
+    try testing.expectEqual(@as(f64, 3), detail_pane.cpuGraphCoreScale(&process, 8));
+    try testing.expectEqual(@as(f64, 2), detail_pane.cpuGraphCoreScale(&process, 2));
 }
 
 test "ratio guards division by zero" {
@@ -2237,18 +2204,13 @@ test "collapse controls win clicks over process rows" {
         TimelineClick{ .collapse = collapse_target },
         resolveTimelineClick(collapse_target, 7).?,
     );
-    try testing.expectEqual(
-        TimelineClick{ .select = 7 },
-        resolveTimelineClick(null, 7).?,
-    );
+    try testing.expectEqual(TimelineClick{ .select = 7 }, resolveTimelineClick(null, 7).?);
     try testing.expect(resolveTimelineClick(null, null) == null);
 }
 
 test "collapse control has a full-row-height hit target" {
     const testing = std.testing;
-    const button = collapseButton(
-        .init(100, 200, 30, process_row_height - process_row_gap),
-    );
+    const button = collapseButton(.init(100, 200, 30, process_row_height - process_row_gap));
 
     try testing.expect(button.hit_box.width > button.visual_box.width);
     try testing.expectEqual(process_row_height - process_row_gap, button.hit_box.height);
@@ -2284,12 +2246,7 @@ test "timeline tick labels stay inside the timeline" {
     );
     try testing.expectEqual(
         timeline_x + timeline_width - label_width,
-        timelineTickLabelX(
-            timeline_x + timeline_width,
-            label_width,
-            timeline_x,
-            timeline_width,
-        ),
+        timelineTickLabelX(timeline_x + timeline_width, label_width, timeline_x, timeline_width),
     );
     try testing.expectEqual(
         @as(f32, 130),
@@ -2329,8 +2286,16 @@ test "root collapse survives process-tree rebuild" {
 
     var session = tracer.Session.init(gpa, testing.io);
     defer session.deinit();
-    try session.processes.append(gpa, .{ .pid = 1, .end_ns = 100 });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+        .pid = 1,
+        .end_ns = 100,
+    });
+    try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 2,
         .parent_pid = 1,
         .parent_index = 0,
@@ -2340,11 +2305,11 @@ test "root collapse survives process-tree rebuild" {
 
     var app = try App.init(gpa);
     defer app.deinit();
-    try process_tree.ensureProcessTree(&app, &session);
+    try process_tree.ensure(&app, &session);
     try testing.expectEqual(@as(usize, 2), app.row_order.items.len);
 
     process_tree.toggleCollapsed(&app, 0);
-    try process_tree.ensureProcessTree(&app, &session);
+    try process_tree.ensure(&app, &session);
     try testing.expect(process_tree.isCollapsed(&app, 0));
     try testing.expectEqual(@as(usize, 1), app.row_order.items.len);
 }
@@ -2355,8 +2320,16 @@ test "master collapse button toggles every collapsible row" {
 
     var session = tracer.Session.init(gpa, testing.io);
     defer session.deinit();
-    try session.processes.append(gpa, .{ .pid = 1, .end_ns = 100 });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+        .pid = 1,
+        .end_ns = 100,
+    });
+    try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 2,
         .parent_pid = 1,
         .parent_index = 0,
@@ -2364,6 +2337,9 @@ test "master collapse button toggles every collapsible row" {
         .end_ns = 100,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 3,
         .parent_pid = 2,
         .parent_index = 1,
@@ -2373,7 +2349,7 @@ test "master collapse button toggles every collapsible row" {
 
     var app = try App.init(gpa);
     defer app.deinit();
-    try process_tree.ensureProcessTree(&app, &session);
+    try process_tree.ensure(&app, &session);
 
     try testing.expect(!process_tree.anyCollapsibleRowCollapsed(&app));
     process_tree.toggleAllRowsCollapsed(&app);
@@ -2393,8 +2369,16 @@ test "packed row collapse toggles every block and reduces the lane to one row" {
 
     var session = tracer.Session.init(gpa, testing.io);
     defer session.deinit();
-    try session.processes.append(gpa, .{ .pid = 1, .end_ns = 200 });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+        .pid = 1,
+        .end_ns = 200,
+    });
+    try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 2,
         .parent_pid = 1,
         .parent_index = 0,
@@ -2402,6 +2386,9 @@ test "packed row collapse toggles every block and reduces the lane to one row" {
         .end_ns = 80,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 3,
         .parent_pid = 1,
         .parent_index = 0,
@@ -2410,6 +2397,9 @@ test "packed row collapse toggles every block and reduces the lane to one row" {
         .end_ns = 180,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 4,
         .parent_pid = 2,
         .parent_index = 1,
@@ -2418,6 +2408,9 @@ test "packed row collapse toggles every block and reduces the lane to one row" {
         .end_ns = 40,
     });
     try session.processes.append(gpa, .{
+        .end_kind = .open,
+        .exec_start_ns = 0,
+
         .pid = 5,
         .parent_pid = 3,
         .parent_index = 2,
@@ -2428,7 +2421,7 @@ test "packed row collapse toggles every block and reduces the lane to one row" {
 
     var app = try App.init(gpa);
     defer app.deinit();
-    try process_tree.ensureProcessTree(&app, &session);
+    try process_tree.ensure(&app, &session);
     try testing.expectEqual(@as(usize, 3), app.row_order.items.len);
     try testing.expect(graphRowsContainProcess(&app, 3));
     try testing.expect(graphRowsContainProcess(&app, 4));
@@ -2437,7 +2430,7 @@ test "packed row collapse toggles every block and reduces the lane to one row" {
     try testing.expect(process_tree.canCollapseRow(&app, target));
     try testing.expect(!process_tree.isRowCollapsed(&app, target));
     process_tree.toggleRowCollapsed(&app, target);
-    try process_tree.ensureProcessTree(&app, &session);
+    try process_tree.ensure(&app, &session);
     try testing.expect(process_tree.isCollapsed(&app, 1));
     try testing.expect(process_tree.isCollapsed(&app, 2));
     try testing.expect(process_tree.isRowCollapsed(&app, target));
@@ -2448,7 +2441,7 @@ test "packed row collapse toggles every block and reduces the lane to one row" {
     try testing.expect(!graphRowsContainProcess(&app, 4));
 
     process_tree.toggleRowCollapsed(&app, target);
-    try process_tree.ensureProcessTree(&app, &session);
+    try process_tree.ensure(&app, &session);
     try testing.expect(!process_tree.isCollapsed(&app, 1));
     try testing.expect(!process_tree.isCollapsed(&app, 2));
     try testing.expectEqual(@as(usize, 3), app.row_order.items.len);
@@ -2501,22 +2494,14 @@ test "GUI save stem truncates long target arguments to fifty characters" {
     const stem = targetSaveStem(&args, &buffer);
 
     try testing.expectEqual(@as(usize, 50), stem.len);
-    try testing.expectEqualStrings(
-        "program-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop",
-        stem,
-    );
+    try testing.expectEqualStrings("program-abcdefghijklmnopqrstuvwxyzabcdefghijklmnop", stem);
 }
 
 test "GUI save skips an existing default without replacing it" {
     const testing = std.testing;
     var input: std.Io.Reader = .fixed(@embedFile("testdata/session-v1-minimal.json"));
     var diagnostics: tracer.session_file.Diagnostics = .{};
-    var session = try tracer.session_file.read(
-        testing.allocator,
-        testing.io,
-        &input,
-        &diagnostics,
-    );
+    var session = try tracer.session_file.read(testing.allocator, testing.io, &input, &diagnostics);
     defer session.deinit();
 
     var temporary = testing.tmpDir(.{});
