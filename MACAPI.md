@@ -5,19 +5,20 @@ validation evidence, and release gates. The cross-platform component layout,
 collector contract, runtime selection, and data flow live in
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Status: research and first implementation, 2026-08-30. The supported macOS
-target is Apple silicon (`aarch64-macos`); Intel macOS is deliberately out of
-scope. The host used for validation runs macOS 26.6.2 with the macOS 26.5 SDK.
+Status: macOS 27 implementation and unsigned validation complete, 2026-09-16. The supported
+target is Apple silicon (`aarch64-macos`). The current host runs macOS 27.0
+(26A428), with Command Line Tools 27 and SDK 27.0 (26A425). Entitled live kernel
+delivery remains unverified; no approved signing identity is available.
 
 ## Conclusion
 
-The best macOS lifecycle API is Endpoint Security (ES), specifically the new beta
+The best macOS lifecycle API is Endpoint Security (ES), specifically
 `es_new_descendants_client`. It creates a client whose kernel-visible scope is the caller and its
 complete existing and future descendant subtree. This exactly matches Flamez's launch model and,
 unlike the older `es_new_client`, does not require root or Full Disk Access. It still requires the
 restricted `com.apple.developer.endpoint-security.client` entitlement, must be code signed, and is
-introduced in macOS 27. It is not declared by the installed macOS 26.5 SDK and is absent from the
-macOS 26.6 runtime used for validation.
+introduced in macOS 27. The installed SDK 27 declares it and the macOS 27 runtime exports it.
+Unsigned client creation returns the not-entitled diagnostic.
 
 ## 1. Endpoint Security
 
@@ -28,7 +29,7 @@ fork record rather than requiring discovery after the fact.
 
 ### Descendant-scoped client: preferred
 
-The beta
+The
 [`es_new_descendants_client`](https://developer.apple.com/documentation/endpointsecurity/es_new_descendants_client%28_%3A_%3A%29)
 has the right semantics for Flamez:
 
@@ -46,17 +47,17 @@ parent `(pid, pidversion)` is already tracked. Other descendants of the Flamez p
 discarded. The shared macOS launch path also starts the target suspended and resumes it only after
 root admission, so exact and fallback launches use the same ordering invariant.
 
-Apple's beta documentation marks the function as introduced in macOS 27. It does not appear in the
-local macOS 26.5 `EndpointSecurity/ESClient.h`. The bridge therefore uses the documented C signature
-with existing public ES types but resolves every ES/libbsm function through `dlopen`/`dlsym`. This
-keeps both the link graph and deployment binary compatible with macOS 26.
+The installed SDK 27 `usr/include/EndpointSecurity/ESClient.h` declares this API as available
+on macOS 27.0. Its C signature remains `es_new_client_result_t
+es_new_descendants_client(es_client_t **client, es_handler_block_t handler)`. The header confirms
+caller notifications, existing and future descendants, serial callbacks, the entitlement, and the
+absence of root/TCC requirements. `es_sync_client` is also annotated macOS 27.0 in this SDK;
+its marker ordering and prohibition on calls from the handler match the bridge's use.
 
-Apple's current DocC data was rechecked on 2026-08-30 and publishes the Objective-C/C declaration as
-`es_new_client_result_t es_new_descendants_client(es_client_t **client,
-es_handler_block_t handler)`. That exactly matches the bridge typedef. The C shim now also asks a
-macOS 27-or-newer SDK to compare the compatibility typedef with
-`typeof(&es_new_descendants_client)` at compile time; older SDKs continue to use the checked dynamic
-declaration. Both C and Zig assert every cross-language event and process-identity field offset in
+`src/macos_es_shim.c` now uses `typeof(&es_new_descendants_client)` on SDK 27, retaining the
+manual function-pointer declaration for SDK 26 and comparing both types at compile time on SDK 27.
+Every ES/libbsm call remains behind `dlopen`/`dlsym`, including the availability null checks.
+Both C and Zig assert every cross-language event and process-identity field offset in
 addition to total structure size, so padding drift cannot silently scramble a dynamically delivered
 record.
 
@@ -129,8 +130,8 @@ zig-out/bin/flamez /usr/bin/true
 ```
 
 In required mode, `armLaunch` returns `ExactCaptureUnavailable` and the UI presents the bridge's
-specific diagnostic instead of selecting kqueue. The same build on the current macOS 26 host
-therefore fails intentionally with the macOS 27 requirement. Automatic mode remains the production
+specific diagnostic instead of selecting kqueue. The same build on the unsigned macOS 27 host
+fails intentionally with the missing ES entitlement diagnostic. Automatic mode remains the production
 default and keeps the deployable fallback.
 
 The older stable `es_new_client` also requires that entitlement, and its normal deployment requires
@@ -139,7 +140,7 @@ descendants and handle initialization races. Apple's
 [Endpoint Security sample](https://developer.apple.com/documentation/endpointsecurity/monitoring-system-events-with-endpoint-security)
 documents the system-extension, signing, entitlement, and approval workflow. Because the new
 descendant client removes the two operational requirements and narrows kernel delivery correctly,
-Flamez should not invest in the older system-wide client unless the beta API changes or disappears.
+Flamez should not invest in the older system-wide client unless Apple changes or removes the descendant API.
 
 ### ES implementation shape
 
@@ -494,14 +495,16 @@ The in-repository implementation has evidence for every Linux-facing collector r
 |---|---|---|
 | Apple-silicon-only build | the complete test root and application compile for `aarch64-macos`; the installed artifact is Mach-O arm64 | verified |
 | API selection and limitations | sections 1–5 cite Apple documentation and current XNU/libproc source | verified |
-| fallback fork/exec/exit and metadata | live Session fixtures cover descendants, shebang argv, empty arguments, immediate exits, process-group escape, and immutable-parent recovery | verified on macOS 26 |
-| fallback launch and final-drain races | suspended-launch, restart, 24 immediate-exit, and root-boundary fixtures | verified on macOS 26 |
+| fallback fork/exec/exit and metadata | live Session fixtures cover descendants, shebang argv, empty arguments, immediate exits, process-group escape, and immutable-parent recovery | verified on macOS 26 and 27 |
+| fallback launch and final-drain races | suspended-launch, restart, 24 immediate-exit, and root-boundary fixtures | verified on macOS 26 and 27 |
 | CPU totals and time domain | live parallel CPU test, per-PID timestamp ordering, 125/3 conversion, and awake-clock calibration | verified on Apple silicon |
 | fallback loss and PID-list bounds | injected queue overflow plus growing and persistently full libproc snapshots | verified |
 | exact event mapping and ownership | native SDK fork/exec/exit fixtures traverse the production extractor and owned queue | verified synthetically |
 | exact PID generations and loss | Zig filtering tests plus C global-sequence fixtures | verified synthetically |
 | exact root-exit drain | condition-gated asynchronous `es_sync_client` fixture | verified synthetically |
-| genuine descendant-scoped kernel delivery | requires macOS 27 and an Apple-approved restricted entitlement | not verifiable on this host |
+| SDK 27 declaration and runtime symbols | native compile-time ABI assertion and dynamic lookup on 27.0 (26A428) | verified |
+| unsigned required/automatic policy | installed production validator and headless application | verified on macOS 27 |
+| genuine descendant-scoped kernel delivery | installed production validator requires an Apple-approved restricted entitlement | blocked on signing identity |
 
 ### In-repository validation details
 
@@ -531,9 +534,8 @@ on the collector delaying delivery until the target has entered its wait.
 Two allocation-failure regressions failed before the recovery optimization and
 passed unchanged afterward: the parent queue is reused, and empty kqueue
 batches do not repeat discovery. [PERF.md](PERF.md) records the native lock and
-queue-drain measurements, including remaining burst limits. This host still
-lacks the descendant Endpoint Security API; exact kernel delivery remains a
-separate macOS 27 and entitlement gate.
+queue-drain measurements, including remaining burst limits. That macOS 26 host lacked the descendant API. The current macOS 27 host has it,
+but exact kernel delivery remains gated on an approved signing identity.
 
 Fallback collector tests cover worker restart, stale kqueue generations,
 immutable-parent recovery, deliberate double-fork non-adoption, queue overflow,
@@ -559,14 +561,42 @@ before the marker completes and propagates marker rejection. This validates the
 barrier control path without assuming callback timing or requiring the
 restricted entitlement.
 
-The validation host is arm64 macOS 26.6.2 with the macOS 26.5 SDK. A direct dynamic-symbol probe
-finds stable `es_sync_client` but not `es_new_descendants_client`, matching Apple's macOS 27
-availability declaration. The entitlement cannot manufacture that missing runtime API, and the
-restricted entitlement itself must be granted by Apple. Consequently no additional repository
-change can prove genuine exact delivery on this machine.
+The September 4 macOS 26 probe found `es_sync_client` but no descendant-client symbol.
+On September 15, direct dynamic lookup found both symbols on macOS 27.0. This removes the runtime
+API gate, but cannot grant the restricted entitlement. The user confirmed that no Apple-approved
+signing identity is available and requested all validation possible unsigned.
 
-The remaining work requires the released OS, released SDK, and an entitled signing identity. The
-release-day procedure and the exact repository changes to make are specified in section 7.
+### macOS 27 validation record (2026-09-15 and 2026-09-16)
+
+| Input/check | Result |
+|---|---|
+| runtime / architecture | macOS 27.0, build 26A428; Apple M1, arm64 |
+| selected developer tools | Command Line Tools 27.0.0.0.1788430756; no full Xcode selected |
+| selected SDK | `/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk`, 27.0 / 26A425 |
+| Zig | 0.16.0 |
+| Debug suite with SDK 27 | 178 passed, 14 expected skips (192 total) |
+| ReleaseSafe, performance telemetry and FPS enabled | 181 passed, 11 expected skips (192 total) |
+| required-mode test root / application | compile successfully for `aarch64-macos` |
+| automatic-mode test root / SDK 26 compatibility | compile successfully for `aarch64-macos` with SDK 27 and explicit SDK 26.5 respectively |
+| production live validator | compiles without `FLAMEZ_TEST`; installed arm64 executable |
+| dynamic linking | validator depends only on `libSystem`; no undefined ES/audit-token symbols |
+| unsigned activation | `ExactCaptureUnavailable`; missing Endpoint Security client entitlement |
+| unsigned fixture protocols | burst, double fork, root exec, script argv, and fixed-work CPU pass |
+| automatic fallback validator | same-PID Session exec history, 24 immediate exits, four Stop/restart cycles, and surviving-child clipping pass with zero loss |
+| native application / analysis export | headless `/usr/bin/true` capture and analysis export pass, retaining `snapshot_recovery` and zero loss |
+| signing / genuine kernel delivery | no valid identity; not run |
+| set-ID ES payload | requires signing; not run |
+| whole-machine suspend-resume | excluded from application scope at the user's request on 2026-09-16; no passing result claimed |
+| SDK package | 35,765 unchanged SDK files; two identical archives; packaged-SDK build/test/capture/analysis pass; retained locally at the user's request |
+| blocked-validator cleanup | `--watchdog-check` exits 1 and its stopped fixture disappears |
+| GUI replay | unavailable in this session: CoreGraphics reports zero active displays |
+
+After removing the footer badge and whole-machine sleep/resume validator mode on September 16,
+the application, test suite, and production validator rebuilt successfully (23/23 build steps).
+Debug again passed 178/192 tests with 14 expected skips. The rebuilt `--unsigned` validator passed,
+and `--watchdog-check` exited with its expected status 1 and left no fixture process behind.
+The agreed unsigned scope is complete; SDK publication and whole-machine sleep/resume checks
+are excluded at the user's request, and signing-dependent acceptance remains separate.
 
 Synthetic coverage already verifies that a generation-authenticated exec survives unavailable
 inspection without retaining inherited argv/executable metadata. Scripts/interpreters,
@@ -578,9 +608,9 @@ that persisted fallback capture.
 The private inspection calls are intentionally behind one shim and are replaceable field by field.
 The shared `Session`, process tree, CPU-slice model, teardown, and UI require no ES-specific changes.
 
-## 7. macOS 27 GA pickup plan
+## 7. macOS 27 validation and remaining release gates
 
-This section is the release-day runbook. Do not change the audit row above to “verified live” merely
+This section records the implemented pickup and the remaining signed release checks. Do not change the audit row above to “verified live” merely
 because macOS reports version 27 or an SDK compiles the project. Genuine exact capture is accepted
 only after a released runtime delivers real descendant events to a production-mode, entitled
 binary.
@@ -597,7 +627,8 @@ The permanent product choices remain:
 
 ### 7.1 Release gates
 
-All of these must be true before starting the GA patch:
+The runtime and SDK gates have been checked locally. Signing and distribution gates remain
+required before accepting genuine exact delivery:
 
 1. Apple has shipped a non-beta macOS 27 build for Apple silicon.
 2. A non-beta Xcode or Command Line Tools release contains a macOS 27 SDK whose public
@@ -610,12 +641,14 @@ All of these must be true before starting the GA patch:
 5. The test identity, provisioning requirements if Apple imposes them, and designated requirement
    all apply to the exact executable being launched. An ad-hoc signature is insufficient.
 
-Record the release inputs before editing code:
+Record these inputs when repeating signed release validation:
 
 ```sh
 sw_vers
 uname -m
 xcodebuild -version
+# With Command Line Tools instead of full Xcode:
+pkgutil --pkg-info com.apple.pkg.CLTools_Executables
 xcrun --sdk macosx --show-sdk-version
 xcrun --sdk macosx --show-sdk-path
 ```
@@ -624,72 +657,78 @@ The expected architecture is `arm64`, and both the runtime and SDK must report 2
 the full macOS build number and Xcode build number in the validation record because ES behavior can
 change in servicing releases without changing the major version.
 
-### 7.2 Update the pinned SDK before evaluating the ABI
+### 7.2 SDK selection and ABI validation
 
-`build.zig` gets Apple framework headers and stubs from the lazy `xcode_frameworks` dependency, not
-from the SDK printed by `xcrun`. Therefore installing Xcode 27 is not sufficient. Replace the
-`xcode_frameworks` URL and hash in `build.zig.zon` with a package generated from the released macOS
-27 SDK. Do not vendor a beta SDK under a release-looking hash.
+Native macOS builds now use the SDK selected by `xcrun --sdk macosx --show-sdk-path` for Flamez's
+C shims and executable roots. `-Dmacos-sdk=/absolute/path/to/MacOSX.sdk` explicitly selects an SDK,
+including for cross-compilation. This ensures installing SDK 27 actually compiles the SDK 27 ABI
+assertion. The SDK path does not change the minimum deployment target.
 
-Verify both the system SDK and the newly pinned package contain the declaration:
+Each executable/test root receives a generated Zig libc configuration pointing to the selected
+SDK headers. Adding `-isystem` alone leaves Zig's bundled Darwin headers first: an unchanged C
+probe requiring `__MAC_OS_X_VERSION_MAX_ALLOWED >= 270000` fails with those search paths and
+passes with the selected libc configuration. This keeps Apple headers marked as system headers
+and activates the SDK 27 alias/ABI assertion. Clang's availability warning is suppressed only
+around the unevaluated `typeof` expression; all runtime calls still require dynamic lookup.
+The Mach-O SDK stamp still comes from Zig's linker (26.4); it does not identify the C headers.
+
+The previous plan required replacing the `xcode_frameworks` URL/hash in `build.zig.zon` first. A
+published SDK 27 replacement could not be located. The existing package remains the default for
+cross-builds without an explicit SDK. When an SDK is selected, raylib's old package include,
+framework, and library paths are removed and replaced with the same SDK as Flamez, including its
+libc configuration.
+
+`tools/package_macos_sdk.py` now generates a deterministic SDK archive from the installed SDK.
+It retains unmodified C/Objective-C headers and library stubs, realizes symlinks (including macOS
+27 Cryptex framework aliases), and omits Swift modules and framework resources. `--verify` compares
+every packaged file with the installed SDK and rejects missing, extra, or changed inputs. Two
+independent runs produced identical archives. All 35,765 files verified; the application, raylib,
+validator, and Debug suite built from the extracted package, with 178 passes and 14 expected skips.
+Headless capture and analysis export also passed using that application.
+
+Verified local package:
+
+- Archive: `zig-pkg/sdk-archives/macos-sdk-27.0-26A425.tar.gz` (approximately 98 MiB;
+  ignored by Git).
+- SHA-256: `13904b712e3c8e3793f846a4ffd5ae65c0779841b2008328e412bbaf44164e80`.
+- Zig hash: `N-V-__8AACZbTy-0TRKD3y-kbetO4Hfy6rtq5Grrw0hysQEU`.
+
+The user chose to keep the archive local and declined publication. The source manifest retains
+its existing cross-build fallback URL; native builds select the installed SDK 27, and an extracted
+local package can be selected with `-Dmacos-sdk`. Publication and changing the public dependency
+pin are outside this unsigned work's scope. The local archive's size and SHA-256 were rechecked
+after copying it into `zig-pkg/sdk-archives`.
+
+An isolated build also checked the package as the default SDK using its verified cache entry:
+Debug passes 178/192 tests (14 skips), ReleaseSafe with telemetry/FPS passes 181/192 (11 skips),
+required-mode tests compile, and the installed validator passes `--unsigned`. This establishes
+local package compatibility; no public SDK 27 URL was published or verified.
+
+The actual declaration lives under `usr/include/EndpointSecurity`, rather than a framework Headers
+directory:
 
 ```sh
 rg -n "es_new_descendants_client" \
-  "$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/EndpointSecurity.framework/Headers"
-rg -n "es_new_descendants_client" zig-pkg \
-  -g 'ESClient.h' -g 'EndpointSecurity.h'
-```
-
-Then compile both policies with the pinned headers:
-
-```sh
+  "$(xcrun --sdk macosx --show-sdk-path)/usr/include/EndpointSecurity/ESClient.h"
 ~/zig/zig build test-compile -Dtarget=aarch64-macos --summary all
 ~/zig/zig build test-compile -Dtarget=aarch64-macos \
   -Dmacos-require-endpoint-security=true --summary all
 ~/zig/zig build -Dtarget=aarch64-macos \
   -Dmacos-require-endpoint-security=true --summary all
-file zig-out/bin/flamez
 ```
 
-The existing SDK-version guard in `src/macos_es_shim.c` makes the compiler compare the local
-function-pointer type with `typeof(&es_new_descendants_client)` when
-`__MAC_OS_X_VERSION_MAX_ALLOWED >= 270000`. Treat a failure as an Apple ABI change to investigate;
-do not delete or weaken that assertion. Also retain the C and Zig size/offset assertions for every
-bridge structure.
+The installed SDK 27 header matches the current fork/exec/exit extraction assumptions, including
+message versions for CWD (3), parent audit tokens (4), and global sequence numbers (4). No event
+layout rewrite was necessary. SDK 27 now supplies the function-pointer alias directly, while the
+manual SDK 26 declaration remains independently asserted against it. Retain all C/Zig size and
+field-offset assertions, runtime dynamic lookup, and null checks.
 
-Compare the released header and documentation against every assumption below:
+To exercise the older declaration with an installed SDK 26:
 
-- exact function name, return type, parameters, and block signature;
-- availability version and supported architectures;
-- caller plus existing-and-future descendant scope;
-- whether notify-only clients still avoid root and Full Disk Access;
-- entitlement, signing, provisioning, user-approval, and distribution requirements;
-- callback serialization and message ownership;
-- `es_sync_client` ordering and handler-reentrancy rules;
-- minimum message versions for `cwd`, `parent_audit_token`, and `global_seq_num`; and
-- whether fork, exec, or exit structures gained a newer authoritative identity or timestamp field.
-
-If the released contract matches, no event-path rewrite is needed. Update the beta wording and SDK
-version recorded in this document, but retain dynamic lookup. If it differs, update the compatibility
-typedef, `flamez_capture_message`, the SDK-native synthetic fixtures, and this document in one
-change. Never reinterpret a changed field by layout coincidence.
-
-Once SDK 27 is the pinned build input, make the compatibility alias use Apple's declaration on new
-SDKs while preserving the manual declaration for SDK 26 builds. The intended shape is:
-
-```c
-#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && \
-    __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
-typedef __typeof__(&es_new_descendants_client) flamez_new_descendants_client_fn;
-#else
-typedef es_new_client_result_t (*flamez_new_descendants_client_fn)(
-    es_client_t **client,
-    es_handler_block_t handler);
-#endif
+```sh
+~/zig/zig build test-compile -Dtarget=aarch64-macos \
+  -Dmacos-sdk=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk --summary all
 ```
-
-This is a source-level cleanup, not permission to call the symbol directly. The runtime lookup and
-null check remain necessary for the macOS 26 fallback.
 
 ### 7.3 Sign and inspect the exact executable
 
@@ -719,37 +758,50 @@ Notarization and distribution packaging are separate release gates. They should 
 local exact delivery works so a packaging failure is not confused with an ES ABI or event-delivery
 failure.
 
-### 7.4 Add a production-mode live validator
+### 7.4 Production-mode live validator
 
-The `FLAMEZ_TEST` bridge proves extraction and queue semantics but intentionally cannot prove kernel
-delivery. For repeatable GA evidence, add a small installed `macos-es-live-test` executable and Zig
-build step with these properties:
+`src/macos_es_live_test.zig` builds a separate installed `macos-es-live-test` executable, with
+`src/macos_es_shim.c` compiled without `FLAMEZ_TEST`. Its default mode constructs the real macOS
+Collector with `.endpoint_security = .required` and checks exact activation before spawning.
+The C fixture and shebang script install beside it, so invocation is independent of the current
+directory and all three paths remain stable for inspection and signing.
 
-- it links `src/macos_es_shim.c` without `FLAMEZ_TEST`;
-- it constructs the real macOS `Collector` in required mode and asserts `.exact` before spawning;
-- it installs at a stable path under `zig-out/bin` so that exact artifact can be signed;
-- it prints the selected fidelity, exact diagnostic, received event counts, loss count, and failed
-  assertion before returning nonzero; and
-- its fixtures use pipes, signals, `SIGSTOP`/`SIGCONT`, child waits, and monotonic deadlines with
-  `std.Thread.yield()`—never `sleep`, `usleep`, `nanosleep`, or a timing delay.
+```sh
+~/zig/zig build macos-es-live-test -Dtarget=aarch64-macos --summary all
+# Available on this unsigned macOS 27 host:
+zig-out/bin/macos-es-live-test --unsigned
+# Expected to fail with ExactCaptureUnavailable until the validator is entitled:
+zig-out/bin/macos-es-live-test
+```
 
-Do not sign and run the ordinary unit-test artifact as the authoritative live check. Its
-`FLAMEZ_TEST` surface and cache-dependent path make it a poor representation of the shipped binary.
-The live validator may reuse Session fixture logic, but it must traverse the production ES client
-creation and real framework callback.
+The build step only installs; it does not run or sign a cache artifact. For positive acceptance,
+sign `zig-out/bin/macos-es-live-test` using the approved identity and `macos.entitlements`, inspect
+and verify that exact file as in section 7.3, then run it without arguments. Sign the application
+separately. The native fixture and shell script do not need the restricted entitlement.
 
-The validator needs the following deterministic scenarios:
+The unsigned mode requires the not-entitled diagnostic, no ES handle, and no fallback worker after
+required-mode rejection. It exercises fixture readiness and exit protocols, then tests real automatic
+kqueue capture. It explicitly reports that kernel assertions were not run. Exact mode prints process
+and fork/exec/exit counts, fidelity, diagnostics, loss count, and any failed assertion. Fixture
+coordination uses blocked signals, stop notifications, pipes, child waits, and awake-clock failure
+deadlines with `std.Thread.yield()`. There are no sleep-based readiness delays.
+A separate watchdog bounds the complete ordinary run to 60 awake seconds, including synchronous
+framework barriers. It kills the tracked fixture groups before returning a failing process status.
+`--watchdog-check` creates a stopped fixture and deliberately blocks the main thread; it must exit
+with status 1 and leave no fixture alive. This failure path is verified without an ES entitlement.
+
+The implemented exact-mode scenarios are:
 
 | Scenario | Required observation |
 |---|---|
 | activation | required mode selects `.exact`, the active diagnostic names descendant-scoped ES, and no fallback worker starts |
-| scope isolation | an unrelated same-user process is absent while the launched root and its descendants are present |
+| scope isolation | an unrelated same-user sibling subtree of 33 processes runs while the admitted trace root is suspended; none is admitted |
 | fork burst | all 32 signal-gated children have fork and exit records with the correct parent generation |
 | short double fork | both generations are retained even when the intermediate exits before userspace polls |
-| root exec | one root process record survives exec with an advanced PID version and kernel metadata |
+| root exec | collector PID version advances; one Session process retains both argv/provenance records with adjacent image intervals through finalization |
 | exec metadata | interpreter, script path, complete argv including an empty argument, executable, and CWD match the ES payload |
 | immediate exits | 24 immediate root exits retain exit code, observed-exit kind, final boundary, and zero live records |
-| final drain | a root exit followed by queued descendant activity is complete before the `es_sync_client` barrier returns |
+| final drain | after releasing a fixture, reap without polling; one `es_sync_client` flush must deliver every queued child and root exit |
 | surviving descendant | the descendant is retained and clipped to the root capture boundary without a CPU slice past that boundary |
 | restart | a forced stop followed immediately by another launch does not receive stale records from the first client |
 | CPU accounting | a fixed-work parallel child has monotonic cumulative self CPU and a final or explicitly partial terminal sample |
@@ -767,7 +819,7 @@ following:
 
 - the collector reports `.exact`;
 - the active diagnostic is `using exact descendant-scoped Endpoint Security capture`;
-- the application footer does not show `CAPTURE · BEST EFFORT`;
+- session and analysis exports retain exact capture fidelity;
 - every controlled fixture reports its exact expected process and event count;
 - kernel exec metadata is tagged as `Process.MetadataSource.kernel`;
 - no controlled run reports an ES sequence gap, queue rejection, or other lost event; and
@@ -776,8 +828,8 @@ following:
 Also prove required mode fails closed. Sign a separate copy without the restricted entitlement, or
 use an identity to which Apple has not granted it, and confirm launch returns
 `ExactCaptureUnavailable` with the not-entitled diagnostic. Do not alter the accepted artifact for
-this negative check. Repeat automatic mode on that copy and confirm it selects
-`.snapshot_recovery`; this preserves the unsigned-development behavior.
+this negative check. Run the separate unentitled validator copy with `--unsigned` to check both
+required-mode rejection and automatic `.snapshot_recovery` capture.
 
 Run the existing suites after the live validator:
 
@@ -789,20 +841,23 @@ Run the existing suites after the live validator:
 git diff --check
 ```
 
-### 7.6 Manual checks that must not become sleep-based tests
+### 7.6 Manual set-ID check and validation scope
 
-Two remaining checks are intentionally manual because automating them would be disruptive or would
-weaken the assertion:
+Execute a real set-ID transition and confirm the ES exec payload still supplies the new image's
+identity and metadata when subsequent `libproc` inspection is denied. The generation-authenticated
+exec must clear inherited metadata rather than attributing the old argv to the new image. This
+check requires an entitled ES client and is excluded from unsigned completion. Record the exact
+setup and result separately from the automated suite; a fixed delay cannot prove the transition.
 
-1. Execute a real set-ID transition and confirm the ES exec payload still supplies the new image's
-   identity and metadata when subsequent `libproc` inspection is denied. The generation-authenticated
-   exec must clear inherited metadata rather than attributing the old argv to the new image.
-2. Suspend and resume the whole Apple-silicon machine during a capture. Confirm ES Mach timestamps,
-   Zig's awake clock, Session duration, process boundaries, and CPU slices remain in one awake-time
-   domain with no negative, wrapped, or post-boundary interval.
+Whole-machine sleep/resume detection is outside application scope at the user's request on
+2026-09-16. The dedicated validator mode and its acceptance gate were removed. The staged runs
+timed out without recording a qualifying cycle, and cleanup was verified; they are not evidence
+of successful suspend/resume validation. Ordinary timestamp conversion, awake-clock calibration,
+and capture-boundary tests remain part of the automated suite.
 
-Do not add a fixed delay to make either check pass. Record the exact setup and result separately from
-the automated suite.
+The footer's capture-fidelity badge was also removed at the user's request. Fidelity remains
+recorded in session and analysis exports. Unsigned macOS 27 capture still uses snapshot recovery;
+the UI change does not establish exact Endpoint Security delivery.
 
 ### 7.7 Failure triage
 
@@ -826,18 +881,18 @@ Attach this matrix to the commit or release issue that enables live exact captur
 |---|---|
 | macOS product/build | `sw_vers` output |
 | machine | Apple-silicon model and `arm64` architecture |
-| Xcode and SDK | released versions and build identifiers |
-| pinned frameworks | new `build.zig.zon` URL and Zig package hash |
+| Xcode or Command Line Tools and SDK | released versions and build identifiers |
+| SDK source | explicit/selected SDK path and build; package URL/hash when a refreshed package is available |
 | ES declaration | released signature and availability annotation |
 | runtime symbol | present/absent result from direct dynamic lookup |
 | signing | Team Identifier, designated requirement, and displayed ES entitlement |
 | required-mode activation | exact diagnostic and fidelity |
 | automated validation | unit, compile-only, and production live-validator totals |
-| manual validation | set-ID and suspend/resume results |
+| manual validation | set-ID transition result |
 | event integrity | controlled-run loss count and short-double-fork result |
 
 Only after every acceptance item passes should section 6 change genuine kernel delivery from “not
-verifiable” to “verified live,” the document status move from research/first implementation to
+verifiable” or “blocked on signing identity” to “verified live,” the document status move to
 validated macOS 27 support, and release notes claim Linux-equivalent lifecycle completeness. Keep
 the fallback limitation language: snapshot recovery remains best effort even when the same binary
 runs on macOS 27 without a usable entitlement.

@@ -88,20 +88,27 @@ FLAMEZ_ASSERT_ES_EVENT_OFFSET(cpu_final, 113);
 
 #undef FLAMEZ_ASSERT_ES_EVENT_OFFSET
 
-typedef es_new_client_result_t (*flamez_new_descendants_client_fn)(
+typedef es_new_client_result_t (*flamez_compat_descendants_client_fn)(
     es_client_t **client,
     es_handler_block_t handler);
 
-/* The macOS 26 build SDK predates this declaration. When a newer SDK is used,
- * make the compiler prove that the compatibility declaration still matches
- * Apple's public header instead of trusting the dlsym cast. */
+/* Use the SDK declaration without introducing a load-time dependency. Keep
+ * checking the SDK 26 compatibility declaration against Apple's current ABI. */
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) &&                                \
     __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+/* typeof does not load or call the symbol. Runtime availability is checked by
+ * flamez_find_descendants_client before this pointer is ever called. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+typedef __typeof__(&es_new_descendants_client) flamez_new_descendants_client_fn;
+#pragma clang diagnostic pop
 _Static_assert(
     __builtin_types_compatible_p(
-        flamez_new_descendants_client_fn,
-        __typeof__(&es_new_descendants_client)),
+        flamez_compat_descendants_client_fn,
+        flamez_new_descendants_client_fn),
     "es_new_descendants_client declaration changed");
+#else
+typedef flamez_compat_descendants_client_fn flamez_new_descendants_client_fn;
 #endif
 
 #define FLAMEZ_LOAD_FUNCTION(target, library, name)                            \

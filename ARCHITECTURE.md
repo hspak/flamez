@@ -140,7 +140,7 @@ The collectors provide the same model from different operating-system sources:
 | Exec metadata | kernel event plus procfs enrichment | Endpoint Security event | identity-checked process inspection |
 | Self CPU | eBPF scheduler accounting | `proc_pid_rusage` | `proc_pid_rusage` |
 | Identity | tracked TGID lifetime | audit-token PID version | process identity plus local registration generation |
-| Fidelity | exact; startup fails if unavailable | exact when the runtime and entitlement permit it | snapshot recovery, shown as best effort in the UI |
+| Fidelity | exact; startup fails if unavailable | exact when the runtime and entitlement permit it | snapshot recovery; retained in session and analysis exports |
 
 ### Linux collector
 
@@ -649,7 +649,10 @@ an orderly boundary exists.
 - **macOS build graph**: Clay, raylib, the application, and the complete test root
   target Apple silicon (`aarch64-macos`); `src/macos_shim.c` and
   `src/macos_es_shim.c` are compiled only into macOS artifacts. The pinned
-  framework package supplies Apple SDK headers and libraries.
+  framework package supplies Apple SDK headers and libraries for cross-builds.
+  `-Dmacos-sdk` selects a complete SDK for Flamez and raylib; native builds
+  currently select the installed SDK. The selected SDK also supplies Zig's
+  libc header configuration, so availability checks use that SDK's version.
   `zig build test-compile -Dtarget=aarch64-macos` validates the complete graph
   without trying to execute a cross-built binary.
   `-Dmacos-require-endpoint-security=true` changes automatic selection to

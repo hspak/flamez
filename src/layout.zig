@@ -239,9 +239,6 @@ pub fn create(
             stat("PROCESSES", view_text.processCount(), theme.blue);
             stat("ACTIVE", view_text.activeCount(), theme.danger);
             stat("", view_text.statusSlice(), theme.muted);
-            if (session.capture_fidelity == .snapshot_recovery) {
-                stat("CAPTURE", "BEST EFFORT", theme.yellow);
-            }
             if (view_text.dropped_len > 0) stat("DROPPED", view_text.droppedSlice(), theme.danger);
             if (session.running) {
                 clay.UI()(.{

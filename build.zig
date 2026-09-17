@@ -1,10 +1,28 @@
 //! Build graph for the Flamez executable, its eBPF object, and the complete test root.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const macos_sdk = b.option(
+        []const u8,
+        "macos-sdk",
+        "macOS SDK root (native builds default to xcrun's selected SDK)",
+    ) orelse if (target.result.os.tag == .macos and builtin.os.tag == .macos)
+        std.mem.trim(u8, b.run(&.{
+            "xcrun",
+            "--sdk",
+            "macosx",
+            "--show-sdk-path",
+        }), " \r\n\t")
+    else
+        null;
+    const macos_libc = if (target.result.os.tag == .macos)
+        macosLibcFile(b, macos_sdk)
+    else
+        null;
 
     const main_module = b.addModule("flamez", .{
         .root_source_file = b.path("src/main.zig"),
@@ -34,6 +52,11 @@ pub fn build(b: *std.Build) void {
         });
     const raylib = raylib_dep.module("raylib");
     const raylib_artifact = raylib_dep.artifact("raylib");
+    if (target.result.os.tag == .macos and macos_sdk != null) {
+        removeLegacyMacosSdkPaths(raylib_artifact.root_module);
+        addMacosSdkPaths(b, raylib_artifact.root_module, macos_sdk);
+        raylib_artifact.setLibCFile(macos_libc);
+    }
     if (target.result.os.tag == .linux) {
         // Upstream hack: raylib doesn't expose a way for us to set the wayland
         // app_id because it runs `glfwDefaultWindowHints()` which wipes the
@@ -100,17 +123,19 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.setLibCFile(macos_libc);
     const app_modules = [_]*std.Build.Module{ main_module, exe.root_module };
     for (app_modules) |module| {
         module.addImport("zclay", zclay_dep.module("zclay"));
         module.addImport("raylib", raylib);
         module.addImport("footer_font", footer_font);
         module.addOptions("build_options", build_options);
-        if (target.result.os.tag == .macos) addMacosSdkPaths(b, module);
+        if (target.result.os.tag == .macos) addMacosSdkPaths(b, module, macos_sdk);
     }
     if (target.result.os.tag == .macos) {
         addMacosProcessShim(b, main_module, true);
         addMacosProcessShim(b, exe.root_module, false);
+        addMacosLiveTest(b, target, optimize, build_options, macos_sdk, macos_libc);
     }
 
     if (enable_ebpf) {
@@ -179,6 +204,7 @@ pub fn build(b: *std.Build) void {
         .root_module = main_module,
         .filters = test_filters,
     });
+    main_tests.setLibCFile(macos_libc);
     const run_main_tests = b.addRunArtifact(main_tests);
 
     const test_compile_step = b.step("test-compile", "Compile tests without running them");
@@ -255,14 +281,114 @@ fn addMacosProcessShim(b: *std.Build, module: *std.Build.Module, test_build: boo
     module.link_libc = true;
 }
 
-// Zig's bundled Darwin headers omit newer platform frameworks. The pinned
-// Xcode package also supplies raylib's non-transitive framework paths.
-fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module) void {
+// Prefer the selected SDK for current API declarations. The package supplies
+// framework paths for cross-builds that do not provide a complete SDK.
+fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, sdk: ?[]const u8) void {
+    if (sdk) |root| {
+        module.addSystemFrameworkPath(.{
+            .cwd_relative = b.pathJoin(&.{ root, "System/Library/Frameworks" }),
+        });
+        module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ root, "usr/include" }) });
+        module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ root, "usr/lib" }) });
+        module.link_libc = true;
+        return;
+    }
     const frameworks = b.lazyDependency("xcode_frameworks", .{}) orelse return;
     module.addSystemFrameworkPath(frameworks.path("Frameworks"));
     module.addSystemIncludePath(frameworks.path("include"));
     module.addLibraryPath(frameworks.path("lib"));
     module.link_libc = true;
+}
+
+fn macosLibcFile(b: *std.Build, sdk: ?[]const u8) ?std.Build.LazyPath {
+    const root = sdk orelse return null;
+    // Merely adding -isystem leaves Zig's bundled Darwin headers ahead of the
+    // SDK. Configure libc itself so Availability.h and the ES header agree,
+    // while retaining system-header diagnostics for Apple's headers.
+    const include = b.pathJoin(&.{ root, "usr/include" });
+    return b.addWriteFiles().add("macos-sdk-libc.txt", b.fmt(
+        "include_dir={s}\nsys_include_dir={s}\ncrt_dir=\n" ++
+            "msvc_lib_dir=\nkernel32_lib_dir=\ngcc_dir=\n",
+        .{ include, include },
+    ));
+}
+
+fn removeLegacyMacosSdkPaths(module: *std.Build.Module) void {
+    const legacy_sdk = dependency: {
+        for (module.include_dirs.items) |directory| {
+            if (directory != .framework_path_system) continue;
+            const path = directory.framework_path_system;
+            if (path == .dependency and std.mem.eql(u8, path.dependency.sub_path, "Frameworks"))
+                break :dependency path.dependency.dependency;
+        }
+        return;
+    };
+    var retained: usize = 0;
+    for (module.include_dirs.items) |directory| {
+        const path: ?std.Build.LazyPath = switch (directory) {
+            .path, .path_system, .path_after, .framework_path, .framework_path_system, .embed_path => |path| path,
+            .other_step, .config_header_step => null,
+        };
+        if (path) |value| {
+            if (value == .dependency and value.dependency.dependency == legacy_sdk) continue;
+        }
+        module.include_dirs.items[retained] = directory;
+        retained += 1;
+    }
+    module.include_dirs.items.len = retained;
+    retained = 0;
+    for (module.lib_paths.items) |path| {
+        if (path == .dependency and path.dependency.dependency == legacy_sdk) continue;
+        module.lib_paths.items[retained] = path;
+        retained += 1;
+    }
+    module.lib_paths.items.len = retained;
+}
+
+fn addMacosLiveTest(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    options: *std.Build.Step.Options,
+    sdk: ?[]const u8,
+    libc_file: ?std.Build.LazyPath,
+) void {
+    const validator = b.addExecutable(.{
+        .name = "macos-es-live-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/macos_es_live_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    validator.setLibCFile(libc_file);
+    validator.root_module.addOptions("build_options", options);
+    addMacosSdkPaths(b, validator.root_module, sdk);
+    addMacosProcessShim(b, validator.root_module, false);
+    const fixture = b.addExecutable(.{
+        .name = "macos-es-fixture",
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize }),
+    });
+    fixture.setLibCFile(libc_file);
+    addMacosSdkPaths(b, fixture.root_module, sdk);
+    fixture.root_module.addCSourceFile(.{
+        .file = b.path("src/macos_es_fixture.c"),
+        .flags = &.{
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+        },
+    });
+    const step = b.step("macos-es-live-test", "Install the production ES validator and fixtures");
+    step.dependOn(&b.addInstallArtifact(validator, .{}).step);
+    step.dependOn(&b.addInstallArtifact(fixture, .{}).step);
+    const script = b.addInstallFileWithDir(
+        b.path("src/macos_es_fixture.sh"),
+        .bin,
+        "macos-es-fixture.sh",
+    );
+    step.dependOn(&script.step);
 }
 
 // raylib-zig attaches Linux system libraries to raylib's static-library root.
