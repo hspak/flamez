@@ -632,7 +632,8 @@ an orderly boundary exists.
 - **Dependencies** (`build.zig.zon`): `zclay` (Clay Zig bindings) and
   optional local Zrct instrumentation. System SDL3 (3.4+), FreeType and libpng
   are linked through pkg-config, or from an explicit `-Dgui-prefix` target tree.
-  Linux defaults to Wayland; SDL owns backend selection and native app identity.
+  Linux defaults to Wayland and Vulkan; macOS retains SDL's native renderer
+  selection (Metal). SDL owns native app identity.
 - **eBPF build graph**: on Linux the build graph always:
   - compiles `src/flamez.bpf.c` with `clang -target bpf` and installs it to
     `share/flamez/flamez.bpf.o`;
@@ -657,8 +658,9 @@ an orderly boundary exists.
   currently select the installed SDK. The selected SDK also supplies Zig's
   libc header configuration, so availability checks use that SDK's version.
   `zig build test-compile -Dtarget=aarch64-macos` also needs target SDL3,
-  FreeType, and libpng development files; the Linux migration did not validate
-  the native Cocoa/Metal path. See [MACOS_SDL.md](MACOS_SDL.md).
+  FreeType, and libpng development files. `zig build test-native-gui` exercises
+  Cocoa/Metal window lifecycle, input and render readback on a Mac desktop.
+  See [MACOS_SDL.md](MACOS_SDL.md) for native results and packaging policy.
   `-Dmacos-require-endpoint-security=true` changes automatic selection to
   fail-closed exact capture for signed macOS 27 validation; it does not grant
   the restricted entitlement in `macos.entitlements`.

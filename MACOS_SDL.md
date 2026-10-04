@@ -1,116 +1,160 @@
-# Native macOS SDL follow-up
+# Native macOS SDL validation
 
-The Linux migration replaces raylib/GLFW with SDL3 rendering and events while
-retaining Clay, embedded Inter/Roboto Mono fonts, capture shims, import/export,
-and analysis. macOS code is best effort until the checks below run on Apple
-silicon. No Cocoa/Metal runtime result is claimed from this Linux host.
+Flamez uses SDL3 for windows, input and rendering. Linux defaults to Vulkan;
+macOS retains SDL's native renderer selection and selects **Metal** on the
+validated host. `SDL_RENDER_DRIVER=software` is an explicit diagnostic fallback.
+No Vulkan loader or MoltenVK dependency is needed on macOS. Clay, embedded
+Inter/Roboto Mono fonts, capture, import/export and analysis retain their existing
+contracts. Command-key equivalents are not added; the documented Ctrl shortcuts
+remain available.
 
-## Build and packaging
+## Build and repeatable checks
 
-Use Zig 0.16.0, a selected Xcode SDK, SDL **3.4+**, FreeType, libpng, and pkg-config.
-Install the target's development packages, then verify discovery on the Mac:
+Use Zig 0.16.0, a selected Xcode/Command Line Tools SDK, SDL **3.4+**, FreeType,
+libpng and pkg-config. With Apple-silicon Homebrew:
 
 ```sh
+brew install sdl3 freetype libpng pkgconf
 pkg-config --modversion sdl3 freetype2 libpng
 zig build -Doptimize=ReleaseSafe
 zig build test
 zig build test -Doptimize=ReleaseSafe -Dperf-telemetry=true -Dfps-counter=true
+python3 -m unittest discover -s tests -p 'test_*.py'
+zig fmt --check build.zig build.zig.zon src
 ```
 
-Native builds retain `xcrun --sdk macosx --show-sdk-path`. `-Dmacos-sdk` overrides
-that SDK. `-Dgui-prefix=/absolute/prefix` instead supplies `include/` and `lib/`
-for all three GUI dependencies without pkg-config; the prefix must contain
-`include/SDL3`, `include/freetype2`, `png.h`, and the target libraries. FreeType
-and libpng's own dynamic dependencies must also be resolvable on the target.
-Zrct receives the same SDL headers/library, avoiding a second SDL instance.
-
-Linux cross-build attempt: `zig build test-compile -Dtarget=aarch64-macos` stopped
-at missing target `SDL3`, `freetype`, and `png16` libraries. The bundled Apple
-framework package covers Apple APIs only. Host pkg-config found Linux headers;
-those are not a valid cross-build environment. With a complete target tree:
+Native builds use `xcrun --sdk macosx --show-sdk-path`; `-Dmacos-sdk` overrides
+that selection. `-Dgui-prefix=/absolute/prefix` supplies `include/` and `lib/`
+for all three GUI dependencies without host pkg-config discovery. The tree must
+contain `include/SDL3`, `include/freetype2`, `include/png.h` and target libraries.
+Cross-builds require those **target** libraries as well as Apple SDK files:
 
 ```sh
 zig build test-compile -Dtarget=aarch64-macos \
   -Dmacos-sdk=/path/to/MacOSX.sdk -Dgui-prefix=/path/to/macos-gui-prefix
 ```
 
-Before release, inspect `otool -L zig-out/bin/flamez`, deployment targets,
-architecture, install names and rpaths. Decide whether the distribution requires
-installed packages or bundles dylibs; retain SDL, FreeType, libpng and embedded
-font notices if bundling. Revisit signing/notarization after changing linkage.
-The former raylib SDK path patch and `-Dmsaa` option are removed. No local Vulkan
-renderer patch is included. Let SDL select Metal normally; record its selected
-backend and version from startup logs, and exercise an available fallback.
+Run native integration checks in an unlocked desktop session with access to
+WindowServer. A sandbox that hides displays produces `WindowUnavailable` and
+cannot establish a native GUI pass.
 
-`release.sh` currently cross-builds `aarch64-macos.13.0` without a target GUI prefix
-and packages only the executable/schema. Before using it, supply the target SDK
-and GUI dependency paths, verify the minimum supported macOS version against
-those libraries, and implement the chosen dylib packaging/rpath policy. The
-separate `../homebrew-tap/Formula/flamez.rb` currently declares no GUI-library
-dependencies. Add `sdl3`, `freetype`, and `libpng` if using Homebrew's libraries,
-or validate the bundled alternative. Updating only release versions/checksums
-will not make this SDL binary distributable. No release was published here.
+```sh
+zig build test-native-gui -Doptimize=ReleaseSafe
+SDL_RENDER_DRIVER=software zig build test-native-gui -Doptimize=ReleaseSafe \
+  -- artifacts/macos-sdl/software
+FLAMEZ_SCREENSHOT=artifacts/macos-sdl/import-metal.png \
+  zig-out/bin/flamez --import src/testdata/session-v1-exec-history.json
+```
 
-## Window, input and rendering
+`test-native-gui` checks the actual Cocoa window and selected renderer, minimum
+size, resize and drawable metrics, hide/show, asynchronous minimize/restore,
+nested clips, alpha order, rounded corners, all three font atlases, screenshot
+readback and output failure, ordered queued wheel/pinch input, focus clearing,
+close and renderer-reset handling. It exercises high-density opt-in and opt-out
+separately and logs the **observed** density; opt-in does not imply a 2× display.
+Screenshots go to `artifacts/macos-sdl` or the directory after `--`. Input is
+injected through SDL's event queue; this does not prove physical trackpad delivery.
+The renderer-reset contract remains fail-and-exit, not texture recreation.
 
-- Launch an imported fixture without capture privileges. Check the title,
-  760×520 minimum, resizing, hide/show, minimize/restore, native close, Escape,
-  focus changes and Dock behavior. SDL initialization, event processing,
-  renderer/texture ownership, and shutdown remain on the main thread.
-- Move between Retina/non-Retina displays, including during resize. Window
-  coordinates drive Clay/hit testing; stable `SDL_GetWindowPixelDensity()` scales
-  them to pixels. Verify actual Cocoa density behavior and screenshots at each
-  scale. Framebuffer dimensions are independently observed for redraws.
-- Check rounded corners, thin outlines, alpha, nested scissor restoration, selected
-  bars, CPU plots, details, hover tooltips and all three fonts. Font rasters are
-  generated once at a 64-pixel ascent-to-descent height and filtered when drawn;
-  assess readability at 1×, 2× and larger accessibility sizes. Glyph coverage is
-  intentionally the former Latin-1 plus UI-symbol set, with `?` fallback; no
-  shaping/emoji expansion is part of this migration.
-- Verify precise wheel deltas, horizontal/Shift scrolling, Ctrl-wheel anchored
-  zoom, trackpad pinch direction and magnitude, scrollbar dragging and releases
-  outside the window. SDL 3.4 pinch updates accumulate logarithmic zoom deltas.
-  Linux injected pinch tests do not establish native Mac trackpad delivery.
-- Check Ctrl-S export, Ctrl-C/Ctrl-A details selection, Ctrl-0/+/- zoom and F5
-  Clay debug. Ctrl shortcuts are preserved; decide separately whether to add
-  Command equivalents to match native conventions. Verify clipboard exchange
-  with another application and focus loss while keys/buttons are held.
-- `FLAMEZ_SCREENSHOT=/tmp/flamez.png` uses a fixed 60 Hz clock, disables VSync and
-  high-density opt-in, and exits after frame 40. Capture occurs before present;
-  verify PNG dimensions/orientation and failure diagnostics. Normal UI uses
-  high density and VSync. SDL render-device reset currently reports an error and
-  exits; test whether Metal/device transitions need a texture-recreation path.
+`FLAMEZ_SCREENSHOT` disables VSync and high density, uses a 60 Hz deadline and
+exits after frame 40. Normal use enables VSync and high density. Font rasters
+retain the 64-pixel ascent-to-descent size and the existing Latin-1/UI-symbol
+coverage, with `?` fallback.
 
-## Frame pacing and capture
+The sibling Zrct checkout is absent on this Mac. Its current desktop runner is
+Linux-specific, so `test-zrct`, `test-zrct-desktop` and `bench-zrct` remain Linux
+workflows. The native integration target does not depend on Zrct.
 
-Review [FRAME_PACING.md](FRAME_PACING.md) and [PERFORMANCE.md](PERFORMANCE.md)
-alongside the concrete Flamez adoption notes in [README.md](README.md).
+## Results recorded on 2026-10-03
 
-- Measure 60 Hz and ProMotion displays, refresh/display changes, rapid width and
-  height resize, held modifiers beyond 120 ms, drag/scroll, idle wakeups and
-  minimize/restore. SDL's reported display cadence sets the minimum frame-start
-  interval, with a 120 Hz fallback. A successful VSync request is not proof that
-  every present blocks. Drawing/presentation time already counts toward the
-  deadline; overdue frames incur no additional full-interval sleep.
-- Confirm unchanged imported/completed captures stop presenting. A visible FPS
-  diagnostic deliberately requests one idle frame per second and displays `Idle`.
-  SDL waits retain events, cap service delay at 25 ms, and use a separate delay
-  for sub-millisecond remainders. These are scheduling bounds, not guaranteed
-  input-to-display latency. Measure macOS idle CPU and timer wake behavior.
-- Preserve the backend's capture lifecycle: run live kqueue/libproc capture and
-  signed/unsigned Endpoint Security validation from [MACAPI.md](MACAPI.md).
-  Exercise target completion while minimized, Stop, quit while capturing, import,
-  GUI export/reopen and headless `-o`/analysis. Capture polling is independent of
-  frame deadlines, and a final capture update stays pending until drawn.
-- Benchmark a fixed ReleaseSafe executable with matching fonts, renderer,
-  dimensions and fixture. Separate draw/present work, frame-start intervals,
-  process CPU and physical presentation evidence. Current telemetry reports
-  recent 64-sample quantiles, not full-run p99 values. Linux software-compositor
-  timings cannot establish Metal performance or ProMotion smoothness.
+Host: Apple silicon, macOS 27.0.1 (26A434), selected MacOSX 27 SDK, Zig 0.16.0,
+SDL 3.4.16, FreeType 2.14.3 (pkg-config ABI version 26.6.20), libpng 1.6.59.
+The available display reports 60 Hz and density 1 in both density modes.
 
-The local Zrct runner provisions Linux tools, so `test-zrct`,
-`test-zrct-desktop`, and `bench-zrct` are Linux-host workflows today. Native SDL
-instrumentation can be built on macOS, but first validate its Unix socket,
-clipboard, screenshot and shutdown behavior with a Mac-capable harness. Record
-all native results and remaining issues here rather than treating Linux passes
-as macOS validation.
+| Validation | Result |
+|---|---|
+| Native ReleaseSafe build, pkg-config discovery | Passed |
+| Debug unit/integration suite | 188 passed, 17 skipped, 205 total |
+| ReleaseSafe suite with telemetry/FPS | 194 passed, 11 skipped, 205 total |
+| Explicit `/opt/homebrew` prefix and required-ES test compilation | Passed |
+| Native Cocoa/Metal integration target | Passed in Debug and ReleaseSafe |
+| Native Cocoa/software integration target | Passed in ReleaseSafe |
+| Imported fixture screenshot | Metal; 1180×760 PNG, visually inspected |
+| Native renderer screenshots | 1000×700 PNGs; clipping, blend and glyph pixels asserted before present |
+| Imported GUI idle and SIGINT shutdown | Seven frames in five seconds; clean exit; CPU time increased 0.04 s during a three-second idle sample |
+| Headless kqueue capture, analysis, GUI reopen | Passed; three-process capture reopened with Metal |
+| Production `macos-es-live-test --unsigned` | Passed entitlement rejection, five fixture protocols, repeated sessions and fallback; exact delivery unverified |
+| Benchmark/packaging Python checks | Five tests passed; macOS benchmark regression failed before the fix and passed unchanged afterward |
+| Local macOS archive | Built with a 27.0 minimum; arm64, dylib closure, signature, version and analysis checks passed; extracted copy rendered with Metal from another directory |
+
+Artifacts are local under `artifacts/macos-sdl/`; they are not release assets.
+The render benchmark ran two samples of each of `typical`, `dense` and `packed`
+with the fixed ReleaseSafe binary in `benchmark/bin/flamez`. The runner now
+selects Metal on macOS and Vulkan on Linux, accepts `--renderer`, and records the
+selected backend and executable/fixture hashes. CPU affinity is `null` on macOS.
+Each sample discards 120 frames and measures 600; raw logs and hashes are in
+`metal-benchmark/result.json`. Mean frame wall times were about 8.2 ms, including
+present, with substantial CPU-time variation. These runs validate the measurement
+path; they do not establish GPU completion, physical presentation cadence, a
+performance improvement over raylib, or ProMotion smoothness.
+
+## Packaging policy
+
+The macOS archive uses **installed Apple-silicon Homebrew libraries** at their
+stable `/opt/homebrew/opt/{sdl3,freetype,libpng}/lib` install names. It does not
+bundle dylibs. Install those runtime packages before running a downloaded archive.
+Embedded Inter, Roboto Mono, Clay and zclay notices install in
+`share/flamez/licenses` on every platform. The specific Roboto Mono file embedded
+from Clay declares Apache 2.0 in its font metadata; its notice is retained.
+
+Build an archive on a Mac before invoking the publishing script on the Linux
+release host:
+
+```sh
+python3 tools/package_macos.py --version 0.2.0 --minimum-macos 27.0 \
+  --output artifacts/flamez-0.2.0-aarch64-macos.tar.gz
+python3 tools/package_macos.py --version 0.2.0 \
+  --verify artifacts/flamez-0.2.0-aarch64-macos.tar.gz
+```
+
+Use the intended release version. The tool validates every non-system linked
+library's architecture, install name and deployment target. It rejects undeclared
+runtime dependencies and any library newer than `--minimum-macos`; it removes
+build-machine rpaths, restores ad-hoc signing, checks the executable, retains
+notices/schema and records provenance in `share/flamez/macos-package.json`.
+The libraries installed for this validation have a macOS 27.0 minimum. Claiming
+Ventura support requires separately built and validated libraries supporting
+13.0; changing the executable target alone is insufficient.
+
+`release.sh` now requires `FLAMEZ_MACOS_ARCHIVE` and verifies its version, checksum
+and clean source commit before publication. It sets the Homebrew formula's macOS
+requirement from the archive and adds `sdl3`, `freetype` and `libpng` dependencies.
+It rejects an unmigrated AUR recipe (missing GUI dependencies/pkgconf or obsolete
+`-Dmsaa`). The external AUR/tap checkouts are not present here. No tag, formula,
+package repository or release has been published. Developer ID signing,
+notarization and restricted Endpoint Security entitlements remain separate from
+this local ad-hoc package validation.
+
+## Remaining physical and signed validation
+
+The migration builds and runs natively; these checks require hardware, human
+input or credentials absent from this run:
+
+- Retina/non-Retina moves during resize, accessibility sizes, display refresh
+  changes and ProMotion. Check font readability and hit testing at each density.
+- Physical precise/horizontal/Shift wheel, Ctrl-wheel anchor, native trackpad
+  pinch direction/magnitude, scrollbar releases outside the window, Dock/native
+  close behavior, and focus changes while keys/buttons are held.
+- Full GUI details, selection/copy, Ctrl-A/C/S, Ctrl-0/+/- and F5 workflows,
+  clipboard exchange with another application, GUI export/reopen, Stop and quit
+  during capture, and capture completion while minimized. Automated lower-level
+  input/capture checks do not establish these entire interaction sequences.
+- Entitled Endpoint Security delivery and set-ID validation from [MACAPI.md](MACAPI.md).
+  Unsigned fallback is best effort and is not exact capture.
+
+For pacing interpretation and broader performance work, retain the contracts in
+[FRAME_PACING.md](FRAME_PACING.md), [PERFORMANCE.md](PERFORMANCE.md) and
+[README.md](README.md). Capture polling remains independent of draw deadlines;
+unchanged completed/imported sessions stop presenting. FPS diagnostics deliberately
+request one idle frame per second. The 25 ms service bound and recent 64-sample
+telemetry quantiles are not input-to-display or full-run p99 guarantees.

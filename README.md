@@ -50,7 +50,7 @@ use the pinned framework package for Apple APIs. SDL, FreeType, and libpng still
 need **macOS** headers and libraries; the framework package does not contain them.
 `-Dgui-prefix=/absolute/target/prefix` selects an `include/` and `lib/` tree without
 host pkg-config discovery. macOS targets Apple silicon; see [MACOS_SDL.md](MACOS_SDL.md)
-for the pending native validation and packaging work.
+for native Metal validation, repeatable desktop checks and packaging instructions.
 
 The macOS 27 production capture validator installs separately:
 
@@ -94,6 +94,9 @@ no release publication.
 zig fmt --check build.zig build.zig.zon src
 zig build test
 zig build test -Doptimize=ReleaseSafe -Dperf-telemetry=true -Dfps-counter=true
+python3 -m unittest discover -s tests -p 'test_*.py'
+# On a macOS desktop with WindowServer access:
+zig build test-native-gui -Doptimize=ReleaseSafe
 # Requires macOS target GUI libraries and SDK; see MACOS_SDL.md.
 zig build test-compile -Dtarget=aarch64-macos -Dgui-prefix=/path/to/macos-prefix
 ```
@@ -185,7 +188,8 @@ python3 tools/benchmark_render.py \
   --output artifacts/render-comparison --repeat 5
 ```
 
-The runner needs an available GPU display and forces Vulkan. It alternates binary
+The runner needs an available GPU display and selects Metal on macOS or Vulkan
+on Linux; `--renderer` explicitly overrides that choice. It alternates binary
 order, generates identical 545-process sessions (one root, 32 parents, 16 children
 per parent), and retains fixture/executable hashes, logs, and raw run summaries.
 The `typical` and `dense` cases use 128 and 512 CPU slices per child; `packed` uses
@@ -233,5 +237,6 @@ executable SHA-256 is
 Before the next release, update the separate `../../aur/flamez/PKGBUILD`: add
 `sdl3>=3.4`, `freetype2`, and `libpng` runtime dependencies and `pkgconf` for the
 build, and remove `-Dmsaa=false` from both build and check commands. The release
-script updates versions/hashes only; it does not migrate package dependencies.
-macOS release-script and Homebrew work is listed in [MACOS_SDL.md](MACOS_SDL.md).
+script rejects an unmigrated AUR recipe. For macOS it consumes a natively built,
+validated archive and updates Homebrew runtime dependencies and the minimum OS
+version. See [MACOS_SDL.md](MACOS_SDL.md).

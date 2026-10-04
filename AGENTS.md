@@ -1,6 +1,7 @@
 # Flamez
 
-This is a zig project that renders a GUI with clayUI and raylib.
+This is a zig project that renders a GUI with Clay and SDL3 (Vulkan on Linux,
+native Metal on macOS).
 It leverages eBPF to track processes of the target process to display a
 flamegraph of all subprocesses.
 

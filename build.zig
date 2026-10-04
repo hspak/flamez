@@ -102,15 +102,7 @@ pub fn build(b: *std.Build) void {
     for (app_modules) |module| {
         module.addImport("zclay", zclay_dep.module("zclay"));
         module.link_libc = true;
-        linkSdl(b, module, gui_prefix);
-        if (gui_prefix) |prefix| {
-            module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include/freetype2" }) });
-            module.linkSystemLibrary("freetype", .{ .use_pkg_config = .no });
-            module.linkSystemLibrary("png", .{ .use_pkg_config = .no });
-        } else {
-            module.linkSystemLibrary("freetype2", .{});
-            module.linkSystemLibrary("libpng", .{});
-        }
+        linkGui(b, module, gui_prefix);
         module.addImport("footer_font", footer_font);
         module.addOptions("build_options", build_options);
         if (target.result.os.tag == .macos) addMacosSdkPaths(b, module, macos_sdk);
@@ -151,6 +143,22 @@ pub fn build(b: *std.Build) void {
         b.step("bench-zrct", "Measure SDL startup and idle-to-details latency (release builds)").dependOn(&benchmark.step);
     }
     if (target.result.os.tag == .macos) {
+        const native_gui = b.addExecutable(.{
+            .name = "macos-sdl-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/macos_sdl_test.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        native_gui.setLibCFile(macos_libc);
+        linkGui(b, native_gui.root_module, gui_prefix);
+        addMacosSdkPaths(b, native_gui.root_module, macos_sdk);
+        native_gui.root_module.addImport("footer_font", footer_font);
+        const run_native_gui = b.addRunArtifact(native_gui);
+        if (b.args) |args| run_native_gui.addArgs(args);
+        b.step("test-native-gui", "Validate Cocoa/Metal window, input, fonts and readback on a Mac desktop")
+            .dependOn(&run_native_gui.step);
         addMacosProcessShim(b, main_module, true);
         addMacosProcessShim(b, exe.root_module, false);
         addMacosLiveTest(b, target, optimize, build_options, macos_sdk, macos_libc);
@@ -199,6 +207,17 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
+    inline for (.{
+        .{ b.path("src/fonts/LICENSE.txt"), "Inter-LICENSE.txt" },
+        .{ b.path("src/fonts/RobotoMono-LICENSE.txt"), "RobotoMono-LICENSE.txt" },
+        .{ clay_dep.path("LICENSE.md"), "Clay-LICENSE.txt" },
+        .{ zclay_dep.path("LICENSE"), "zclay-LICENSE.txt" },
+    }) |notice| {
+        b.getInstallStep().dependOn(&b.addInstallFile(
+            notice[0],
+            "share/flamez/licenses/" ++ notice[1],
+        ).step);
+    }
     const install_analysis_schema = b.addInstallFile(
         b.path("schema/flamez-analysis-v1.schema.json"),
         "share/flamez/flamez-analysis-v1.schema.json",
@@ -250,6 +269,19 @@ fn linkSdl(b: *std.Build, module: *std.Build.Module, prefix: ?[]const u8) void {
         module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ root, "lib" }) });
         module.linkSystemLibrary("SDL3", .{ .use_pkg_config = .no });
     } else module.linkSystemLibrary("sdl3", .{});
+}
+
+fn linkGui(b: *std.Build, module: *std.Build.Module, prefix: ?[]const u8) void {
+    module.link_libc = true;
+    linkSdl(b, module, prefix);
+    if (prefix) |root| {
+        module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ root, "include/freetype2" }) });
+        module.linkSystemLibrary("freetype", .{ .use_pkg_config = .no });
+        module.linkSystemLibrary("png", .{ .use_pkg_config = .no });
+    } else {
+        module.linkSystemLibrary("freetype2", .{});
+        module.linkSystemLibrary("libpng", .{});
+    }
 }
 
 fn addLinuxCaptureTests(b: *std.Build, module: *std.Build.Module) void {

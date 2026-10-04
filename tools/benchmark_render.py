@@ -50,6 +50,8 @@ def main():
     parser.add_argument("--executable", action="append", required=True, help="label=/absolute/path")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--renderer", default="metal" if platform.system() == "Darwin" else "vulkan",
+                        help="SDL backend (default: Metal on macOS, Vulkan elsewhere)")
     parser.add_argument("--case", action="append", choices=("typical", "dense", "packed"))
     args = parser.parse_args()
     if args.repeat < 1:
@@ -66,12 +68,13 @@ def main():
         path.write_text(json.dumps(fixture(repository, slices, packed), separators=(",", ":")))
         fixtures[name] = path
     result = dict(executables=executables, hashes=hashes,
-                  host=platform.uname()._asdict(), affinity=sorted(os.sched_getaffinity(0)),
+                  host=platform.uname()._asdict(), renderer=args.renderer,
+                  affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
                   fixtures={name: fingerprint(path) for name, path in fixtures.items()},
                   policy="120 warmup, 600 measured frames; vsync/pacing off; OS cache shared; serial alternating order",
                   runs=[])
     pattern = re.compile(r"info\(render_benchmark\): (\w+) frames=(\d+) mean_ns=(\d+) p50_ns=(\d+) p95_ns=(\d+)")
-    env = dict(os.environ, SDL_RENDER_DRIVER="vulkan")
+    env = dict(os.environ, SDL_RENDER_DRIVER=args.renderer)
     env.pop("FLAMEZ_SCREENSHOT", None)
     for iteration in range(args.repeat):
         labels = list(executables)
@@ -86,7 +89,7 @@ def main():
                                      env=env, capture_output=True, text=True, timeout=60)
                 log = args.output / f"{iteration}-{case}-{label}.log"
                 log.write_text(run.stdout + run.stderr)
-                if run.returncode or "renderer: vulkan" not in run.stderr:
+                if run.returncode or f"renderer: {args.renderer}\n" not in run.stderr:
                     raise RuntimeError(f"Benchmark failed: {log}")
                 if fingerprint(executable) != hashes[label]:
                     raise RuntimeError(f"Executable changed during measurement: {executable}")

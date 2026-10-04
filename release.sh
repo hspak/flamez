@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <version>" >&2
+  echo "Usage: FLAMEZ_MACOS_ARCHIVE=/path/to/validated.tar.gz $0 <version>" >&2
   echo "Example: $0 0.2.0" >&2
 }
 
@@ -21,11 +21,16 @@ version=$1
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
   die "version must use the X.Y.Z format"
 
-for command in curl file gh git grep install makepkg mktemp ruby sed sha256sum tar zig; do
+for command in curl file gh git grep install makepkg mktemp python3 ruby sed sha256sum tar zig; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+macos_archive=${FLAMEZ_MACOS_ARCHIVE:?Build an archive with tools/package_macos.py first}
+[[ -f $macos_archive ]] || die "macOS archive not found: $macos_archive"
+python3 "$repo_dir/tools/package_macos.py" --verify "$macos_archive" --version "$version" \
+  --release-commit "$(git -C "$repo_dir" rev-parse HEAD)" >/dev/null ||
+  die "macOS archive failed validation"
 aur_dir=$(cd -- "$repo_dir/../../aur/flamez" 2>/dev/null && pwd) ||
   die "AUR repository not found at $repo_dir/../../aur/flamez"
 tap_dir=$(cd -- "$repo_dir/../homebrew-tap" 2>/dev/null && pwd) ||
@@ -36,6 +41,12 @@ formula=$tap_dir/$formula_path
 
 [[ -f $pkgbuild ]] || die "PKGBUILD not found at $pkgbuild"
 [[ -f $formula ]] || die "Homebrew formula not found at $formula"
+for dependency in sdl3 freetype2 libpng pkgconf; do
+  grep -Fq "$dependency" "$pkgbuild" || die "migrate PKGBUILD first: missing $dependency"
+done
+if grep -Fq -- '-Dmsaa' "$pkgbuild"; then
+  die "migrate PKGBUILD first: remove the obsolete -Dmsaa option"
+fi
 git -C "$repo_dir" remote get-url origin >/dev/null 2>&1 ||
   die "the source repository has no origin remote"
 git -C "$aur_dir" remote get-url origin >/dev/null 2>&1 ||
@@ -139,31 +150,25 @@ echo "Running tests..."
 )
 
 target=aarch64-macos
-zig_target=aarch64-macos.13.0
-prefix=$release_dir/prefix-$target
 package_name=flamez-$version-$target
 package_dir=$release_dir/$package_name
 archive_name=$package_name.tar.gz
 archive=$release_dir/$archive_name
 
-echo "Building $target..."
-(
-  cd -- "$repo_dir"
-  zig build \
-    --prefix "$prefix" \
-    -Dtarget="$zig_target" \
-    -Doptimize=ReleaseSafe \
-    -Dversion="$version"
-)
-
-install -d "$package_dir/bin" "$package_dir/share/flamez"
-install -m 0755 "$prefix/bin/flamez" "$package_dir/bin/flamez"
-install -m 0644 \
-  "$prefix/share/flamez/flamez-analysis-v1.md" \
-  "$prefix/share/flamez/flamez-analysis-v1.schema.json" \
-  "$package_dir/share/flamez/"
-install -m 0644 "$repo_dir/README.md" "$repo_dir/LICENSE" "$package_dir/"
-tar -C "$release_dir" -czf "$archive" "$package_name"
+echo "Using natively validated $target archive..."
+install -m 0644 "$macos_archive" "$archive"
+tar -C "$release_dir" -xzf "$archive"
+macos_minimum=$(ruby -rjson -e \
+  'puts JSON.parse(File.read(ARGV[0])).fetch("minimum_macos")' \
+  "$package_dir/share/flamez/macos-package.json")
+case "$macos_minimum" in
+  13.0) macos_formula=ventura ;;
+  14.0) macos_formula=sonoma ;;
+  15.0) macos_formula=sequoia ;;
+  26.0) macos_formula=tahoe ;;
+  27.0) macos_formula=golden_gate ;;
+  *) die "add an exact Homebrew minimum-version mapping for macOS $macos_minimum" ;;
+esac
 
 file "$package_dir/bin/flamez" | grep -Fq 'Mach-O 64-bit arm64 executable' ||
   die "release binary is not an arm64 macOS executable"
@@ -213,6 +218,17 @@ sed -Ei "s/^sha256sums=.*/sha256sums=(\"$source_sha256\")/" "$pkgbuild"
 )
 
 echo "Updating the Homebrew tap..."
+ruby - "$formula" "$macos_formula" <<'RUBY'
+path, minimum = ARGV
+text = File.read(path)
+text = text.gsub(/^  depends_on macos:.*$/, "  depends_on macos: :#{minimum}")
+abort "Homebrew formula has no macOS requirement" unless text.include?("  depends_on macos: :#{minimum}")
+%w[sdl3 freetype libpng].each do |name|
+  text.sub!("  def install", "  depends_on \"#{name}\"\n\n  def install") unless
+    text.match?(/^  depends_on "#{name}"/)
+end
+File.write(path, text)
+RUBY
 download_url=https://github.com/$github_repo/releases/download/$version
 sed -Ei "s|^  version \".*\"|  version \"$version\"|" "$formula"
 sed -Ei "s|^  url \".*\"|  url \"$download_url/$archive_name\"|" "$formula"
