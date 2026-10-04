@@ -6,12 +6,28 @@ binary="${prefix}/bin/flamez"
 bpf_dir="${prefix}/share/flamez"
 bpf_object="${bpf_dir}/flamez.bpf.o"
 
+for arg in "$@"; do
+    if [[ "${arg}" == "--uninstall" ]]; then
+        if (( $# != 1 )); then
+            echo "ERROR: --uninstall cannot be combined with build arguments." >&2
+            exit 1
+        fi
+
+        sudo rm -f -- "${binary}" "${bpf_object}"
+        if [[ -d "${bpf_dir}" ]]; then
+            sudo rmdir --ignore-fail-on-non-empty -- "${bpf_dir}"
+        fi
+        echo "Uninstalled Flamez from ${prefix}"
+        exit 0
+    fi
+done
+
 if ! command -v findmnt >/dev/null 2>&1; then
     echo "ERROR: findmnt is required to verify file-capability mount semantics." >&2
     exit 1
 fi
 
-zig build --release=safe -Dfps-counter=true -Dperf-telemetry=true "$@"
+zig build --release=safe "$@"
 
 # Install the loader and its compiled BPF object together. The executable
 # derives this share path from /proc/self/exe, so it works from any cwd.
