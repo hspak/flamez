@@ -3,11 +3,13 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <version> [--check] [--macos-host HOST] [--macos-archive PATH]" >&2
+  echo "Usage: $0 <version> [--check|--resume] [--macos-host HOST] [--macos-archive PATH]" >&2
   echo "  [--minimum-macos MAJOR.0] (default: the Mac's current major release)" >&2
   echo "  FLAMEZ_MACOS_HOST selects the SSH builder; FLAMEZ_MACOS_ARCHIVE reuses an archive." >&2
   echo "  FLAMEZ_MACOS_REPO defaults to code/flamez; an existing checkout is optional." >&2
   echo "  --check prepares and builds both packages without publishing." >&2
+  echo "  --resume uses the existing tag's source after release tooling has changed." >&2
+  echo "  Reruns resume matching tags and draft releases; published releases are rejected." >&2
 }
 
 die() {
@@ -29,6 +31,7 @@ shift
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
   die "version must use the X.Y.Z format"
 check_only=false
+resume=false
 macos_host=${FLAMEZ_MACOS_HOST:-}
 macos_repo=${FLAMEZ_MACOS_REPO:-code/flamez}
 macos_archive=${FLAMEZ_MACOS_ARCHIVE:-}
@@ -36,6 +39,7 @@ macos_minimum=${FLAMEZ_MINIMUM_MACOS:-}
 while [[ $# -gt 0 ]]; do
   case $1 in
     --check) check_only=true; shift ;;
+    --resume) resume=true; shift ;;
     --macos-host|--macos-archive|--minimum-macos)
       [[ $# -ge 2 && -n $2 ]] || { usage; exit 2; }
       case $1 in
@@ -47,17 +51,16 @@ while [[ $# -gt 0 ]]; do
     *) usage; exit 2 ;;
   esac
 done
+if $check_only && $resume; then
+  die "--check and --resume cannot be combined"
+fi
 [[ -z $macos_minimum || $macos_minimum =~ ^[0-9]+\.0$ ]] ||
   die "minimum macOS must use MAJOR.0"
 if [[ -n $macos_archive ]]; then
   [[ -f $macos_archive ]] || die "macOS archive not found: $macos_archive"
-else
-  [[ -n $macos_host && $macos_host != -* ]] ||
-    die "set FLAMEZ_MACOS_HOST or pass --macos-host HOST (or supply --macos-archive PATH)"
-  command -v ssh >/dev/null || die "required command not found: ssh"
 fi
 
-for command in curl file git grep install makepkg mktemp python3 ruby sed sha256sum tar zig; do
+for command in cmp curl file git grep install makepkg mktemp python3 ruby sed sha256sum tar zig; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
 [[ $(zig version) == 0.16.0 ]] || die "Zig 0.16.0 is required on the release host"
@@ -130,13 +133,31 @@ git -C "$aur_dir" ls-files --error-unmatch PKGBUILD .SRCINFO >/dev/null 2>&1 ||
   die "PKGBUILD and .SRCINFO must be tracked in the AUR repository"
 [[ $(git -C "$repo_dir" rev-parse HEAD) == $(git -C "$repo_dir" rev-parse '@{upstream}') ]] ||
   die "the source branch is not synchronized with its upstream; push or pull it first"
-[[ $(git -C "$aur_dir" rev-parse HEAD) == $(git -C "$aur_dir" rev-parse '@{upstream}') ]] ||
-  die "the AUR branch is not synchronized with its upstream; push or pull it first"
-[[ $(git -C "$tap_dir" rev-parse HEAD) == $(git -C "$tap_dir" rev-parse '@{upstream}') ]] ||
-  die "the Homebrew tap branch is not synchronized with its upstream; push or pull it first"
 
-grep -Fq ".version = \"$version\"" "$repo_dir/build.zig.zon" ||
-  die "build.zig.zon does not declare version $version"
+check_package_history() {
+  local directory=$1 message=$2
+  shift 2
+  [[ $(git -C "$directory" rev-parse HEAD) != \
+    $(git -C "$directory" rev-parse '@{upstream}') ]] || return 0
+  # A failed push leaves exactly our release commit ahead of the upstream.
+  if $check_only ||
+    [[ $(git -C "$directory" rev-parse HEAD^) != \
+      $(git -C "$directory" rev-parse '@{upstream}') ]] ||
+    [[ $(git -C "$directory" log -1 --format=%s) != "$message" ]]; then
+    die "$directory is not synchronized with its upstream; push or pull it first"
+  fi
+  local path allowed candidate
+  while IFS= read -r path; do
+    allowed=false
+    for candidate in "$@"; do
+      [[ $path != "$candidate" ]] || allowed=true
+    done
+    $allowed || die "unpublished commit in $directory changes unrelated file $path"
+  done < <(git -C "$directory" diff --name-only '@{upstream}' HEAD)
+}
+check_package_history "$aur_dir" "Publish version $version" PKGBUILD .SRCINFO
+check_package_history "$tap_dir" "Publish Flamez version $version" "$formula_path"
+
 [[ $(grep -Ec '^pkgver=' "$pkgbuild") -eq 1 ]] ||
   die "expected exactly one pkgver entry in PKGBUILD"
 [[ $(grep -Ec '^pkgrel=' "$pkgbuild") -eq 1 ]] ||
@@ -150,20 +171,69 @@ grep -Fq ".version = \"$version\"" "$repo_dir/build.zig.zon" ||
 [[ $(grep -Ec '^  sha256 "[^"]*"$' "$formula") -eq 1 ]] ||
   die "expected exactly one SHA-256 entry in the Homebrew formula"
 
+release_status=
+release_assets=
+local_tag=false
+remote_tag=false
 if ! $check_only; then
-  git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/$version" >/dev/null &&
-    die "tag $version already exists locally"
-  if git -C "$repo_dir" ls-remote --exit-code --tags origin "refs/tags/$version" >/dev/null; then
-    die "tag $version already exists on origin"
-  else
-    status=$?
-    [[ $status -eq 2 ]] || die "could not query tags on origin"
+  if git -C "$repo_dir" show-ref --verify --quiet "refs/tags/$version"; then
+    if $resume; then
+      revision=$(git -C "$repo_dir" rev-parse "refs/tags/$version^{commit}")
+    fi
+    [[ $(git -C "$repo_dir" rev-parse "refs/tags/$version^{commit}") == "$revision" ]] ||
+      die "local tag $version does not point to HEAD; refusing to replace it"
+    local_tag=true
   fi
+  remote_refs=$(git -C "$repo_dir" ls-remote --tags origin \
+    "refs/tags/$version" "refs/tags/$version^{}") || die "could not query tags on origin"
+  remote_revision=
+  remote_peeled=
+  while read -r object ref; do
+    [[ -n $object ]] || continue
+    remote_tag=true
+    case $ref in
+      "refs/tags/$version") remote_revision=$object ;;
+      "refs/tags/$version^{}") remote_peeled=$object ;;
+    esac
+  done <<<"$remote_refs"
+  if $remote_tag; then
+    remote_revision=${remote_peeled:-$remote_revision}
+    if $resume && ! $local_tag; then
+      git -C "$repo_dir" fetch --no-tags origin "refs/tags/$version"
+      revision=$(git -C "$repo_dir" rev-parse 'FETCH_HEAD^{commit}')
+    fi
+    [[ $remote_revision == "$revision" ]] ||
+      die "origin tag $version does not point to the source commit; refusing to replace it"
+  fi
+  if $resume; then
+    $local_tag || $remote_tag || die "--resume requires an existing tag $version"
+    git -C "$repo_dir" merge-base --is-ancestor "$revision" HEAD ||
+      die "tag $version is not an ancestor of HEAD; inspect the source history first"
+    echo "Resuming $version from source commit $revision..."
+  fi
+  # A successful empty query means absent; API failures must stop the release.
+  release_status=$(gh api "repos/$github_repo/releases" --paginate \
+    --jq ".[] | select(.tag_name == \"$version\") | if .draft then \"draft\" else \"published\" end") ||
+    die "could not query GitHub releases"
+  case $release_status in
+    '') ;;
+    draft)
+      $remote_tag || die "draft release $version has no matching tag on origin"
+      release_assets=$(gh release view "$version" --repo "$github_repo" \
+        --json assets --jq '.assets[].name') || die "could not query draft release assets"
+      echo "Resuming draft release $version..."
+      ;;
+    published) die "release $version is already published; refusing to modify it" ;;
+    *) die "unexpected GitHub release status for $version" ;;
+  esac
   git -C "$aur_dir" ls-remote origin HEAD >/dev/null ||
     die "could not connect to the AUR origin"
   git -C "$tap_dir" ls-remote origin HEAD >/dev/null ||
     die "could not connect to the Homebrew tap origin"
 fi
+source_manifest=$(git -C "$repo_dir" show "$revision:build.zig.zon")
+grep -Fq ".version = \"$version\"" <<<"$source_manifest" ||
+  die "build.zig.zon at $revision does not declare version $version"
 
 release_dir=$(mktemp --directory --suffix="-flamez-$version")
 cleanup() {
@@ -176,15 +246,15 @@ cleanup() {
 trap cleanup EXIT
 
 previous_tag=$(git -C "$repo_dir" describe --tags --abbrev=0 \
-  --match '[0-9]*.[0-9]*.[0-9]*' --exclude "$version" HEAD 2>/dev/null || true)
+  --match '[0-9]*.[0-9]*.[0-9]*' --exclude "$version" "$revision" 2>/dev/null || true)
 notes=$release_dir/release-notes.md
 if [[ -n $previous_tag ]]; then
   echo "Generating release notes from commits after $previous_tag..."
-  git -C "$repo_dir" log --no-decorate --pretty=oneline "$previous_tag..HEAD" |
+  git -C "$repo_dir" log --no-decorate --pretty=oneline "$previous_tag..$revision" |
     sed 's/$/  /' >"$notes"
 else
   echo "Generating release notes from all commits..."
-  git -C "$repo_dir" log --no-decorate --pretty=oneline HEAD |
+  git -C "$repo_dir" log --no-decorate --pretty=oneline "$revision" |
     sed 's/$/  /' >"$notes"
 fi
 [[ -s $notes ]] || die "there are no commits to include in the release notes"
@@ -195,10 +265,23 @@ package_dir=$release_dir/$package_name
 archive_name=$package_name.tar.gz
 archive=$release_dir/$archive_name
 
-if [[ -n $macos_archive ]]; then
+reuse_archive=false
+if grep -Fxq "$archive_name" <<<"$release_assets"; then
+  echo "Reusing the draft's $target archive..."
+  gh release download "$version" --repo "$github_repo" \
+    --pattern "$archive_name" --output "$archive"
+  if [[ -n $macos_archive ]]; then
+    cmp -s "$macos_archive" "$archive" ||
+      die "supplied macOS archive differs from the draft asset; refusing to replace it"
+  fi
+  reuse_archive=true
+elif [[ -n $macos_archive ]]; then
   echo "Using supplied $target archive..."
   install -m 0644 "$macos_archive" "$archive"
 else
+  [[ -n $macos_host && $macos_host != -* ]] ||
+    die "set FLAMEZ_MACOS_HOST or pass --macos-host HOST (or supply --macos-archive PATH)"
+  command -v ssh >/dev/null || die "required command not found: ssh"
   echo "Preparing and building $target at $revision on $macos_host..."
   remote_command=$(python3 - "$macos_repo" "$source_origin" \
     "$version" "$revision" "$macos_minimum" <<'PY'
@@ -334,17 +417,21 @@ if $check_only; then
   exit 0
 fi
 
-echo "Tagging $version and pushing it to GitHub..."
-git -C "$repo_dir" tag "$version"
-git -C "$repo_dir" push origin "refs/tags/$version"
+if ! $remote_tag; then
+  echo "Tagging $version and pushing it to GitHub..."
+  $local_tag || git -C "$repo_dir" tag "$version" "$revision"
+  git -C "$repo_dir" push origin "refs/tags/$version"
+fi
 
-echo "Creating a draft GitHub release..."
-gh release create "$version" "$archive" "$release_dir/SHA256SUMS" \
-  --repo "$github_repo" \
-  --draft \
-  --verify-tag \
-  --title "Flamez $version" \
-  --notes-file "$notes"
+if [[ -z $release_status ]]; then
+  echo "Creating a draft GitHub release..."
+  gh release create "$version" --repo "$github_repo" --draft --verify-tag \
+    --title "Flamez $version" --notes-file "$notes"
+fi
+if ! $reuse_archive; then
+  gh release upload "$version" "$archive" --repo "$github_repo" --clobber
+fi
+gh release upload "$version" "$release_dir/SHA256SUMS" --repo "$github_repo" --clobber
 
 source_url=https://github.com/$github_repo/archive/refs/tags/$version.tar.gz
 echo "Downloading the tagged source archive..."
@@ -354,9 +441,23 @@ curl --fail --location --silent --show-error \
 stage_recipe "$source_archive"
 (
   cd -- "$stage"
-  SRCDEST="$stage" makepkg --verifysource
+  export PKGDEST="$stage" SRCDEST="$stage" BUILDDIR="$stage" LOGDEST="$stage"
+  # makepkg checks for built packages even when only verifying sources.
+  makepkg --verifysource --force
   makepkg --printsrcinfo >.SRCINFO
 )
+
+check_pending_recipe() {
+  local directory=$1 staged=$2 path=$3
+  if [[ $(git -C "$directory" rev-parse HEAD) != \
+    $(git -C "$directory" rev-parse '@{upstream}') ]]; then
+    cmp -s "$staged" "$directory/$path" ||
+      die "unpublished release commit in $directory has different $path; inspect it first"
+  fi
+}
+check_pending_recipe "$aur_dir" "$stage/PKGBUILD" PKGBUILD
+check_pending_recipe "$aur_dir" "$stage/.SRCINFO" .SRCINFO
+check_pending_recipe "$tap_dir" "$staged_formula" "$formula_path"
 
 echo "Updating the AUR package..."
 install -m 0644 "$stage/PKGBUILD" "$pkgbuild"
@@ -366,7 +467,9 @@ install -m 0644 "$stage/.SRCINFO" "$aur_dir/.SRCINFO"
   cd -- "$aur_dir"
   git diff --check
   git add -- PKGBUILD .SRCINFO
-  git commit -m "Publish version $version"
+  if ! git diff --cached --quiet; then
+    git commit -m "Publish version $version"
+  fi
   git push
 )
 
@@ -377,7 +480,9 @@ install -m 0644 "$staged_formula" "$formula"
   cd -- "$tap_dir"
   git diff --check
   git add -- "$formula_path"
-  git commit -m "Publish Flamez version $version"
+  if ! git diff --cached --quiet; then
+    git commit -m "Publish Flamez version $version"
+  fi
   git push
 )
 
