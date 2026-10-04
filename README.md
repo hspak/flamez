@@ -23,6 +23,10 @@ flamez -o trace-data-output.json <your target program> [target program args]
 flamez -i trace-data-output.json
 ```
 
+The [application icon](packaging/icons/README.md) has a shared SVG master and
+committed Linux PNG/macOS ICNS exports. Linux builds install desktop metadata
+and theme icons; the executable also sets its window/macOS Dock icon at startup.
+
 ## Releasing
 
 Run `./release.sh <version> --macos-host <host>` from a clean, pushed source

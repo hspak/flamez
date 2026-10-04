@@ -22,6 +22,7 @@
         "build.zig.zon",
         "ARCHITECTURE.md",
         "schema",
+        "packaging",
         "src",
         "tools",
         "tests",

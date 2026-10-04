@@ -88,6 +88,10 @@ pub fn build(b: *std.Build) void {
         "RobotoMono-Medium.ttf",
     );
     const footer_font = b.createModule(.{ .root_source_file = footer_font_source });
+    const icon_files = b.addWriteFiles();
+    const icon_source = icon_files.add("app_icon.zig", "pub const png = @embedFile(\"flamez.png\");\n");
+    _ = icon_files.addCopyFile(b.path("packaging/icons/flamez-512.png"), "flamez.png");
+    const app_icon = b.createModule(.{ .root_source_file = icon_source });
 
     const exe = b.addExecutable(.{
         .name = "flamez",
@@ -104,6 +108,7 @@ pub fn build(b: *std.Build) void {
         module.link_libc = true;
         linkGui(b, module, gui_prefix);
         module.addImport("footer_font", footer_font);
+        module.addImport("app_icon", app_icon);
         module.addOptions("build_options", build_options);
         if (target.result.os.tag == .macos) addMacosSdkPaths(b, module, macos_sdk);
     }
@@ -155,6 +160,7 @@ pub fn build(b: *std.Build) void {
         linkGui(b, native_gui.root_module, gui_prefix);
         addMacosSdkPaths(b, native_gui.root_module, macos_sdk);
         native_gui.root_module.addImport("footer_font", footer_font);
+        native_gui.root_module.addImport("app_icon", app_icon);
         const run_native_gui = b.addRunArtifact(native_gui);
         if (b.args) |args| run_native_gui.addArgs(args);
         b.step("test-native-gui", "Validate Cocoa/Metal window, input, fonts and readback on a Mac desktop")
@@ -228,6 +234,29 @@ pub fn build(b: *std.Build) void {
     );
     b.getInstallStep().dependOn(&install_analysis_schema.step);
     b.getInstallStep().dependOn(&install_analysis_metrics.step);
+    if (target.result.os.tag == .linux) {
+        b.installFile("packaging/linux/flamez.desktop", "share/applications/flamez.desktop");
+        b.installFile("packaging/linux/flamez.svg", "share/icons/hicolor/scalable/apps/flamez.svg");
+        for ([_]u16{
+            16,
+            24,
+            32,
+            48,
+            64,
+            96,
+            128,
+            256,
+            512,
+            1024,
+        }) |size| {
+            b.installFile(
+                b.fmt("packaging/icons/flamez-{d}.png", .{size}),
+                b.fmt("share/icons/hicolor/{d}x{d}/apps/flamez.png", .{ size, size }),
+            );
+        }
+    }
+    if (target.result.os.tag == .macos)
+        b.installFile("packaging/macos/flamez.icns", "share/flamez/flamez.icns");
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);

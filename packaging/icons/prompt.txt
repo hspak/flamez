@@ -1,0 +1,77 @@
+Use case: logo-brand
+Asset type: finished desktop application icon for Flamez, a Zig process flamegraph profiler, shared by KDE/Linux and macOS.
+Primary request: an unmistakable FIRE silhouette, made from MANY distinct nested angular layers, discrete rather than smooth. Aim for 10 clearly separated flat solid-color flame strata, like precision cut colored paper nested concentrically. Tall central flame tongue with two shorter asymmetric side tongues, broad stable base. Crisp straight edges, angular pointed tips and segmented faceted contour. A cohesive striking flame, not a stack of rectangles, not a mountain.
+Color palette: outer deep burnt red, then brick red, vermilion, vivid red-orange, orange, one substantial exactly Zig orange #F7A41D layer, golden yellow, light amber, warm pale yellow and a small cream hot core. Each layer has ONE perfectly uniform color with hard boundaries. No gradients or shading anywhere.
+Composition: single large centered flame, square 1024x1024 canvas with transparent background, about 10% breathing room on all sides. The mark must remain recognizable at 32 px. Transparent space outside the fire. No container tile.
+Avoid: smooth curves, blended colors, gradients, gloss, lighting effects, glow, shadows, texture, strokes, fine lines, text, letters, Zig logo, watermark, extra objects, detached sparks, photographic realism. Deliver just the icon artwork.
+
+Production revision: make the base of the fire flat across all ten layers.
+Production revision: make the flame less symmetric and less like a trident. Sweep
+the dominant tongue to the right and shorten the right flicker relative to the
+left lick, preserving the ten discrete layers, flat base, and exact palette.
+Production revision: use eight broader, more visibly discrete layers. Return the
+tallest tip to the horizontal center, preserve the unequal side flames and flat
+base, and increase the color separation while retaining exact Zig orange.
+Production revision: make the flame more blocky, using square, stepped contours
+throughout the silhouette and all eight layers. Preserve the centered peak,
+asymmetric side flames, flat base, and exact Zig orange.
+Production revision: add a rounded-square background like Zimbr, using the app's
+canvas navy (#090E1C). Keep transparent corners outside the tile and inset the
+existing blocky flame so it has padding inside the background.
+Production revision: replace the pixel-grid staircases with a few large geometric
+blocks, broad ledges, and clean diagonal cuts. Keep the eight clearly separated
+layers, centered peak, asymmetric sides, flat base, and navy rounded-square tile.
+Production revision: match Zimbr's shallow raised sides, soft downward shadow,
+fine warm edge highlights, and gently lit tile. Keep the eight face fills solid
+and sharply separated, including exact Zig orange. Base the tile shading on the
+app's navy canvas color and preserve transparent outer corners.
+Production revision: build the fire itself from a small assembly of much larger
+raised tiles, loosely voxel-inspired. Use broad, individually beveled tile faces
+with visible dark sides, a centered crown, uneven side tongues, and a flat base.
+Keep the eight-color warm palette, exact Zig orange, navy background, and soft
+lighting. The final assembly uses twelve large tiles rather than nested outlines.
+Production revision: soften the contours for the dark navy background. Reduce
+both the background rim and the tile bevels in width and opacity, preserving the
+raised sides, cast shadow, lighting direction, tile geometry, and face colors.
+Production revision: make the icon flat and two-dimensional. Build the flame only
+from axis-aligned squares, with larger body squares and smaller squares shaping
+the centered tip, uneven sides, and core. Remove all extrusion, shadows, bevels,
+gradients, and contour strokes. Keep the eight warm colors, exact Zig orange,
+flat base, and rounded-square background in the app's solid navy canvas color.
+
+Production revision: remove all gaps between the squares. Resize and position
+the square tiles to meet edge to edge, preserving the flat base, centered peak,
+uneven sides, solid colors, and two-dimensional style. No seams are needed.
+
+Production revision: give the background a tiny bit more contour with a thin,
+low-contrast navy outline. Keep the background fill solid and the square flame
+tiles flat and gapless.
+
+Production revision: add a blue bar directly beneath the flame, spanning its
+full flat base without a gap. Use the app's parent-node blue, theme.blue
+(#5C97FF). Assemble the bar from touching squares to preserve the square-only
+foreground, with solid color and no shading.
+
+Production revision: match the blue bar's left and right edges to the flame
+above, keeping its height unchanged. Use the same edge antialiasing for both
+so pixel snapping does not make the bar appear shorter, and fill the touching
+blue squares together to avoid internal seams.
+
+Production revision: extend the blue bar ever so slightly beyond both sides
+of the flame as an optical correction. Add four artwork units at each end,
+keeping the height, color, gapless contact, and flat square geometry unchanged.
+
+Production revision: make the background contour a tiny bit more visible by
+lightening its two-unit navy outline to #222D40, preserving the flat style.
+
+Production revision: replace the background border with very subtle, visible
+shading and a soft shadow inspired by Zimbr. Use gentle navy surface lighting,
+a four-unit shadow blur and downward offset, and 18% shadow opacity. Keep the
+fire and blue bar flat, preserving their colors, squares, spacing, and sizes.
+
+Production revision: align the flame and blue bar with the background's gentle
+lighting and shadows. Light the square faces subtly from above and the left,
+preserving the original palette in their centers, including exact Zig orange
+and parent-node blue. Add one soft shadow beneath the assembled foreground,
+using the same four-unit blur and downward offset at 18% opacity as the
+background. Preserve square geometry, gapless joins, and the slight blue overhang.

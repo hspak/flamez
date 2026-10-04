@@ -2,6 +2,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = std.log.scoped(.desktop);
+const app_icon = @import("app_icon");
 const Point = @import("geometry.zig").Point;
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
@@ -186,12 +187,29 @@ pub fn open(w: i32, h: i32, title: [:0]const u8, high_density: bool) OpenError!v
     errdefer c.SDL_Quit();
     handle = c.SDL_CreateWindow(title, w, h, c.SDL_WINDOW_RESIZABLE |
         @as(c.SDL_WindowFlags, if (high_density) c.SDL_WINDOW_HIGH_PIXEL_DENSITY else 0)) orelse return unavailable();
+    setIcon();
     input = .{};
     last_frame = 0;
     frame_rate = 0;
     idle = false;
     _ = c.SDL_SetWindowMinimumSize(handle, 760, 520);
     refreshMetrics();
+}
+fn setIcon() void {
+    // Embedding also gives command-line launches a macOS Dock / X11 window icon.
+    // Wayland compositors can instead resolve flamez.desktop through the app ID.
+    const png = app_icon.png;
+    const stream = c.SDL_IOFromConstMem(png.ptr, png.len) orelse {
+        log.warn("Icon stream: {s}", .{c.SDL_GetError()});
+        return;
+    };
+    const surface = c.SDL_LoadPNG_IO(stream, true) orelse {
+        log.warn("Icon PNG: {s}", .{c.SDL_GetError()});
+        return;
+    };
+    defer c.SDL_DestroySurface(surface);
+    if (!c.SDL_SetWindowIcon(handle, surface))
+        log.debug("Window icon: {s}", .{c.SDL_GetError()});
 }
 fn unavailable() OpenError {
     log.err("SDL window: {s}", .{c.SDL_GetError()});

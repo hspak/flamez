@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Flamez
+Comment=Process lifetime and CPU activity flamegraph
+Exec=flamez
+Icon=flamez
+Terminal=false
+Categories=Development;Profiling;
+StartupWMClass=flamez
+# Flamez needs a target command or an imported trace; this entry identifies its windows.
+NoDisplay=true

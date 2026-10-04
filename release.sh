@@ -363,6 +363,15 @@ if '"zig-out/share/flamez/licenses"' not in text:
         '  cp -R "zig-out/share/flamez/licenses" "${pkgdir}/usr/share/flamez/"\n', text, flags=re.M)
     if count != 1:
         sys.exit("release.sh: cannot add license installation to PKGBUILD's package()")
+# Older AUR recipes predate the desktop identity and theme icons.
+if '"zig-out/share/icons/hicolor"' not in text:
+    text, count = re.subn(r"^(package\(\) \{\n  cd [^\n]+\n)", r'\1'
+        '  install -Dm644 "zig-out/share/applications/flamez.desktop" '
+        '"${pkgdir}/usr/share/applications/flamez.desktop"\n'
+        '  install -d "${pkgdir}/usr/share/icons"\n'
+        '  cp -R "zig-out/share/icons/hicolor" "${pkgdir}/usr/share/icons/"\n', text, flags=re.M)
+    if count != 1:
+        sys.exit("release.sh: cannot add desktop installation to PKGBUILD's package()")
 Path(destination).write_text(text)
 PYTHON
 }

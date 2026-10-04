@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Flamez</title>
+  <desc>A softly lit fire made from edge-to-edge squares in eight warm colors, including Zig orange, resting on a blue bar matching Flamez's parent nodes. The squares and navy rounded-square background share gentle upper-left lighting and soft downward shadows.</desc>
+  <defs>
+    <linearGradient id="background-shading" gradientUnits="userSpaceOnUse" x1="164" y1="32" x2="340" y2="480">
+      <stop stop-color="#111A2B"/>
+      <stop offset="0.55" stop-color="#090E1C"/>
+      <stop offset="1" stop-color="#070B16"/>
+    </linearGradient>
+    <linearGradient id="face-lighting" x1="0" y1="0" x2="0.4" y2="1"/>
+    <linearGradient id="flame-maroon" href="#face-lighting">
+      <stop stop-color="#962635"/>
+      <stop offset="0.3" stop-color="#8F1828"/>
+      <stop offset="0.7" stop-color="#8F1828"/>
+      <stop offset="1" stop-color="#841625"/>
+    </linearGradient>
+    <linearGradient id="flame-red" href="#face-lighting">
+      <stop stop-color="#D84238"/>
+      <stop offset="0.3" stop-color="#D5362B"/>
+      <stop offset="0.7" stop-color="#D5362B"/>
+      <stop offset="1" stop-color="#C43228"/>
+    </linearGradient>
+    <linearGradient id="flame-orange" href="#face-lighting">
+      <stop stop-color="#FA6F33"/>
+      <stop offset="0.3" stop-color="#FA6626"/>
+      <stop offset="0.7" stop-color="#FA6626"/>
+      <stop offset="1" stop-color="#E65E23"/>
+    </linearGradient>
+    <linearGradient id="flame-zig-orange" href="#face-lighting">
+      <stop stop-color="#F7A92B"/>
+      <stop offset="0.3" stop-color="#F7A41D"/>
+      <stop offset="0.7" stop-color="#F7A41D"/>
+      <stop offset="1" stop-color="#E3971B"/>
+    </linearGradient>
+    <linearGradient id="flame-gold" href="#face-lighting">
+      <stop stop-color="#FFD447"/>
+      <stop offset="0.3" stop-color="#FFD13B"/>
+      <stop offset="0.7" stop-color="#FFD13B"/>
+      <stop offset="1" stop-color="#EBC036"/>
+    </linearGradient>
+    <linearGradient id="flame-yellow" href="#face-lighting">
+      <stop stop-color="#FFE67D"/>
+      <stop offset="0.3" stop-color="#FFE475"/>
+      <stop offset="0.7" stop-color="#FFE475"/>
+      <stop offset="1" stop-color="#EBD26C"/>
+    </linearGradient>
+    <linearGradient id="flame-cream" href="#face-lighting">
+      <stop stop-color="#FFF1B2"/>
+      <stop offset="0.3" stop-color="#FFF0AD"/>
+      <stop offset="0.7" stop-color="#FFF0AD"/>
+      <stop offset="1" stop-color="#EBDD9F"/>
+    </linearGradient>
+    <linearGradient id="flame-ivory" href="#face-lighting">
+      <stop stop-color="#FFFAE2"/>
+      <stop offset="0.3" stop-color="#FFFAE0"/>
+      <stop offset="0.7" stop-color="#FFFAE0"/>
+      <stop offset="1" stop-color="#EBE6CE"/>
+    </linearGradient>
+    <linearGradient id="parent-blue" gradientUnits="userSpaceOnUse" x1="92" y1="456" x2="92" y2="480">
+      <stop stop-color="#669DFF"/>
+      <stop offset="0.3" stop-color="#5C97FF"/>
+      <stop offset="0.7" stop-color="#5C97FF"/>
+      <stop offset="1" stop-color="#558BEB"/>
+    </linearGradient>
+    <filter id="soft-shadow" filterUnits="userSpaceOnUse" x="12" y="12" width="488" height="496" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="4" result="blur"/>
+      <feOffset in="blur" dy="4" result="offset"/>
+      <feFlood flood-color="#02050C" flood-opacity="0.18"/>
+      <feComposite in2="offset" operator="in"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <path id="background" fill="url(#background-shading)" filter="url(#soft-shadow)" d="M176 32H336C431 32 480 81 480 176V336C480 431 431 480 336 480H176C81 480 32 431 32 336V176C32 81 81 32 176 32Z"/>
+  <g id="foreground" filter="url(#soft-shadow)">
+    <g id="flame" transform="translate(32 24) scale(.875)">
+      <rect id="flame-tip" x="240" y="72" width="32" height="32" fill="url(#flame-maroon)"/>
+      <rect id="flame-crown" x="224" y="104" width="64" height="64" fill="url(#flame-maroon)"/>
+      <rect id="flame-upper" x="192" y="168" width="96" height="96" fill="url(#flame-red)"/>
+      <rect id="flame-left-tip" x="136" y="240" width="40" height="40" fill="url(#flame-red)"/>
+      <rect id="flame-left" x="112" y="280" width="80" height="80" fill="url(#flame-red)"/>
+      <rect id="flame-center" x="192" y="264" width="96" height="96" fill="url(#flame-zig-orange)"/>
+      <rect id="flame-upper-right" x="288" y="264" width="48" height="48" fill="url(#flame-orange)"/>
+      <rect id="flame-upper-core" x="288" y="312" width="48" height="48" fill="url(#flame-yellow)"/>
+      <rect id="flame-right-tip" x="368" y="256" width="32" height="32" fill="url(#flame-red)"/>
+      <rect id="flame-right" x="336" y="288" width="72" height="72" fill="url(#flame-orange)"/>
+      <rect id="flame-lower-left" x="96" y="360" width="96" height="96" fill="url(#flame-orange)"/>
+      <rect id="flame-lower-center" x="192" y="360" width="96" height="96" fill="url(#flame-gold)"/>
+      <rect id="flame-core-upper-left" x="288" y="360" width="48" height="48" fill="url(#flame-yellow)"/>
+      <rect id="flame-core-upper-right" x="336" y="360" width="48" height="48" fill="url(#flame-cream)"/>
+      <rect id="flame-core-lower-left" x="288" y="408" width="48" height="48" fill="url(#flame-cream)"/>
+      <rect id="flame-core-lower-right" x="336" y="408" width="48" height="48" fill="url(#flame-ivory)"/>
+      <rect id="flame-lower-right" x="384" y="360" width="48" height="48" fill="url(#flame-zig-orange)"/>
+      <rect id="flame-base-right" x="384" y="408" width="48" height="48" fill="url(#flame-orange)"/>
+    </g>
+    <!-- Fill adjacent squares together to avoid seams while matching the flame's antialiasing. -->
+    <path id="parent-bar" fill="url(#parent-blue)" transform="translate(32 24) scale(.875)" d="
+      M92 456h4v4h-4Z
+      M92 460h4v4h-4Z
+      M92 464h4v4h-4Z
+      M92 468h4v4h-4Z
+      M92 472h4v4h-4Z
+      M92 476h4v4h-4Z
+      M96 456h24v24h-24Z
+      M120 456h24v24h-24Z
+      M144 456h24v24h-24Z
+      M168 456h24v24h-24Z
+      M192 456h24v24h-24Z
+      M216 456h24v24h-24Z
+      M240 456h24v24h-24Z
+      M264 456h24v24h-24Z
+      M288 456h24v24h-24Z
+      M312 456h24v24h-24Z
+      M336 456h24v24h-24Z
+      M360 456h24v24h-24Z
+      M384 456h24v24h-24Z
+      M408 456h24v24h-24Z
+      M432 456h4v4h-4Z
+      M432 460h4v4h-4Z
+      M432 464h4v4h-4Z
+      M432 468h4v4h-4Z
+      M432 472h4v4h-4Z
+      M432 476h4v4h-4Z
+    "/>
+  </g>
+</svg>

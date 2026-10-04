@@ -5,6 +5,16 @@ prefix="${FLAMEZ_PREFIX:-/usr/local}"
 binary="${prefix}/bin/flamez"
 bpf_dir="${prefix}/share/flamez"
 bpf_object="${bpf_dir}/flamez.bpf.o"
+icon_sizes=(16 24 32 48 64 96 128 256 512 1024)
+
+refresh_desktop_cache() {
+    if [[ -d "${prefix}/share/icons/hicolor" ]] && command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        sudo gtk-update-icon-cache --force --ignore-theme-index "${prefix}/share/icons/hicolor"
+    fi
+    if [[ -d "${prefix}/share/applications" ]] && command -v update-desktop-database >/dev/null 2>&1; then
+        sudo update-desktop-database "${prefix}/share/applications"
+    fi
+}
 
 for arg in "$@"; do
     if [[ "${arg}" == "--uninstall" ]]; then
@@ -14,6 +24,12 @@ for arg in "$@"; do
         fi
 
         sudo rm -f -- "${binary}" "${bpf_object}"
+        sudo rm -f -- "${prefix}/share/applications/flamez.desktop" \
+            "${prefix}/share/icons/hicolor/scalable/apps/flamez.svg"
+        for size in "${icon_sizes[@]}"; do
+            sudo rm -f -- "${prefix}/share/icons/hicolor/${size}x${size}/apps/flamez.png"
+        done
+        refresh_desktop_cache
         if [[ -d "${bpf_dir}" ]]; then
             sudo rmdir --ignore-fail-on-non-empty -- "${bpf_dir}"
         fi
@@ -45,6 +61,17 @@ fi
 sudo install -o root -g root -m 0755 zig-out/bin/flamez "${binary}"
 sudo install -o root -g root -m 0644 \
     zig-out/share/flamez/flamez.bpf.o "${bpf_object}"
+sudo install -D -o root -g root -m 0644 \
+    zig-out/share/applications/flamez.desktop "${prefix}/share/applications/flamez.desktop"
+sudo install -D -o root -g root -m 0644 \
+    zig-out/share/icons/hicolor/scalable/apps/flamez.svg \
+    "${prefix}/share/icons/hicolor/scalable/apps/flamez.svg"
+for size in "${icon_sizes[@]}"; do
+    sudo install -D -o root -g root -m 0644 \
+        "zig-out/share/icons/hicolor/${size}x${size}/apps/flamez.png" \
+        "${prefix}/share/icons/hicolor/${size}x${size}/apps/flamez.png"
+done
+refresh_desktop_cache
 
 # install(1) replaces the destination inode, which clears file capabilities;
 # always apply them after copying the freshly built executable.
