@@ -1,5 +1,6 @@
 //! SDL renderer for logical window coordinates, with ordered geometry and texture submission.
 const std = @import("std");
+const builtin = @import("builtin");
 const log = std.log.scoped(.graphics);
 const desktop = @import("desktop.zig");
 const geometry = @import("geometry.zig");
@@ -13,6 +14,7 @@ const png = @cImport({
 });
 pub const Texture = *c.SDL_Texture;
 pub const Vertex = c.SDL_Vertex;
+pub const RectangleBatch = @import("graphics/RectangleBatch.zig");
 pub const ResourceError = error{GraphicsUnavailable};
 pub const SaveError = ResourceError || error{ImageOutputUnavailable};
 
@@ -24,6 +26,9 @@ var failed = false;
 
 /// Owns the renderer until deinit. Release fonts and textures before deinit.
 pub fn init(vsync: bool) ResourceError!void {
+    // Keep explicit SDL_RENDER_DRIVER overrides available for diagnostics.
+    if (comptime builtin.os.tag == .linux)
+        _ = c.SDL_SetHintWithPriority(c.SDL_HINT_RENDER_DRIVER, "vulkan", c.SDL_HINT_DEFAULT);
     renderer = c.SDL_CreateRenderer(desktop.window(), null) orelse {
         log.err("SDL renderer: {s}", .{c.SDL_GetError()});
         return error.GraphicsUnavailable;
@@ -243,6 +248,36 @@ test "SDL nested clips restore their parent and preserve translucent draw order"
     rectangle(.init(15, 15, 5, 5), .white);
     endClip();
     rectangle(.init(200, 20, 8, 8), .white);
+    flush();
+    try testing.expect(!failed);
+    try testing.expectEqual(Color.black, testPixel(surface, 5, 5));
+    try testing.expectEqual(Color.black, testPixel(surface, 120, 50));
+    try testing.expectEqual(Color.white, testPixel(surface, 16, 16));
+    try testing.expectEqual(Color.white, testPixel(surface, 202, 22));
+    const mixed = testPixel(surface, 50, 50);
+    try testing.expect(mixed.r >= 126 and mixed.r <= 128);
+    try testing.expect(mixed.b >= 127 and mixed.b <= 128);
+    try testing.expectEqual(@as(u8, 0), mixed.g);
+}
+
+test "rectangle batches preserve clipping and blend order across capacity and reuse" {
+    const testing = std.testing;
+    const surface = try testRenderer();
+    defer c.SDL_DestroySurface(surface);
+    defer deinit();
+    clear(.black);
+    beginClip(.init(10, 10, 100, 100));
+    var batch: RectangleBatch = .{};
+    batch.rectangle(.init(0, 0, 320, 200), .init(255, 0, 0, 255));
+    // The overlapping blue rectangle must follow the red one across a full batch.
+    for (0..255) |_| batch.rectangle(.init(200, 150, 1, 1), .white);
+    batch.rectangle(.init(30, 30, 100, 100), .init(0, 0, 255, 128));
+    batch.submit();
+    endClip();
+    rectangle(.init(15, 15, 5, 5), .white);
+    batch.rectangle(.init(200, 20, 8, 8), .white);
+    batch.submit();
+    batch.submit();
     flush();
     try testing.expect(!failed);
     try testing.expectEqual(Color.black, testPixel(surface, 5, 5));

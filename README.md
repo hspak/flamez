@@ -31,8 +31,11 @@ Linux also needs clang and libbpf development files for capture. For example,
 on Arch Linux the GUI packages are `sdl3 freetype2 libpng pkgconf`.
 
 SDL libraries are supplied by the target system; no raylib or GLFW is linked.
-`SDL_RENDER_DRIVER` can select an installed SDL backend for diagnostics. Linux
-prefers Wayland by default; `SDL_VIDEODRIVER` can override that preference.
+Linux uses SDL's Vulkan renderer by default and requires a working Vulkan driver;
+renderer initialization fails if Vulkan is unavailable. `SDL_RENDER_DRIVER` can
+explicitly select another installed SDL backend for diagnostics. Other platforms
+retain SDL's native renderer selection (normally Metal on macOS). Linux prefers
+Wayland by default; `SDL_VIDEODRIVER` can override that preference.
 Antialiasing uses geometry coverage and filtered font atlases, so the former
 `-Dmsaa` option has been removed.
 
@@ -133,7 +136,8 @@ The application of [FRAME_PACING.md](FRAME_PACING.md) and
   completion or physical display latency.
 
 The application-owned Zrct suites require the optional `../zrct` checkout declared
-in `build.zig.zon`. Production builds do not load the driver. Use its
+in `build.zig.zon`. GUI suites and benchmarks explicitly select Vulkan to match
+the Linux application default. Production builds do not load the driver. Use its
 [`SKILL.md`](../zrct/SKILL.md) for artifact inspection and reproduction:
 
 ```sh
@@ -141,6 +145,13 @@ zig build test-zrct -Dautomation=true -- --json
 zig build test-zrct-desktop -Dautomation=true -- --json
 zig build bench-zrct -Dautomation=true -Doptimize=ReleaseSafe -- --warmup 2 --repeat 10
 ```
+
+For Vulkan validation on an existing GPU-backed Wayland desktop, prefix
+`test-zrct` or `bench-zrct` with `ZRCT_DISPLAY_SMOKE=1`; Zrct creates an isolated
+nested compositor. The output-scaling test requires the headless compositor.
+Headless Vulkan runs require a software Vulkan driver such as Mesa Lavapipe,
+selected with `VK_DRIVER_FILES` pointing to its ICD manifest, to match Zrct's
+software compositor. A hardware Vulkan driver alone does not satisfy that profile.
 
 The first suite covers details, export/reopen, collapse/selection, zoom anchoring,
 idle shortcuts, and held input during resize. The desktop suite uses real Wayland
@@ -155,6 +166,57 @@ are completed semantic frames before presentation; startup and idle-to-details
 use the small saved-session fixture. Preserve `benchmark.json`, executable hashes,
 renderer identity and cache policy, and compare identical workloads. These results
 do not establish large-capture throughput, native resize smoothness, or GPU latency.
+
+For steady-state rendering experiments, build with `-Drender-benchmark=true` and
+use `tools/benchmark_render.py`. This opt-in executable requires a saved session,
+disables vsync and frame pacing, discards 120 warmup frames, measures 600 frames,
+and exits. It reports wall time through `SDL_RenderPresent`, main-thread CPU time,
+and preparation/presentation spans; it does not measure GPU completion. Normal
+builds compile out the instrumentation. Use separate install prefixes to preserve
+the exact baseline and candidate binaries:
+
+```sh
+zig build -Doptimize=ReleaseSafe -Drender-benchmark=true --prefix /tmp/flamez-baseline
+# Make the candidate change, then build it separately.
+zig build -Doptimize=ReleaseSafe -Drender-benchmark=true --prefix /tmp/flamez-candidate
+python3 tools/benchmark_render.py \
+  --executable baseline=/tmp/flamez-baseline/bin/flamez \
+  --executable candidate=/tmp/flamez-candidate/bin/flamez \
+  --output artifacts/render-comparison --repeat 5
+```
+
+The runner needs an available GPU display and forces Vulkan. It alternates binary
+order, generates identical 545-process sessions (one root, 32 parents, 16 children
+per parent), and retains fixture/executable hashes, logs, and raw run summaries.
+The `typical` and `dense` cases use 128 and 512 CPU slices per child; `packed` uses
+sequential children without slices as a shape-heavy control. Output directories
+must be new. Keep the display, window size, optimization, and background load
+unchanged; OS caches remain shared. These are synthetic rendering workloads, not
+live capture or Ninja FPS measurements.
+
+Vulkan experiments on 2026-10-03 retained ordered CPU-slice rectangle batching.
+At 1180×760, ReleaseSafe, five alternating runs per binary, the median of each
+run's mean frame cost changed as follows:
+
+| Workload | Before | Batched | Reduction |
+|---|---:|---:|---:|
+| Typical slices | 466 µs | 321 µs | 31% |
+| Dense slices | 1172 µs | 522 µs | 55% |
+| Packed bars, no slices | 1127 µs | 1114 µs | Within run variation |
+
+Evidence is in `artifacts/render-final/result.json`. Separately staging an entire
+frame before SDL submission did not improve total cost and made the dense case
+about 4% slower (`artifacts/render-prepared`). Reusing rounded-shape contours and
+indices showed no repeatable gain against an unchanged-binary control
+(`artifacts/render-contours-confirm`). Both prototypes were removed. The timing
+fix that resumes the timeline phase after a tree rebuild remains independently
+of the optimization. Baseline/batched Vulkan screenshots matched exactly in all
+three workloads.
+
+With 32 competing CPU workers, typical-workload main-thread CPU time fell from
+797 µs to 572 µs (28%); total frame time varied substantially with scheduling and
+presentation (`artifacts/render-contention`). This does not establish a 120 FPS
+guarantee during shader generation.
 
 Linux validation on 2026-10-03 used Zig 0.16.0 and SDL 3.4.18: Debug passed 167
 tests (17 skipped), ReleaseSafe with telemetry/FPS passed 172 (12 skipped), all

@@ -1,7 +1,11 @@
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import shutil
+
+
+gpu_display = os.environ.get("ZRCT_DISPLAY_SMOKE") == "1"
 
 
 @contextmanager

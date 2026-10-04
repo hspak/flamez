@@ -62,6 +62,11 @@ pub fn build(b: *std.Build) void {
     const automation = b.option(bool, "automation", "Enable private Zrct GUI instrumentation") orelse false;
     const build_options = b.addOptions();
     build_options.addOption(bool, "automation", automation);
+    build_options.addOption(bool, "render_benchmark", b.option(
+        bool,
+        "render-benchmark",
+        "Render 120 warmup and 600 measured frames without vsync or pacing, then exit",
+    ) orelse false);
     const version = b.option([]const u8, "version", "Set the build version") orelse "unset";
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "ebpf", enable_ebpf);

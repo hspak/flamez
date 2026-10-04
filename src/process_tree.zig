@@ -17,8 +17,8 @@ pub fn ensure(app: *App, session: *const tracer.Session) Allocator.Error!void {
     const pack_stale = topology_stale or collapse_stale or
         (!session.running and app.interval_revision_seen != session.interval_revision);
     if (!topology_stale and !collapse_stale and !pack_stale) return;
-    perf.enter(.tree_rebuild);
-    defer perf.leave();
+    const previous_phase = perf.enterNested(.tree_rebuild);
+    defer perf.leaveNested(previous_phase);
     try rebuildProcessTree(app, session);
     app.topology_revision_seen = session.topology_revision;
     app.interval_revision_seen = session.interval_revision;

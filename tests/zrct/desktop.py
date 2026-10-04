@@ -6,7 +6,7 @@ from zrct.desktop import DesktopInput
 # Place the window at 2x first: Weston does not reposition it when output
 # coordinates shrink. Every later scale retains reachable native hit regions.
 SUITE = Suite("flamez-desktop", setup=imported_session, width=3200, height=2200, scale=2,
-              required_boundaries=("compositor_input",))
+              required_boundaries=("compositor_input",), sdl_renderer="vulkan")
 
 
 class DesktopWorkflow(TestCase):

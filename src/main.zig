@@ -20,6 +20,7 @@ const process_tree = @import("process_tree.zig");
 const theme = @import("theme.zig");
 const text = @import("text.zig");
 const perf = @import("perf.zig");
+const render_benchmark = @import("render_benchmark.zig");
 
 const canvas = theme.canvas;
 const panel_raised = theme.panel_raised;
@@ -158,6 +159,10 @@ pub fn main(init: std.process.Init) !void {
         printUsage();
         std.process.exit(2);
     };
+    if (render_benchmark.enabled and parsed.mode != .import_file) {
+        std.debug.print("flamez: render benchmarks require --import SESSION\n", .{});
+        std.process.exit(2);
+    }
     if (parsed.mode == .capture_file) {
         std.process.exit(runHeadless(init, parsed.target, parsed.path.?));
     }
@@ -252,9 +257,9 @@ pub fn main(init: std.process.Init) !void {
         std.mem.span(path)
     else
         null;
-    try desktop.open(window_width, window_height, window_title, screenshot_path == null);
+    try desktop.open(window_width, window_height, window_title, screenshot_path == null and !render_benchmark.enabled);
     defer desktop.close();
-    try graphics.init(screenshot_path == null);
+    try graphics.init(screenshot_path == null and !render_benchmark.enabled);
     defer graphics.deinit();
     if (comptime build_options.automation) {
         zrct.setRenderer(.{ .window = desktop.window(), .flush = graphics.flush });
@@ -310,7 +315,7 @@ pub fn main(init: std.process.Init) !void {
         const input_changed = desktop.changed() or !window.eql(last_drawn_window) or
             mouse.x != last_drawn_mouse.x or mouse.y != last_drawn_mouse.y;
         if (input_changed) interaction_burst.refresh(now);
-        const active = session.running or screenshot_path != null or
+        const active = render_benchmark.enabled or session.running or screenshot_path != null or
             frame_number < initial_present_frames or input_changed or
             interaction_burst.active(now) or desktop.inputHeld();
         const redraw = active or capture_pending or automation_pending or
@@ -333,6 +338,7 @@ pub fn main(init: std.process.Init) !void {
         const pinch_zoom = desktop.pinchZoom();
         const width = window.screen_width;
         const height = window.screen_height;
+        render_benchmark.beginFrame(init.io);
         perf.beginFrame();
 
         clay.setLayoutDimensions(.{
@@ -441,16 +447,18 @@ pub fn main(init: std.process.Init) !void {
             if (frame_number + 1 == 40) try graphics.saveScreenshot(path);
         }
         desktop.commitCursor();
+        render_benchmark.beginPresent(init.io);
         try graphics.endFrame();
         perf.leave();
         perf.endFrame();
+        if (render_benchmark.endFrame(init.io)) break;
         last_drawn_mouse = mouse;
         last_drawn_window = window;
         frame_number += 1;
         desktop.consumeInput();
         automation_pending = false;
         capture_pending = false;
-        next_draw = ticks + if (screenshot_path != null)
+        next_draw = ticks + if (render_benchmark.enabled) 0 else if (screenshot_path != null)
             std.time.ns_per_s / screenshot_fps
         else
             desktop.intervalNs();
@@ -862,11 +870,11 @@ fn cpuSliceRect(
     return .init(x, layout.y + bar_height - height, width, height);
 }
 
-fn paintCpuSlice(slice: tracer.Process.CpuSlice, rect: graphics.Rect) void {
+fn paintCpuSlice(batch: *graphics.RectangleBatch, slice: tracer.Process.CpuSlice, rect: graphics.Rect) void {
     const base = toColor(cpu_hot);
-    graphics.rectangle(rect, .init(base.r, base.g, base.b, cpuSliceAlpha(slice.band)));
+    batch.rectangle(rect, .init(base.r, base.g, base.b, cpuSliceAlpha(slice.band)));
     if (slice.band > 4) {
-        graphics.rectangle(
+        batch.rectangle(
             .init(rect.x, rect.y, rect.width, 1),
             graphics.Color.init(255, 178, 178, 255),
         );
@@ -902,6 +910,7 @@ fn paintCpuSlices(
     const view_end_ns = layout.window.start_ns + layout.view_span;
     const first = tracer.Process.firstVisibleSlice(slices, layout.window.start_ns, view_end_ns);
     if (first == slices.len or slices[first].start_ns >= view_end_ns) return;
+    defer app.cpu_rectangles.submit();
 
     const width = @max(1, @as(usize, @intFromFloat(@floor(layout.timeline_width))));
     var columns_ready = false;
@@ -912,7 +921,7 @@ fn paintCpuSlices(
         scanned += 1;
         const rect = cpuSliceRect(slice, layout, host_cpu_count) orelse continue;
         if (rect.width >= 1.5) {
-            paintCpuSlice(slice, rect);
+            paintCpuSlice(&app.cpu_rectangles, slice, rect);
             drawn += 1;
             continue;
         }
@@ -943,7 +952,7 @@ fn paintCpuSlices(
                 .band = column.band,
             };
             const rect = cpuSliceRect(synthetic, layout, host_cpu_count) orelse continue;
-            paintCpuSlice(synthetic, rect);
+            paintCpuSlice(&app.cpu_rectangles, synthetic, rect);
             drawn += 1;
         }
     }

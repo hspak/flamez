@@ -1,11 +1,12 @@
 """Saved-session workflows; no tracing privileges or live workload required."""
 from zrct import Suite, TestCase
 from pathlib import Path
-from support import imported_session, validate_export
+from support import gpu_display, imported_session, validate_export
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 SUITE = Suite("flamez", REPOSITORY, ("zig", "build", "-Dautomation=true"),
-              "zig-out/bin/flamez", setup=imported_session)
+              "zig-out/bin/flamez", setup=imported_session, sdl_renderer="vulkan",
+              display=gpu_display)
 
 
 class ImportedSession(TestCase):

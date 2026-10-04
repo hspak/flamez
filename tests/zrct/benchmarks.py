@@ -1,8 +1,9 @@
 """Serial measurements of completed application frames, before presentation."""
 from zrct import Benchmark, Suite, TestCase
-from support import imported_session
+from support import gpu_display, imported_session
 
-SUITE = Suite("flamez-benchmarks", setup=imported_session, benchmark=Benchmark(
+SUITE = Suite("flamez-benchmarks", setup=imported_session, sdl_renderer="vulkan",
+              display=gpu_display, benchmark=Benchmark(
     optimization="ReleaseSafe",
     fixture={"kind": "imported-exec-history", "processes": 1},
     cache="fresh process and private app state; shared OS page cache uncontrolled; details opens after drawing idle",

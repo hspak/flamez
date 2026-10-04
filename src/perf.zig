@@ -156,6 +156,20 @@ pub fn leave() void {
     if (elapsed > 0) recording.phase_ns[phaseIndex(phase)] +|= @intCast(elapsed);
 }
 
+/// Suspends the current phase; pass the returned phase to leaveNested to resume it.
+pub fn enterNested(phase: Phase) ?Phase {
+    if (comptime !enabled) return null;
+    const previous = recording.current_phase;
+    enter(phase);
+    return previous;
+}
+
+pub fn leaveNested(previous: ?Phase) void {
+    if (comptime !enabled) return;
+    leave();
+    if (previous) |phase| enter(phase);
+}
+
 pub fn noteRebuild(jobs: usize) void {
     if (comptime !enabled) return;
     recording.rebuilds += 1;
@@ -330,6 +344,28 @@ test "telemetry retains phase totals between frames" {
     try std.testing.expect(
         recording.phase_ns[phaseIndex(.detail)] >= first_detail + std.time.ns_per_ms,
     );
+}
+
+test "tree rebuild resumes timing its enclosing timeline phase" {
+    if (comptime !enabled) return error.SkipZigTest;
+    const App = @import("App.zig");
+    const tracer = @import("tracer.zig");
+    const process_tree = @import("process_tree.zig");
+    var app = try App.init(std.testing.allocator);
+    defer app.deinit();
+    var session = tracer.Session.init(std.testing.allocator, std.testing.io);
+    defer session.deinit();
+    beginSession(std.testing.io);
+    beginFrame();
+    enter(.timeline);
+    try process_tree.ensure(&app, &session);
+    try std.testing.expectEqual(Phase.timeline, recording.current_phase.?);
+    const before = recording.phase_ns[phaseIndex(.timeline)];
+    recording.phase_started = .fromNanoseconds(
+        recording.phase_started.?.nanoseconds - std.time.ns_per_ms,
+    );
+    leave();
+    try std.testing.expect(recording.phase_ns[phaseIndex(.timeline)] >= before + std.time.ns_per_ms);
 }
 
 test "telemetry counts received samples and actual CPU slice growth" {

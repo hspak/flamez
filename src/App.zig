@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const process_info = @import("process_info.zig");
+const graphics = @import("graphics.zig");
 
 const TooltipLine = process_info.TooltipLine;
 
@@ -66,6 +67,7 @@ row_trees_scratch: std.ArrayList(PackingTree) = .empty,
 /// Node addresses stay fixed for an entire rebuild; each visible process belongs to one tree.
 interval_nodes_scratch: std.ArrayList(PackingTree.Node) = .empty,
 cpu_columns: std.ArrayList(CpuColumn) = .empty,
+cpu_rectangles: graphics.RectangleBatch = .{},
 cpu_touched_columns: std.ArrayList(usize) = .empty,
 packed_columns: std.ArrayList(?usize) = .empty,
 packed_touched_columns: std.ArrayList(usize) = .empty,
