@@ -1,8 +1,8 @@
 //! UI palette: single source of truth for every color the interface draws.
-//! Colors are clay colors; convert at the raylib boundary with `toRaylibColor`.
+//! Colors are clay colors; convert at the SDL boundary with `toColor`.
 
 const clay = @import("zclay");
-const rl = @import("raylib");
+const graphics = @import("graphics.zig");
 
 pub const canvas: clay.Color = .{
     9,
@@ -95,8 +95,8 @@ pub const danger: clay.Color = .{
     255,
 };
 
-/// Converts a Clay color to raylib's byte-channel representation.
-pub fn toRaylibColor(color: clay.Color) rl.Color {
+/// Converts a Clay color to SDL's byte-channel representation.
+pub fn toColor(color: clay.Color) graphics.Color {
     return .init(
         @intFromFloat(color[0]),
         @intFromFloat(color[1]),

@@ -1,13 +1,16 @@
-//! Flamez entry point and raylib/Clay renderer for live process timelines.
+//! Flamez entry point and SDL/Clay renderer for live process timelines.
 
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.flamez);
 const build_options = @import("build_options");
+const zrct = if (build_options.automation) @import("zrct") else void;
 const cli = @import("cli.zig");
 const clay = @import("zclay");
-const rl = @import("raylib");
+const graphics = @import("graphics.zig");
+const desktop = @import("desktop.zig");
+const Font = @import("Font.zig");
 const footer_font = @import("footer_font");
 const tracer = @import("tracer.zig");
 const App = @import("App.zig");
@@ -30,11 +33,8 @@ const cpu_hot = theme.cpu_hot;
 const ink = theme.ink;
 const muted = theme.muted;
 const faint = theme.faint;
-const toRaylibColor = theme.toRaylibColor;
+const toColor = theme.toColor;
 
-const text_buffer_capacity = text.buffer_capacity;
-const ui_glyph_spacing = text.ui_glyph_spacing;
-const nullTerminate = text.nullTerminate;
 const formatDuration = text.formatDuration;
 const measureTextSlice = text.measure;
 const drawTextSlice = text.draw;
@@ -53,11 +53,9 @@ const window_height = 760;
 /// Software cap used when vsync is off (screenshot clock). `0` means no CPU wait.
 const screenshot_fps = 60;
 /// Completed captures poll for input without rebuilding or presenting unchanged frames.
-const idle_poll_interval_ms: i64 = 32;
+const idle_poll_interval_ms: i64 = 25;
 /// Keep polling and presenting briefly after input so a quiet sample cannot stall a gesture.
 const interaction_burst_ms: i64 = 120;
-/// FPS-enabled idle captures present only often enough to keep the diagnostic visibly live.
-const idle_fps_refresh_polls: usize = @intCast(@divTrunc(1000, idle_poll_interval_ms));
 /// Keep presenting while the compositor delivers the initial HiDPI framebuffer configuration.
 const initial_present_frames: usize = 4;
 const max_gui_save_stem_len: usize = 50;
@@ -72,10 +70,10 @@ const WindowMetrics = struct {
 
     fn current() WindowMetrics {
         return .{
-            .screen_width = rl.getScreenWidth(),
-            .screen_height = rl.getScreenHeight(),
-            .render_width = rl.getRenderWidth(),
-            .render_height = rl.getRenderHeight(),
+            .screen_width = desktop.width(),
+            .screen_height = desktop.height(),
+            .render_width = desktop.pixelWidth(),
+            .render_height = desktop.pixelHeight(),
         };
     }
 
@@ -100,56 +98,34 @@ const InteractionBurst = struct {
 };
 
 const FontBook = struct {
-    ui: rl.Font,
-    row: rl.Font,
-    footer: rl.Font,
+    ui: Font,
+    row: Font,
+    footer: Font,
 
-    fn get(self: *const FontBook, font_id: u16) rl.Font {
+    fn get(self: *const FontBook, font_id: u16) *const Font {
         return switch (font_id) {
-            footer_font_id => self.footer,
-            ui_font_id => self.ui,
-            else => self.ui,
+            footer_font_id => &self.footer,
+            ui_font_id => &self.ui,
+            else => &self.ui,
         };
     }
 
     fn deinit(self: *FontBook) void {
-        unloadEmbeddedFont(self.footer);
-        unloadEmbeddedFont(self.row);
-        unloadEmbeddedFont(self.ui);
+        self.footer.deinit();
+        self.row.deinit();
+        self.ui.deinit();
         self.* = undefined;
     }
 };
 
 const FrameInput = struct {
-    font: rl.Font,
-    row_font: rl.Font,
-    mouse: rl.Vector2,
+    font: *const Font,
+    row_font: *const Font,
+    mouse: graphics.Point,
     wheel: f32,
     pinch_zoom: f32,
     clicked: bool,
     host_cpu_count: usize,
-};
-
-const TrackpadGestures = struct {
-    pinch_distance: ?f32 = null,
-
-    fn samplePinch(self: *TrackpadGestures) f32 {
-        const pinching = rl.isGestureDetected(.{ .pinch_in = true }) or
-            rl.isGestureDetected(.{ .pinch_out = true });
-        if (!pinching) {
-            self.pinch_distance = null;
-            return 0;
-        }
-
-        const vector = rl.getGesturePinchVector();
-        const distance = @sqrt(vector.x * vector.x + vector.y * vector.y);
-        const previous = self.pinch_distance orelse {
-            self.pinch_distance = distance;
-            return 0;
-        };
-        self.pinch_distance = distance;
-        return (distance - previous) * 24;
-    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -251,7 +227,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     defer session.deinit();
-    defer if (collector_attached) collector.deinit();
+    defer if (collector_attached) {
+        if (session.running) session.stop(&collector);
+        collector.deinit();
+    };
     var app = try App.init(init.gpa);
     defer app.deinit();
     if (start_error) |err| {
@@ -273,36 +252,19 @@ pub fn main(init: std.process.Init) !void {
         std.mem.span(path)
     else
         null;
-    rl.setConfigFlags(.{
-        .window_resizable = true,
-        .msaa_4x_hint = build_options.msaa,
-        .vsync_hint = screenshot_path == null,
-        .window_highdpi = screenshot_path == null,
-    });
-    rl.initWindow(window_width, window_height, window_title);
-    if (!rl.isWindowReady()) {
-        log.err("raylib could not create a window", .{});
-        return error.WindowInitializationFailed;
+    try desktop.open(window_width, window_height, window_title, screenshot_path == null);
+    defer desktop.close();
+    try graphics.init(screenshot_path == null);
+    defer graphics.deinit();
+    if (comptime build_options.automation) {
+        zrct.setRenderer(.{ .window = desktop.window(), .flush = graphics.flush });
+        try zrct.init("flamez", build_options.version);
     }
-    defer rl.closeWindow();
-    // Raylib normally performs its first event poll after presenting frame one.
-    // Process compositor scale callbacks before that frame reaches the screen.
-    rl.pollInputEvents();
-    rl.setGesturesEnabled(.{
-        .tap = true,
-        .doubletap = true,
-        .pinch_in = true,
-        .pinch_out = true,
-    });
-    rl.setWindowMinSize(760, 520);
-    // Screenshots disable vsync and need a fixed clock. Interactive frames
-    // use `setTargetFPS(0)` so the swap interval is the cap.
-    var fps_cap: i32 = if (screenshot_path != null) screenshot_fps else 0;
-    rl.setTargetFPS(fps_cap);
-
-    var fonts = loadFonts();
+    defer if (comptime build_options.automation) zrct.deinit();
+    desktop.poll();
+    var fonts = try loadFonts(init.gpa);
     defer fonts.deinit();
-    const font = fonts.ui;
+    const font = &fonts.ui;
     const clay_memory = try init.arena.allocator().alloc(u8, clay.minMemorySize());
     _ = clay.initialize(
         .init(clay_memory),
@@ -312,80 +274,72 @@ pub fn main(init: std.process.Init) !void {
     clay.setMeasureTextFunction(*const FontBook, &fonts, measureText);
 
     var frame_number: usize = 0;
-    var trackpad_gestures: TrackpadGestures = .{};
-    var last_drawn_mouse = rl.getMousePosition();
+    var last_drawn_mouse = desktop.mouse();
     var last_drawn_window: WindowMetrics = .{};
-    var idle_polls_since_draw: usize = 0;
+    var next_draw: u64 = 0;
+    var next_diagnostic: u64 = 0;
+    var automation_pending = false;
+    var capture_pending = false;
     var interaction_burst: InteractionBurst = .{};
     var tooltip_hold: TooltipHold = .{};
     var next_save_index: usize = 0;
     var save_path_buffer: [128]u8 = undefined;
     perf.beginSession(init.io);
 
-    while (!rl.windowShouldClose()) {
-        if (tracer.stopRequested()) {
-            if (session.running) session.stop(&collector);
-            break;
+    while (true) {
+        if (comptime build_options.automation) {
+            automation_pending = zrct.poll() or automation_pending;
+            if (zrct.shouldClose()) break;
+        }
+        desktop.poll();
+        if (desktop.shouldClose() or desktop.keyPressed(.escape) or tracer.stopRequested()) break;
+        if (desktop.rendererLost()) return error.GraphicsUnavailable;
+        // Capture must progress even when rendering is delayed or the window is minimized.
+        capture_pending = capture_pending or session.running;
+        if (session.running) session.update(&collector);
+        if (!session.running and collector_attached) {
+            app.remapProcesses(session.process_remap.items);
+            if (session.process_remap.items.len != 0) tooltip_hold = .{};
+            collector.deinit();
+            collector_attached = false;
         }
         const now = std.Io.Clock.awake.now(init.io);
-        const frame_time = rl.getFrameTime();
-        const mouse = rl.getMousePosition();
-        const wheel = rl.getMouseWheelMoveV();
-        const tapped = rl.isGestureDetected(.{ .tap = true }) or
-            rl.isGestureDetected(.{ .doubletap = true });
-        const clicked = rl.isMouseButtonPressed(.left) or tapped;
-        const pointer_active = clicked or
-            rl.isMouseButtonDown(.left) or
-            rl.isMouseButtonReleased(.left);
-        const pinch_zoom = trackpad_gestures.samplePinch();
+        const ticks = desktop.ticks();
+        const mouse = desktop.mouse();
         const window = WindowMetrics.current();
-        const width = window.screen_width;
-        const height = window.screen_height;
-        const wanted_fps: i32 = if (screenshot_path != null)
-            screenshot_fps
-        else
-            0; // 0 == vsync
-
-        if (wanted_fps != fps_cap) {
-            fps_cap = wanted_fps;
-            rl.setTargetFPS(fps_cap);
-        }
-
-        const mouse_moved = mouse.x != last_drawn_mouse.x or mouse.y != last_drawn_mouse.y;
-        const input_changed = mouse_moved or
-            wheel.x != 0 or
-            wheel.y != 0 or
-            pointer_active or
-            trackpad_gestures.pinch_distance != null or
-            hasKeyboardActivity() or
-            rl.isWindowResized() or
-            !window.eql(last_drawn_window);
+        const input_changed = desktop.changed() or !window.eql(last_drawn_window) or
+            mouse.x != last_drawn_mouse.x or mouse.y != last_drawn_mouse.y;
         if (input_changed) interaction_burst.refresh(now);
-        const fps_refresh_due = if (comptime build_options.fps_counter)
-            idle_polls_since_draw >= idle_fps_refresh_polls
-        else
-            false;
-        const redraw = session.running or
-            screenshot_path != null or
-            frame_number < initial_present_frames or
-            input_changed or
-            interaction_burst.active(now) or
-            fps_refresh_due;
-        if (!redraw) {
-            init.io.sleep(.fromMilliseconds(idle_poll_interval_ms), .awake) catch {};
-            // EndDrawing normally polls events; idle frames deliberately skip it.
-            rl.pollInputEvents();
-            idle_polls_since_draw +|= 1;
+        const active = session.running or screenshot_path != null or
+            frame_number < initial_present_frames or input_changed or
+            interaction_burst.active(now) or desktop.inputHeld();
+        const redraw = active or capture_pending or automation_pending or
+            (build_options.fps_counter and ticks >= next_diagnostic);
+        if (desktop.minimized() or !redraw) {
+            desktop.idle = true;
+            perf.noteIdle();
+            desktop.waitNs(@intCast(idle_poll_interval_ms * std.time.ns_per_ms));
             continue;
         }
-        idle_polls_since_draw = 0;
+        if (ticks < next_draw) {
+            desktop.waitNs(next_draw - ticks);
+            continue;
+        }
+        perf.noteFrameStart(ticks, active);
+        desktop.beginFrame(ticks, active);
+        const frame_time = desktop.frameTime();
+        const wheel = desktop.wheel();
+        const clicked = desktop.buttonPressed(.left);
+        const pinch_zoom = desktop.pinchZoom();
+        const width = window.screen_width;
+        const height = window.screen_height;
         perf.beginFrame();
 
         clay.setLayoutDimensions(.{
             .w = @floatFromInt(width),
             .h = @floatFromInt(height),
         });
-        clay.setPointerState(.{ .x = mouse.x, .y = mouse.y }, rl.isMouseButtonDown(.left));
+        clay.setPointerState(.{ .x = mouse.x, .y = mouse.y }, desktop.buttonDown(.left));
         clay.updateScrollContainers(false, .{ .x = wheel.x, .y = wheel.y }, frame_time);
 
         if (clicked and session.running and clay.pointerOver(.ID("StopButton"))) {
@@ -397,8 +351,8 @@ pub fn main(init: std.process.Init) !void {
         {
             app.selected_process = null;
         }
-        if (rl.isKeyPressed(.f5)) clay.setDebugModeEnabled(!clay.isDebugModeEnabled());
-        const save_shortcut = ctrlHeld() and rl.isKeyPressed(.s);
+        if (desktop.keyPressed(.f5)) clay.setDebugModeEnabled(!clay.isDebugModeEnabled());
+        const save_shortcut = ctrlHeld() and desktop.keyPressed(.s);
         const export_clicked = clicked and session.finished and
             clay.pointerOver(.ID("ExportButton"));
         if (save_shortcut or export_clicked) {
@@ -420,18 +374,9 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        if (session.running) {
-            session.update(&collector);
-        }
-        if (!session.running and collector_attached) {
-            app.remapProcesses(session.process_remap.items);
-            if (session.process_remap.items.len != 0) tooltip_hold = .{};
-            collector.deinit();
-            collector_attached = false;
-        }
         const frame_input = FrameInput{
             .font = font,
-            .row_font = fonts.row,
+            .row_font = &fonts.row,
             .mouse = mouse,
             .wheel = wheel.y,
             .pinch_zoom = pinch_zoom,
@@ -450,9 +395,10 @@ pub fn main(init: std.process.Init) !void {
         const commands = page_layout.create(&app, &session, &view_text);
         perf.leave();
 
-        rl.beginDrawing();
-        rl.clearBackground(toRaylibColor(canvas));
-        rl.setMouseCursor(.default);
+        if (comptime build_options.automation) zrct.beginFrame();
+        graphics.beginFrame();
+        graphics.clear(toColor(canvas));
+        desktop.setCursor(.default);
         perf.enter(.clay_playback);
         renderClay(commands, &fonts);
         perf.leave();
@@ -478,19 +424,38 @@ pub fn main(init: std.process.Init) !void {
         if (hovered) |target| {
             detail_pane.renderTooltip(&app, &session, target.process_index, font, mouse);
         }
+        if (comptime build_options.automation) {
+            zrct.add(.{ .id = "window", .role = "window", .status = if (active) "active" else "idle", .bounds = .{ .x = 0, .y = 0, .width = @floatFromInt(width), .height = @floatFromInt(height) }, .interactive = false });
+            inline for (.{ .{ "DetailPane", "detail-pane", "pane", "Details" }, .{ "DetailCloseButton", "detail-close", "button", "Close details" }, .{ "ExportButton", "export-button", "button", "Export session" } }) |item| {
+                const element = clay.getElementData(.ID(item[0]));
+                if (element.found and (!std.mem.startsWith(u8, item[0], "Detail") or app.selected_process != null)) zrct.add(.{ .id = item[1], .role = item[2], .label = item[3], .bounds = .from(element.bounding_box), .interactive = !std.mem.eql(u8, item[2], "pane") });
+            }
+            if (session.running) {
+                const stop = clay.getElementData(.ID("StopButton"));
+                if (stop.found) zrct.add(.{ .id = "stop-button", .role = "button", .label = "Stop capture", .bounds = .from(stop.bounding_box) });
+            }
+            zrct.endFrame();
+        }
         perf.enter(.end_drawing);
-        rl.endDrawing();
+        if (screenshot_path) |path| {
+            if (frame_number + 1 == 40) try graphics.saveScreenshot(path);
+        }
+        desktop.commitCursor();
+        try graphics.endFrame();
         perf.leave();
         perf.endFrame();
         last_drawn_mouse = mouse;
         last_drawn_window = window;
         frame_number += 1;
-        if (screenshot_path) |path| {
-            if (frame_number == 40) {
-                rl.takeScreenshot(path);
-                break;
-            }
-        }
+        desktop.consumeInput();
+        automation_pending = false;
+        capture_pending = false;
+        next_draw = ticks + if (screenshot_path != null)
+            std.time.ns_per_s / screenshot_fps
+        else
+            desktop.intervalNs();
+        next_diagnostic = ticks + std.time.ns_per_s;
+        if (screenshot_path != null and frame_number == 40) break;
     }
     if (session.running) session.stop(&collector);
     perf.sessionSummary();
@@ -756,28 +721,6 @@ fn guiSavePath(directory: []const u8, stem: []const u8, index: usize, buffer: []
         );
 }
 
-fn hasKeyboardActivity() bool {
-    return rl.isKeyPressed(.f5) or
-        rl.isKeyPressed(.s) or
-        rl.isKeyPressed(.zero) or
-        rl.isKeyPressed(.kp_0) or
-        rl.isKeyPressed(.minus) or
-        rl.isKeyPressed(.kp_subtract) or
-        rl.isKeyPressed(.equal) or
-        rl.isKeyPressed(.kp_equal) or
-        rl.isKeyPressed(.kp_add) or
-        rl.isKeyPressed(.up) or
-        rl.isKeyPressed(.down) or
-        rl.isKeyPressed(.page_up) or
-        rl.isKeyPressed(.page_down) or
-        rl.isKeyPressed(.home) or
-        rl.isKeyPressed(.end) or
-        rl.isKeyPressed(.left) or
-        rl.isKeyPressed(.right) or
-        rl.isKeyPressed(.a) or
-        rl.isKeyPressed(.c);
-}
-
 fn countSlices(session: *const tracer.Session) usize {
     var total: usize = 0;
     for (session.processes.items) |process| total += process.cpu_slices.items.len;
@@ -798,22 +741,22 @@ const scrollbar_width: f32 = 12;
 const scrollbar_min_thumb_size: f32 = 24;
 
 fn ctrlHeld() bool {
-    return rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
+    return desktop.keyDown(.left_control) or desktop.keyDown(.right_control);
 }
 
 fn shiftHeld() bool {
-    return rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+    return desktop.keyDown(.left_shift) or desktop.keyDown(.right_shift);
 }
 
 fn applyTimeViewHotkeys(app: *App, total_ns: u64) void {
     if (!ctrlHeld()) return;
-    if (rl.isKeyPressed(.zero) or rl.isKeyPressed(.kp_0)) {
+    if (desktop.keyPressed(.zero) or desktop.keyPressed(.kp_0)) {
         resetTimeView(app);
-    } else if (rl.isKeyPressed(.minus) or rl.isKeyPressed(.kp_subtract)) {
+    } else if (desktop.keyPressed(.minus) or desktop.keyPressed(.kp_subtract)) {
         zoomTimeView(app, total_ns, 0.5, -1);
-    } else if (rl.isKeyPressed(.equal) or
-        rl.isKeyPressed(.kp_equal) or
-        rl.isKeyPressed(.kp_add))
+    } else if (desktop.keyPressed(.equal) or
+        desktop.keyPressed(.kp_equal) or
+        desktop.keyPressed(.kp_add))
     {
         zoomTimeView(app, total_ns, 0.5, 1);
     }
@@ -865,7 +808,7 @@ const TooltipHold = struct {
     }
 };
 
-fn lifetimeBar(process: *const tracer.Process, now_ns: u64, layout: BarLayout) ?rl.Rectangle {
+fn lifetimeBar(process: *const tracer.Process, now_ns: u64, layout: BarLayout) ?graphics.Rect {
     const window = layout.window;
     const bar_start_ns = process.start_ns;
     const bar_end_ns = process.end_ns orelse now_ns;
@@ -881,7 +824,7 @@ fn lifetimeBar(process: *const tracer.Process, now_ns: u64, layout: BarLayout) ?
         2,
         layout.timeline_width * @as(f32, @floatCast(end_fraction - start_fraction)),
     );
-    return rl.Rectangle.init(bar_x, layout.y, bar_width, layout.row_height - process_row_gap);
+    return graphics.Rect.init(bar_x, layout.y, bar_width, layout.row_height - process_row_gap);
 }
 
 fn cpuSliceHeight(slice: tracer.Process.CpuSlice, row_height: f32, host_cpu_count: usize) f32 {
@@ -899,7 +842,7 @@ fn cpuSliceRect(
     slice: tracer.Process.CpuSlice,
     layout: BarLayout,
     host_cpu_count: usize,
-) ?rl.Rectangle {
+) ?graphics.Rect {
     const view_end_ns = layout.window.start_ns + layout.view_span;
     if (slice.end_ns <= layout.window.start_ns or slice.start_ns >= view_end_ns) return null;
     const clipped_start = @max(slice.start_ns, layout.window.start_ns);
@@ -919,13 +862,13 @@ fn cpuSliceRect(
     return .init(x, layout.y + bar_height - height, width, height);
 }
 
-fn paintCpuSlice(slice: tracer.Process.CpuSlice, rect: rl.Rectangle) void {
-    const base = toRaylibColor(cpu_hot);
-    rl.drawRectangleRec(rect, .init(base.r, base.g, base.b, cpuSliceAlpha(slice.band)));
+fn paintCpuSlice(slice: tracer.Process.CpuSlice, rect: graphics.Rect) void {
+    const base = toColor(cpu_hot);
+    graphics.rectangle(rect, .init(base.r, base.g, base.b, cpuSliceAlpha(slice.band)));
     if (slice.band > 4) {
-        rl.drawRectangleRec(
+        graphics.rectangle(
             .init(rect.x, rect.y, rect.width, 1),
-            rl.Color.init(255, 178, 178, 255),
+            graphics.Color.init(255, 178, 178, 255),
         );
     }
 }
@@ -1012,22 +955,22 @@ fn cpuSliceAlpha(band: u8) u8 {
     return @intCast(@min(scaled, 220));
 }
 
-fn pointInRect(point: rl.Vector2, rect: rl.Rectangle) bool {
+fn pointInRect(point: graphics.Point, rect: graphics.Rect) bool {
     return point.x >= rect.x and point.x <= rect.x + rect.width and
         point.y >= rect.y and point.y <= rect.y + rect.height;
 }
 
 // Visual treatment for a painted lifetime bar.
 const BarLook = struct {
-    color: rl.Color,
-    font: rl.Font,
-    ink: rl.Color,
+    color: graphics.Color,
+    font: *const Font,
+    ink: graphics.Color,
     rounded: bool,
 };
 
 const CollapseButton = struct {
-    hit_box: rl.Rectangle,
-    visual_box: rl.Rectangle,
+    hit_box: graphics.Rect,
+    visual_box: graphics.Rect,
 };
 
 const TimelineClick = union(enum) {
@@ -1065,8 +1008,8 @@ fn needsHorizontalScrollbar(window: TimeWindow, total_ns: u64, track_width: f32)
     return track_width - thumb_width >= 1;
 }
 
-fn collapseButton(gutter: rl.Rectangle) CollapseButton {
-    const hit_box = rl.Rectangle.init(
+fn collapseButton(gutter: graphics.Rect) CollapseButton {
+    const hit_box = graphics.Rect.init(
         gutter.x + (gutter.width - collapse_button_hit_width) / 2,
         gutter.y,
         collapse_button_hit_width,
@@ -1085,35 +1028,35 @@ fn collapseButton(gutter: rl.Rectangle) CollapseButton {
 
 fn paintCollapseButton(button: CollapseButton, collapsed: bool, hovered: bool) void {
     if (hovered) {
-        rl.drawRectangleRoundedLinesEx(button.visual_box, 0.25, 4, 1, toRaylibColor(accent));
+        graphics.roundedOutline(button.visual_box, 0.25, 1, toColor(accent));
     }
 
-    const center = rl.Vector2{
+    const center = graphics.Point{
         .x = button.visual_box.x + button.visual_box.width / 2,
         .y = button.visual_box.y + button.visual_box.height / 2,
     };
-    const color = toRaylibColor(muted);
+    const color = toColor(muted);
     if (collapsed) {
-        rl.drawLineEx(
+        graphics.line(
             .{ .x = center.x - 2, .y = center.y - 4 },
             .{ .x = center.x + 2, .y = center.y },
             2,
             color,
         );
-        rl.drawLineEx(
+        graphics.line(
             .{ .x = center.x + 2, .y = center.y },
             .{ .x = center.x - 2, .y = center.y + 4 },
             2,
             color,
         );
     } else {
-        rl.drawLineEx(
+        graphics.line(
             .{ .x = center.x - 4, .y = center.y - 2 },
             .{ .x = center.x, .y = center.y + 2 },
             2,
             color,
         );
-        rl.drawLineEx(
+        graphics.line(
             .{ .x = center.x, .y = center.y + 2 },
             .{ .x = center.x + 4, .y = center.y - 2 },
             2,
@@ -1140,17 +1083,17 @@ fn applyTimelineClick(app: *App, target: TimelineClick) void {
     }
 }
 
-fn paintLifetimeBar(bar: rl.Rectangle, look: BarLook) void {
+fn paintLifetimeBar(bar: graphics.Rect, look: BarLook) void {
     if (look.rounded) {
-        rl.drawRectangleRounded(bar, 0.22, 4, look.color);
+        graphics.roundedRectangle(bar, 0.22, look.color);
     } else {
-        rl.drawRectangleRec(bar, look.color);
+        graphics.rectangle(bar, look.color);
     }
 }
 
-fn paintSelectedBarBorder(app: *const App, index: usize, bar: rl.Rectangle) void {
+fn paintSelectedBarBorder(app: *const App, index: usize, bar: graphics.Rect) void {
     if (app.selected_process != index) return;
-    rl.drawRectangleLinesEx(bar, selected_bar_border_width, rl.Color.white);
+    graphics.outline(bar, selected_bar_border_width, graphics.Color.white);
 }
 
 fn paintBarLabel(
@@ -1158,7 +1101,7 @@ fn paintBarLabel(
     process: *const tracer.Process,
     process_index: usize,
     metadata: []const u8,
-    bar: rl.Rectangle,
+    bar: graphics.Rect,
     look: BarLook,
 ) void {
     const name = process.rowNameSlice();
@@ -1184,7 +1127,7 @@ fn paintBarLabel(
         .{ name, summary },
     ) catch name;
     const label_height = measureTextSlice(look.font, bar_label, bar_label_size).y;
-    const label_position = rl.Vector2{
+    const label_position = graphics.Point{
         // Bar positions are time-derived and commonly fractional. Sampling a
         // glyph atlas between screen pixels makes the small row labels fuzzy.
         .x = @round(bar.x + bar_label_inset),
@@ -1214,6 +1157,7 @@ fn renderTimeline(
     const element = clay.getElementData(.ID("TimelineViewport"));
     if (!element.found) return .{};
     const box = element.bounding_box;
+    if (comptime build_options.automation) zrct.add(.{ .id = "timeline", .role = "scroll", .bounds = .from(box), .interactive = false });
     if (box.width < 100 or box.height < 80) return .{};
 
     try process_tree.ensure(app, session);
@@ -1291,7 +1235,7 @@ fn renderTimeline(
     };
     const over_scrollbar = needs_scroll and pointInBox(mouse, track);
 
-    if (!rl.isMouseButtonDown(.left)) {
+    if (!desktop.buttonDown(.left)) {
         app.scrollbar_dragging = false;
         app.hscroll_dragging = false;
     }
@@ -1361,27 +1305,31 @@ fn renderTimeline(
         }
     }
     window = visibleTimeWindow(app, total_ns);
+    if (comptime build_options.automation) {
+        const anchor_fraction = (@as(f64, @floatFromInt(total_ns)) / 2 - @as(f64, @floatFromInt(window.start_ns))) / @as(f64, @floatFromInt(window.span_ns));
+        zrct.add(.{ .id = "zoom-anchor", .role = "geometry", .bounds = .{ .x = timeline_x + timeline_width * @as(f32, @floatCast(anchor_fraction)) - 40, .y = box.y + 2, .width = 80, .height = 24 }, .clip = .from(box), .parent = "timeline", .interactive = false });
+    }
     const h_thumb_draw_x = h_track.x + if (h_max_start == 0)
         0
     else
         h_thumb_travel * ratio(window.start_ns, h_max_start);
     if (inside) {
-        if (rl.isKeyPressed(.up)) app.graph_scroll -|= 1;
-        if (rl.isKeyPressed(.down)) app.graph_scroll = @min(max_scroll, app.graph_scroll + 1);
-        if (rl.isKeyPressed(.page_up)) app.graph_scroll -|= visible_rows -| 1;
-        if (rl.isKeyPressed(.page_down)) {
+        if (desktop.keyPressed(.up)) app.graph_scroll -|= 1;
+        if (desktop.keyPressed(.down)) app.graph_scroll = @min(max_scroll, app.graph_scroll + 1);
+        if (desktop.keyPressed(.page_up)) app.graph_scroll -|= visible_rows -| 1;
+        if (desktop.keyPressed(.page_down)) {
             app.graph_scroll = @min(max_scroll, app.graph_scroll + (visible_rows -| 1));
         }
-        if (rl.isKeyPressed(.home)) app.graph_scroll = 0;
-        if (rl.isKeyPressed(.end)) app.graph_scroll = max_scroll;
+        if (desktop.keyPressed(.home)) app.graph_scroll = 0;
+        if (desktop.keyPressed(.end)) app.graph_scroll = max_scroll;
         if (app.selected_process) |idx| {
             const can_toggle = idx < app.first_child.items.len and
                 app.first_child.items[idx] != null;
             if (can_toggle and idx < app.collapsed.items.len) {
-                if (rl.isKeyPressed(.left) and !app.collapsed.items[idx]) {
+                if (desktop.keyPressed(.left) and !app.collapsed.items[idx]) {
                     process_tree.toggleCollapsed(app, idx);
                 }
-                if (rl.isKeyPressed(.right) and app.collapsed.items[idx]) {
+                if (desktop.keyPressed(.right) and app.collapsed.items[idx]) {
                     process_tree.toggleCollapsed(app, idx);
                 }
             }
@@ -1391,19 +1339,15 @@ fn renderTimeline(
     row_count = app.row_order.items.len;
     app.graph_scroll = @min(app.graph_scroll, row_count -| visible_rows);
 
-    rl.beginScissorMode(
-        @intFromFloat(box.x),
-        @intFromFloat(box.y),
-        @intFromFloat(box.width),
-        @intFromFloat(box.height),
-    );
-    rl.drawRectangleRec(.init(box.x, box.y, box.width, header_height), toRaylibColor(panel_raised));
+    graphics.beginClip(.init(box.x, box.y, box.width, box.height));
+    graphics.rectangle(.init(box.x, box.y, box.width, header_height), toColor(panel_raised));
     const master_button = collapseButton(.init(box.x, box.y, timeline_x - box.x, header_height));
     const over_master_button = !app.scrollbar_dragging and
         !app.hscroll_dragging and
         pointInRect(mouse, master_button.hit_box);
-    if (over_master_button) rl.setMouseCursor(.pointing_hand);
+    if (over_master_button) desktop.setCursor(.pointing_hand);
     if (clicked and over_master_button) process_tree.toggleAllRowsCollapsed(app);
+    if (comptime build_options.automation) zrct.add(.{ .id = "collapse-all", .role = "button", .label = "Collapse or expand all", .bounds = .from(master_button.hit_box), .parent = "timeline", .expanded = !process_tree.anyCollapsibleRowCollapsed(app) });
     paintCollapseButton(
         master_button,
         process_tree.anyCollapsibleRowCollapsed(app),
@@ -1428,7 +1372,7 @@ fn renderTimeline(
                 .y = box.y + (header_height - measured.y) / 2,
             },
             12,
-            toRaylibColor(muted),
+            toColor(muted),
         );
     }
 
@@ -1443,9 +1387,9 @@ fn renderTimeline(
                 .y = box.y + header_height + (box.height - header_height - size.y) / 2,
             },
             17,
-            toRaylibColor(faint),
+            toColor(faint),
         );
-        rl.endScissorMode();
+        graphics.endClip();
         return .{};
     }
 
@@ -1463,7 +1407,7 @@ fn renderTimeline(
             .width = row_width,
             .height = row_height,
         };
-        const collapse_gutter = rl.Rectangle.init(
+        const collapse_gutter = graphics.Rect.init(
             box.x,
             y,
             timeline_x - box.x,
@@ -1475,9 +1419,9 @@ fn renderTimeline(
         switch (app.row_order.items[row]) {
             .process => |index| {
                 if (visible_index % 2 == 1) {
-                    rl.drawRectangleRec(
+                    graphics.rectangle(
                         .init(row_box.x, row_box.y, row_box.width, row_box.height),
-                        toRaylibColor(.{
+                        toColor(.{
                             14,
                             21,
                             38,
@@ -1511,9 +1455,9 @@ fn renderTimeline(
                     false;
                 if (over_row and !over_button) can_retain_previous = true;
                 if (over_row) {
-                    rl.drawRectangleRec(
+                    graphics.rectangle(
                         .init(row_box.x, row_box.y, row_box.width, row_box.height),
-                        toRaylibColor(.{
+                        toColor(.{
                             30,
                             42,
                             66,
@@ -1522,7 +1466,7 @@ fn renderTimeline(
                     );
                 }
                 if (over_button) {
-                    rl.setMouseCursor(.pointing_hand);
+                    desktop.setCursor(.pointing_hand);
                 } else if (over_row) {
                     hovered = .{ .process_index = index };
                 }
@@ -1557,6 +1501,19 @@ fn renderTimeline(
                     paintBarLabel(app, process, index, session.metadataBytes(), b, look);
                     paintSelectedBarBorder(app, index, b);
                 }
+                if (comptime build_options.automation) {
+                    var id_buffer: [96]u8 = undefined;
+                    const id = std.fmt.bufPrint(&id_buffer, "process/{d}/{d}", .{ process.pid, process.start_ns }) catch unreachable;
+                    zrct.add(.{ .id = id, .role = "row", .label = process.rowNameSlice(), .bounds = .from(row_box), .clip = .from(box), .parent = "timeline", .selected = app.selected_process == index });
+                    if (button) |control| {
+                        var button_id: [128]u8 = undefined;
+                        zrct.add(.{ .id = std.fmt.bufPrint(&button_id, "disclosure/{s}", .{id}) catch unreachable, .role = "button", .label = "Expand or collapse process", .bounds = .from(control.hit_box), .clip = .from(box), .parent = id, .expanded = !process_tree.isRowCollapsed(app, collapse_target.?) });
+                    }
+                    if (bar) |b| {
+                        var bar_id: [128]u8 = undefined;
+                        zrct.add(.{ .id = std.fmt.bufPrint(&bar_id, "bar/{s}", .{id}) catch unreachable, .role = "geometry", .bounds = .from(b), .clip = .from(box), .parent = id, .interactive = false });
+                    }
+                }
                 if (button) |control| {
                     paintCollapseButton(
                         control,
@@ -1589,9 +1546,9 @@ fn renderTimeline(
                     !over_scrollbar and !over_hscroll and
                     mouse.x >= row_box.x and mouse.x <= row_box.x + row_box.width and
                     mouse.y >= slot_top and mouse.y < slot_top + slot_h;
-                rl.drawRectangleRec(
+                graphics.rectangle(
                     .init(row_box.x, row_box.y, row_box.width, row_box.height),
-                    toRaylibColor(if (over_slot) .{
+                    toColor(if (over_slot) .{
                         30,
                         42,
                         66,
@@ -1636,6 +1593,10 @@ fn renderTimeline(
                         },
                     );
                     if (bar) |b| {
+                        if (comptime build_options.automation) {
+                            var id_buffer: [96]u8 = undefined;
+                            zrct.add(.{ .id = std.fmt.bufPrint(&id_buffer, "process/{d}/{d}", .{ process.pid, process.start_ns }) catch unreachable, .role = "row", .label = process.rowNameSlice(), .bounds = .from(b), .clip = .from(box), .parent = "timeline", .selected = app.selected_process == index });
+                        }
                         if (b.width <= 2) {
                             const px_f = @floor(b.x - timeline_x);
                             if (px_f >= 0) {
@@ -1679,7 +1640,7 @@ fn renderTimeline(
                 }
                 for (app.packed_touched_columns.items) |px| {
                     const index = app.packed_columns.items[px] orelse continue;
-                    rl.drawRectangleRec(
+                    graphics.rectangle(
                         .init(
                             timeline_x + @as(f32, @floatFromInt(px)),
                             y,
@@ -1703,7 +1664,7 @@ fn renderTimeline(
                 else
                     false;
                 if (over_row and !over_button) can_retain_previous = true;
-                if (over_button) rl.setMouseCursor(.pointing_hand);
+                if (over_button) desktop.setCursor(.pointing_hand);
                 if (button) |control| {
                     paintCollapseButton(
                         control,
@@ -1729,11 +1690,10 @@ fn renderTimeline(
     }
 
     if (needs_hscroll) {
-        rl.drawRectangleRounded(
+        graphics.roundedRectangle(
             .init(h_track.x, h_track.y, h_track.width, h_track.height),
             0.5,
-            4,
-            toRaylibColor(.{
+            toColor(.{
                 12,
                 18,
                 32,
@@ -1761,19 +1721,17 @@ fn renderTimeline(
                 110,
                 255,
             };
-        rl.drawRectangleRounded(
+        graphics.roundedRectangle(
             .init(h_thumb_draw_x, h_thumb.y, h_thumb.width, h_thumb.height),
             0.5,
-            4,
-            toRaylibColor(h_color),
+            toColor(h_color),
         );
     }
     if (needs_scroll) {
-        rl.drawRectangleRounded(
+        graphics.roundedRectangle(
             .init(track.x, track.y, track.width, track.height),
             0.5,
-            4,
-            toRaylibColor(.{
+            toColor(.{
                 12,
                 18,
                 32,
@@ -1801,14 +1759,13 @@ fn renderTimeline(
                 110,
                 255,
             };
-        rl.drawRectangleRounded(
+        graphics.roundedRectangle(
             .init(thumb.x, thumb.y, thumb.width, thumb.height),
             0.5,
-            4,
-            toRaylibColor(thumb_color),
+            toColor(thumb_color),
         );
     }
-    rl.endScissorMode();
+    graphics.endClip();
     // The caller draws the tooltip after every other layer so it stays on top.
     return .{
         .target = hovered,
@@ -1821,8 +1778,8 @@ const tooltip_max_width: f32 = 560;
 // enough to swallow the first and last text rows.
 const tooltip_corner_radius: f32 = 4;
 // `numerator / denominator` as f32 for scrollbar geometry; 0 when empty.
-fn processColor(has_children: bool, active: bool) rl.Color {
-    return toRaylibColor(if (has_children)
+fn processColor(has_children: bool, active: bool) graphics.Color {
+    return toColor(if (has_children)
         if (active) blue_bright else blue
     else if (active)
         yellow_bright
@@ -1830,13 +1787,13 @@ fn processColor(has_children: bool, active: bool) rl.Color {
         yellow);
 }
 
-fn barNameInk(kind: tracer.NameKind, has_children: bool) rl.Color {
-    var color = toRaylibColor(if (has_children) ink else canvas);
+fn barNameInk(kind: tracer.NameKind, has_children: bool) graphics.Color {
+    var color = toColor(if (has_children) ink else canvas);
     if (kind == .other) color.a = 205;
     return color;
 }
 
-fn pointInBox(point: rl.Vector2, box: clay.BoundingBox) bool {
+fn pointInBox(point: graphics.Point, box: clay.BoundingBox) bool {
     return point.x >= box.x and point.x <= box.x + box.width and
         point.y >= box.y and point.y <= box.y + box.height;
 }
@@ -1847,12 +1804,10 @@ fn measureText(
     fonts: *const FontBook,
 ) clay.Dimensions {
     const font = fonts.get(config.font_id);
-    var buffer: [text_buffer_capacity]u8 = undefined;
-    const measured = rl.measureTextEx(
-        font,
-        nullTerminate(value, &buffer),
+    const measured = font.measure(
+        value,
         @floatFromInt(config.font_size),
-        raylibSpacing(font, config.font_size, config.letter_spacing),
+        fontSpacing(config.letter_spacing),
     );
     return .{ .w = measured.x, .h = measured.y };
 }
@@ -1860,7 +1815,7 @@ fn measureText(
 fn renderClay(commands: []const clay.RenderCommand, fonts: *const FontBook) void {
     for (commands) |command| {
         const box = command.bounding_box;
-        const rectangle = rl.Rectangle.init(box.x, box.y, box.width, box.height);
+        const rectangle = graphics.Rect.init(box.x, box.y, box.width, box.height);
         switch (command.command_type) {
             .none, .image, .custom => {},
             .rectangle => {
@@ -1870,38 +1825,30 @@ fn renderClay(commands: []const clay.RenderCommand, fonts: *const FontBook) void
                     @max(data.corner_radius.bottom_left, data.corner_radius.bottom_right),
                 );
                 if (radius > 0) {
-                    rl.drawRectangleRounded(
+                    graphics.roundedRectangle(
                         rectangle,
                         rectangleRoundness(box, radius),
-                        12,
-                        toRaylibColor(data.background_color),
+                        toColor(data.background_color),
                     );
                 } else {
-                    rl.drawRectangleRec(rectangle, toRaylibColor(data.background_color));
+                    graphics.rectangle(rectangle, toColor(data.background_color));
                 }
             },
             .text => {
                 const data = command.render_data.text;
                 const font = fonts.get(data.font_id);
                 const value = data.string_contents.chars[0..@intCast(data.string_contents.length)];
-                var buffer: [text_buffer_capacity]u8 = undefined;
-                rl.drawTextEx(
-                    font,
-                    nullTerminate(value, &buffer),
+                font.draw(
+                    value,
                     .{ .x = box.x, .y = box.y },
                     @floatFromInt(data.font_size),
-                    raylibSpacing(font, data.font_size, data.letter_spacing),
-                    toRaylibColor(data.text_color),
+                    fontSpacing(data.letter_spacing),
+                    toColor(data.text_color),
                 );
             },
             .border => renderBorder(box, command.render_data.border),
-            .scissor_start => rl.beginScissorMode(
-                @intFromFloat(box.x),
-                @intFromFloat(box.y),
-                @intFromFloat(box.width),
-                @intFromFloat(box.height),
-            ),
-            .scissor_end => rl.endScissorMode(),
+            .scissor_start => graphics.beginClip(.init(box.x, box.y, box.width, box.height)),
+            .scissor_end => graphics.endClip(),
         }
     }
 }
@@ -1909,36 +1856,35 @@ fn renderClay(commands: []const clay.RenderCommand, fonts: *const FontBook) void
 fn renderBorder(box: clay.BoundingBox, data: clay.BorderRenderData) void {
     const width = data.width;
     const radius = data.corner_radius.top_left;
-    const color = toRaylibColor(data.color);
-    const rectangle = rl.Rectangle.init(box.x, box.y, box.width, box.height);
+    const color = toColor(data.color);
+    const rectangle = graphics.Rect.init(box.x, box.y, box.width, box.height);
     const uniform_width = width.left > 0 and
         width.left == width.right and width.left == width.top and width.left == width.bottom;
     if (radius > 0 and uniform_width) {
-        rl.drawRectangleRoundedLinesEx(
+        graphics.roundedOutline(
             rectangle,
             rectangleRoundness(box, radius),
-            12,
             @floatFromInt(width.left),
             color,
         );
         return;
     }
     if (width.left > 0) {
-        rl.drawRectangleRec(.init(box.x, box.y, @floatFromInt(width.left), box.height), color);
+        graphics.rectangle(.init(box.x, box.y, @floatFromInt(width.left), box.height), color);
     }
     if (width.right > 0) {
         const thickness: f32 = @floatFromInt(width.right);
-        rl.drawRectangleRec(
+        graphics.rectangle(
             .init(box.x + box.width - thickness, box.y, thickness, box.height),
             color,
         );
     }
     if (width.top > 0) {
-        rl.drawRectangleRec(.init(box.x, box.y, box.width, @floatFromInt(width.top)), color);
+        graphics.rectangle(.init(box.x, box.y, box.width, @floatFromInt(width.top)), color);
     }
     if (width.bottom > 0) {
         const thickness: f32 = @floatFromInt(width.bottom);
-        rl.drawRectangleRec(
+        graphics.rectangle(
             .init(box.x, box.y + box.height - thickness, box.width, thickness),
             color,
         );
@@ -1950,63 +1896,16 @@ fn rectangleRoundness(box: clay.BoundingBox, radius: f32) f32 {
     return if (shortest_side > 0) @min(1, (radius * 2) / shortest_side) else 0;
 }
 
-fn raylibSpacing(_: rl.Font, _: u16, letter_spacing: u16) f32 {
+fn fontSpacing(letter_spacing: u16) f32 {
     return @floatFromInt(letter_spacing);
 }
 
-// Inter Regular and Bold, SIL OFL 1.1. The 64px source atlases keep small text
-// sharp when raylib downsamples it to each UI size.
-const ui_font_ttf = @embedFile("fonts/Inter-Regular.ttf");
-const row_font_ttf = @embedFile("fonts/Inter-Bold.ttf");
-const footer_font_ttf = footer_font.ttf;
-const ui_font_atlas_size: i32 = 64;
-
-const extra_codepoints = [_]i32{
-    0x2013, // –
-    0x2014, // —
-    0x2022, // •
-    0x2026, // …
-    0x2192, // →
-    0x25B8, // ▸
-    0x2260, // ≠
-};
-
-fn loadFonts() FontBook {
-    return .{
-        .ui = loadEmbeddedFont(ui_font_ttf, ui_font_atlas_size),
-        .row = loadEmbeddedFont(row_font_ttf, ui_font_atlas_size),
-        .footer = loadEmbeddedFont(footer_font_ttf, ui_font_atlas_size),
-    };
-}
-
-fn loadEmbeddedFont(ttf: []const u8, font_size: i32) rl.Font {
-    var codepoints: [256]i32 = undefined;
-    var count: usize = 0;
-    var cp: i32 = 32;
-    while (cp < 127) : (cp += 1) {
-        codepoints[count] = cp;
-        count += 1;
-    }
-    cp = 160;
-    while (cp < 256) : (cp += 1) {
-        codepoints[count] = cp;
-        count += 1;
-    }
-    for (extra_codepoints) |extra| {
-        codepoints[count] = extra;
-        count += 1;
-    }
-    const font = rl.loadFontFromMemory(".ttf", ttf, font_size, codepoints[0..count]) catch {
-        return rl.getFontDefault() catch unreachable;
-    };
-    rl.setTextureFilter(font.texture, .bilinear);
-    return font;
-}
-
-fn unloadEmbeddedFont(font: rl.Font) void {
-    const fallback = rl.getFontDefault() catch return;
-    if (font.texture.id == fallback.texture.id) return;
-    rl.unloadFont(font);
+fn loadFonts(gpa: Allocator) Font.InitError!FontBook {
+    var ui = try Font.init(gpa, @embedFile("fonts/Inter-Regular.ttf"));
+    errdefer ui.deinit();
+    var row = try Font.init(gpa, @embedFile("fonts/Inter-Bold.ttf"));
+    errdefer row.deinit();
+    return .{ .ui = ui, .row = row, .footer = try Font.init(gpa, footer_font.ttf) };
 }
 
 test "window metrics notice framebuffer-only DPI changes" {
@@ -2549,6 +2448,8 @@ test "GUI save skips an existing default without replacing it" {
 
 // Imports used only by main are not analyzed by the test runner.
 test {
+    _ = desktop;
+    _ = graphics;
     _ = cli;
     _ = tracer;
     _ = page_layout;

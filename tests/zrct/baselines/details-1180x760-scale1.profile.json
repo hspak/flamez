@@ -1,0 +1,20 @@
+{
+  "fonts": {
+    "Lato-Regular.ttf": "6f6940be0835c3ddec9199e5fc42be4cbc61ebcfd58c623fdf719366253f1780",
+    "Lato-Bold.ttf": "bf1b8130069b44b9148eeece35e5423bedac49777ba746615b826b8276574a7b",
+    "Hack-Regular.ttf": "15f55cc0c85a2988d2b4b3a8cdb5d77fdfbaf319e1bb5309d725db9818fb7125",
+    "NotoColorEmoji.ttf": "72a635cb3d2f3524c51620cdde406b217204e8a6a06c6a096ff8ed4b5fd6e27b"
+  },
+  "rendering": {
+    "name": "weston-gl-llvmpipe",
+    "width": 1280,
+    "height": 800,
+    "scale": 1
+  },
+  "renderer": {
+    "vendor": "Mesa",
+    "device": "llvmpipe (LLVM 22.1.8, 256 bits)",
+    "version": "4.6 (Core Profile) Mesa 26.2.3-arch1.1"
+  },
+  "image_tool": "Version: ImageMagick 7.1.2-32 Q16-HDRI x86_64 68f8d115a:20260926 https://imagemagick.org"
+}

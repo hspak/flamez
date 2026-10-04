@@ -5,7 +5,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const clay = @import("zclay");
-const rl = @import("raylib");
+const graphics = @import("graphics.zig");
+const desktop = @import("desktop.zig");
+const Font = @import("Font.zig");
 const App = @import("App.zig");
 const page_layout = @import("layout.zig");
 const process_info = @import("process_info.zig");
@@ -32,7 +34,7 @@ const danger = theme.danger;
 const faint = theme.faint;
 const ink = theme.ink;
 const muted = theme.muted;
-const toRaylibColor = theme.toRaylibColor;
+const toColor = theme.toColor;
 const drawClippedAt = text.drawClippedAt;
 const drawTextSlice = text.draw;
 const drawTextSliceClipped = text.drawClipped;
@@ -40,9 +42,9 @@ const formatDuration = text.formatDuration;
 const measureTextSlice = text.measure;
 
 pub const Input = struct {
-    font: rl.Font,
-    bold_font: rl.Font,
-    mouse: rl.Vector2,
+    font: *const Font,
+    bold_font: *const Font,
+    mouse: graphics.Point,
     wheel: f32,
     clicked: bool,
     host_cpu_count: usize,
@@ -123,24 +125,24 @@ pub fn cpuGraphCoreScale(process: *const tracer.Process, host_cpu_count: usize) 
     return @min(@ceil(@max(observed_cores, 1)), host_cores);
 }
 
-pub fn cpuGraphX(range: CpuGraphRange, at_ns: u64, plot: rl.Rectangle) f32 {
+pub fn cpuGraphX(range: CpuGraphRange, at_ns: u64, plot: graphics.Rect) f32 {
     const clipped_ns = std.math.clamp(at_ns, range.start_ns, range.end_ns);
     const offset: f64 = @floatFromInt(clipped_ns -| range.start_ns);
     const span: f64 = @floatFromInt(range.spanNs());
     return plot.x + plot.width * @as(f32, @floatCast(offset / span));
 }
 
-fn cpuGraphY(cores: f64, core_scale: f64, plot: rl.Rectangle) f32 {
+fn cpuGraphY(cores: f64, core_scale: f64, plot: graphics.Rect) f32 {
     const fraction = std.math.clamp(cores / core_scale, 0, 1);
     return plot.y + plot.height * (1 - @as(f32, @floatCast(fraction)));
 }
 
 fn drawDetailCpuGraphText(
-    font: rl.Font,
+    font: *const Font,
     value: []const u8,
-    position: rl.Vector2,
+    position: graphics.Point,
     size: f32,
-    color: rl.Color,
+    color: graphics.Color,
 ) void {
     drawTextSlice(
         font,
@@ -157,7 +159,7 @@ fn drawDetailCpuGraphText(
 fn fillCpuGraphColumns(
     slices: []const tracer.Process.CpuSlice,
     range: CpuGraphRange,
-    plot: rl.Rectangle,
+    plot: graphics.Rect,
     columns: []f32,
 ) void {
     const width = columns.len;
@@ -193,18 +195,18 @@ fn drawDetailCpuGraph(
     process_index: usize,
     now_ns: u64,
     host_cpu_count: usize,
-    font: rl.Font,
-    card: rl.Rectangle,
+    font: *const Font,
+    card: graphics.Rect,
 ) Allocator.Error!void {
-    rl.drawRectangleRounded(card, 0.04, 4, toRaylibColor(panel_raised));
-    rl.drawRectangleRoundedLinesEx(card, 0.04, 4, 1, toRaylibColor(border));
+    graphics.roundedRectangle(card, 0.04, toColor(panel_raised));
+    graphics.roundedOutline(card, 0.04, 1, toColor(border));
 
     drawDetailCpuGraphText(
         font,
         "THREAD CPU",
         .{ .x = card.x + 10, .y = card.y + 8 },
         detail_cpu_graph_label_size,
-        toRaylibColor(ink),
+        toColor(ink),
     );
     const core_scale = cpuGraphCoreScale(process, host_cpu_count);
     var scale_buffer: [32]u8 = undefined;
@@ -219,7 +221,7 @@ fn drawDetailCpuGraph(
         scale_label,
         .{ .x = card.x + card.width - scale_size.x - 10, .y = card.y + 8 },
         detail_cpu_graph_label_size,
-        toRaylibColor(cpu_hot),
+        toColor(cpu_hot),
     );
     drawTextSliceClipped(
         "ALL THREADS · FULL PROCESS RANGE · SESSION TIME",
@@ -227,25 +229,25 @@ fn drawDetailCpuGraph(
             .font = font,
             .position = .{ .x = @round(card.x + 10), .y = @round(card.y + 25) },
             .size = detail_cpu_graph_label_size,
-            .color = toRaylibColor(faint),
+            .color = toColor(faint),
             .max_width = card.width - 20,
         },
     );
 
-    const plot = rl.Rectangle.init(card.x + 42, card.y + 49, card.width - 52, 88);
-    rl.drawRectangleRec(plot, toRaylibColor(canvas));
-    const grid_color = toRaylibColor(border);
+    const plot = graphics.Rect.init(card.x + 42, card.y + 49, card.width - 52, 88);
+    graphics.rectangle(plot, toColor(canvas));
+    const grid_color = toColor(border);
     for (0..3) |tick| {
         const fraction = @as(f32, @floatFromInt(tick)) / 2;
         const y = plot.y + plot.height * fraction;
-        rl.drawLineEx(
+        graphics.line(
             .{ .x = plot.x, .y = y },
             .{ .x = plot.x + plot.width, .y = y },
             1,
             grid_color,
         );
         const x = plot.x + plot.width * fraction;
-        rl.drawLineEx(
+        graphics.line(
             .{ .x = x, .y = plot.y },
             .{ .x = x, .y = plot.y + plot.height },
             1,
@@ -261,7 +263,7 @@ fn drawDetailCpuGraph(
         top_core,
         .{ .x = plot.x - top_core_size.x - 7, .y = plot.y - top_core_size.y / 2 },
         detail_cpu_graph_label_size,
-        toRaylibColor(muted),
+        toColor(muted),
     );
     const zero_size = measureTextSlice(font, "0", detail_cpu_graph_label_size);
     drawDetailCpuGraphText(
@@ -272,13 +274,13 @@ fn drawDetailCpuGraph(
             .y = plot.y + plot.height - zero_size.y / 2,
         },
         detail_cpu_graph_label_size,
-        toRaylibColor(muted),
+        toColor(muted),
     );
 
     const range = cpuGraphRange(process, now_ns);
     const baseline_y = plot.y + plot.height;
-    const fill_color = toRaylibColor(cpu_hot);
-    const area_color = rl.Color.init(fill_color.r, fill_color.g, fill_color.b, 58);
+    const fill_color = toColor(cpu_hot);
+    const area_color = graphics.Color.init(fill_color.r, fill_color.g, fill_color.b, 58);
     const width = @max(1, @as(usize, @intFromFloat(@floor(plot.width))));
     const rebuild_columns = app.graph_cache_process != process_index or
         app.graph_cache_process_revision != process.revision or
@@ -304,18 +306,18 @@ fn drawDetailCpuGraph(
             const start_x = plot.x + @as(f32, @floatFromInt(col));
             const end_x = plot.x + @as(f32, @floatFromInt(col + run));
             const y = cpuGraphY(@floatCast(cores), core_scale, plot);
-            rl.drawRectangleRec(
+            graphics.rectangle(
                 .init(start_x, y, @max(1, end_x - start_x), baseline_y - y),
                 area_color,
             );
-            rl.drawLineEx(.{ .x = start_x, .y = y }, .{ .x = end_x, .y = y }, 2, fill_color);
-            rl.drawLineEx(
+            graphics.line(.{ .x = start_x, .y = y }, .{ .x = end_x, .y = y }, 2, fill_color);
+            graphics.line(
                 .{ .x = start_x, .y = baseline_y },
                 .{ .x = start_x, .y = y },
                 2,
                 fill_color,
             );
-            rl.drawLineEx(.{ .x = end_x, .y = y }, .{ .x = end_x, .y = baseline_y }, 2, fill_color);
+            graphics.line(.{ .x = end_x, .y = y }, .{ .x = end_x, .y = baseline_y }, 2, fill_color);
             drew_slice = true;
         }
         col += run;
@@ -331,7 +333,7 @@ fn drawDetailCpuGraph(
                 .y = plot.y + (plot.height - no_samples_size.y) / 2,
             },
             detail_cpu_graph_label_size,
-            toRaylibColor(faint),
+            toColor(faint),
         );
     }
 
@@ -358,7 +360,7 @@ fn drawDetailCpuGraph(
         start_label,
         .{ .x = plot.x, .y = label_y },
         detail_cpu_graph_label_size,
-        toRaylibColor(muted),
+        toColor(muted),
     );
     if (plot.width >= 300) {
         const middle_size = measureTextSlice(font, middle_label, detail_cpu_graph_label_size);
@@ -367,7 +369,7 @@ fn drawDetailCpuGraph(
             middle_label,
             .{ .x = plot.x + (plot.width - middle_size.x) / 2, .y = label_y },
             detail_cpu_graph_label_size,
-            toRaylibColor(muted),
+            toColor(muted),
         );
     }
     const end_size = measureTextSlice(font, end_label, detail_cpu_graph_label_size);
@@ -376,7 +378,7 @@ fn drawDetailCpuGraph(
         end_label,
         .{ .x = plot.x + plot.width - end_size.x, .y = label_y },
         detail_cpu_graph_label_size,
-        toRaylibColor(muted),
+        toColor(muted),
     );
 }
 
@@ -384,11 +386,11 @@ pub fn renderTooltip(
     app: *App,
     session: *const tracer.Session,
     index: usize,
-    font: rl.Font,
-    mouse: rl.Vector2,
+    font: *const Font,
+    mouse: graphics.Point,
 ) void {
-    const screen_w: f32 = @floatFromInt(rl.getScreenWidth());
-    const screen_h: f32 = @floatFromInt(rl.getScreenHeight());
+    const screen_w: f32 = @floatFromInt(desktop.width());
+    const screen_h: f32 = @floatFromInt(desktop.height());
     const box_w = @min(tooltip_max_width, screen_w - 40);
     const inner_w = box_w - 20;
     const process = &session.processes.items[index];
@@ -453,7 +455,7 @@ pub fn renderTooltip(
     var y = mouse.y + 14;
     if (x + box_w > screen_w) x = @max(8, mouse.x - box_w - 12);
     if (y + box_h + 8 > screen_h) y = @max(8, screen_h - box_h - 8);
-    const tooltip = rl.Rectangle.init(x, y, box_w, box_h);
+    const tooltip = graphics.Rect.init(x, y, box_w, box_h);
     const roundness = rectangleRoundness(
         .{
             .x = x,
@@ -463,14 +465,9 @@ pub fn renderTooltip(
         },
         tooltip_corner_radius,
     );
-    rl.drawRectangleRounded(tooltip, roundness, 4, toRaylibColor(panel_raised));
-    rl.drawRectangleRoundedLinesEx(tooltip, roundness, 4, 1, toRaylibColor(border));
-    rl.beginScissorMode(
-        @intFromFloat(x + 1),
-        @intFromFloat(y + 1),
-        @intFromFloat(box_w - 2),
-        @intFromFloat(box_h - 2),
-    );
+    graphics.roundedRectangle(tooltip, roundness, toColor(panel_raised));
+    graphics.roundedOutline(tooltip, roundness, 1, toColor(border));
+    graphics.beginClip(.init(x + 1, y + 1, box_w - 2, box_h - 2));
     var text_y = y + 8;
     for (app.tooltip_lines[0..app.tooltip_shown], 0..) |line, line_index| {
         if (text_y > y + box_h - 8) break;
@@ -483,10 +480,10 @@ pub fn renderTooltip(
             tooltip_more_marker,
             .{ .x = x + 10, .y = text_y },
             tooltip_sizes.body,
-            toRaylibColor(muted),
+            toColor(muted),
         );
     }
-    rl.endScissorMode();
+    graphics.endClip();
 }
 
 fn thumbOffset(travel: f32, max_scroll: f32, scroll: f32) f32 {
@@ -513,8 +510,8 @@ fn utf8FloorBoundary(value: []const u8, byte_index: usize) usize {
 }
 
 fn measureDetailLinePrefix(
-    font: rl.Font,
-    bold_font: rl.Font,
+    font: *const Font,
+    bold_font: *const Font,
     line: TooltipLine,
     byte_index: usize,
 ) f32 {
@@ -535,7 +532,7 @@ fn measureDetailLinePrefix(
     return width;
 }
 
-fn detailLineHeight(font: rl.Font, bold_font: rl.Font, line: TooltipLine) f32 {
+fn detailLineHeight(font: *const Font, bold_font: *const Font, line: TooltipLine) f32 {
     const regular_height = measureTextSlice(
         font,
         if (line.text.len == 0) " " else line.text,
@@ -549,19 +546,19 @@ fn detailLineHeight(font: rl.Font, bold_font: rl.Font, line: TooltipLine) f32 {
 }
 
 fn drawDetailLinePart(
-    font: rl.Font,
+    font: *const Font,
     value: []const u8,
     x: *f32,
     y: f32,
     size: f32,
-    color: rl.Color,
+    color: graphics.Color,
 ) void {
     if (value.len == 0) return;
     drawTextSlice(font, value, .{ .x = x.*, .y = y }, size, color);
     x.* += measureTextSlice(font, value, size).x;
 }
 
-fn drawDetailLine(font: rl.Font, bold_font: rl.Font, line: TooltipLine, position: rl.Vector2) void {
+fn drawDetailLine(font: *const Font, bold_font: *const Font, line: TooltipLine, position: graphics.Point) void {
     var x = position.x;
     var byte_index: usize = 0;
     if (line.bold) |bold| {
@@ -599,14 +596,14 @@ fn drawDetailLine(font: rl.Font, bold_font: rl.Font, line: TooltipLine, position
             &x,
             position.y,
             line.size,
-            toRaylibColor(accent),
+            toColor(accent),
         );
         byte_index = highlight.end;
     }
     drawDetailLinePart(font, line.text[byte_index..], &x, position.y, line.size, line.color);
 }
 
-fn detailByteAtX(font: rl.Font, bold_font: rl.Font, line: TooltipLine, x: f32) usize {
+fn detailByteAtX(font: *const Font, bold_font: *const Font, line: TooltipLine, x: f32) usize {
     if (x <= 0 or line.text.len == 0) return 0;
     if (measureDetailLinePrefix(font, bold_font, line, line.text.len) <= x) return line.text.len;
     var low: usize = 0;
@@ -624,9 +621,9 @@ fn detailByteAtX(font: rl.Font, bold_font: rl.Font, line: TooltipLine, x: f32) u
 
 fn detailPositionAt(
     app: *const App,
-    font: rl.Font,
-    bold_font: rl.Font,
-    mouse: rl.Vector2,
+    font: *const Font,
+    bold_font: *const Font,
+    mouse: graphics.Point,
     content: clay.BoundingBox,
     pad: f32,
     leading_height: f32,
@@ -708,14 +705,14 @@ fn copyTextSelection(app: *App) void {
     }
     if (clipboard_len == 0) return;
     app.detail_clipboard[clipboard_len] = 0;
-    rl.setClipboardText(app.detail_clipboard[0..clipboard_len :0]);
+    desktop.setClipboardText(app.detail_clipboard[0..clipboard_len :0]);
 }
 
 fn drawTextSelection(
     app: *const App,
     selection: ?TextSelection,
-    font: rl.Font,
-    bold_font: rl.Font,
+    font: *const Font,
+    bold_font: *const Font,
     line_index: usize,
     text_x: f32,
     text_y: f32,
@@ -729,17 +726,17 @@ fn drawTextSelection(
     if (start >= end) return;
     const start_x = measureDetailLinePrefix(font, bold_font, line, start);
     const end_x = measureDetailLinePrefix(font, bold_font, line, end);
-    rl.drawRectangleRec(
+    graphics.rectangle(
         .init(text_x + start_x, text_y, @max(1, end_x - start_x), line_height),
-        rl.Color.init(55, 105, 170, 170),
+        graphics.Color.init(55, 105, 170, 170),
     );
 }
 
-fn drawDetailCloseButton(font: rl.Font, mouse: rl.Vector2, box: clay.BoundingBox) void {
+fn drawDetailCloseButton(font: *const Font, mouse: graphics.Point, box: clay.BoundingBox) void {
     const hovered = pointInBox(mouse, box);
-    const color = toRaylibColor(if (hovered) danger else border);
-    const button = rl.Rectangle.init(box.x, box.y, box.width, box.height);
-    rl.drawRectangleRounded(button, 0.25, 4, color);
+    const color = toColor(if (hovered) danger else border);
+    const button = graphics.Rect.init(box.x, box.y, box.width, box.height);
+    graphics.roundedRectangle(button, 0.25, color);
 
     const label = "X";
     const measured = measureTextSlice(font, label, 11);
@@ -751,15 +748,15 @@ fn drawDetailCloseButton(font: rl.Font, mouse: rl.Vector2, box: clay.BoundingBox
             .y = box.y + (box.height - measured.y) / 2,
         },
         11,
-        if (hovered) toRaylibColor(canvas) else toRaylibColor(ink),
+        if (hovered) toColor(canvas) else toColor(ink),
     );
 }
 
 fn ctrlHeld() bool {
-    return rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
+    return desktop.keyDown(.left_control) or desktop.keyDown(.right_control);
 }
 
-fn pointInBox(point: rl.Vector2, box: clay.BoundingBox) bool {
+fn pointInBox(point: graphics.Point, box: clay.BoundingBox) bool {
     return point.x >= box.x and point.x <= box.x + box.width and
         point.y >= box.y and point.y <= box.y + box.height;
 }
@@ -802,9 +799,9 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
         .height = detail_resize_handle_height,
     };
     const over_resize_handle = pointInBox(mouse, resize_handle);
-    const left_down = rl.isMouseButtonDown(.left);
+    const left_down = desktop.buttonDown(.left);
     if (!left_down) app.detail_resize_dragging = false;
-    if (app.detail_resize_dragging or over_resize_handle) rl.setMouseCursor(.resize_ns);
+    if (app.detail_resize_dragging or over_resize_handle) desktop.setCursor(.resize_ns);
     if (clicked and over_resize_handle) {
         app.detail_resize_dragging = true;
         app.detail_dragging = false;
@@ -812,7 +809,7 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
         app.detail_text_focused = false;
     }
     if (app.detail_resize_dragging) {
-        const page_height = @as(f32, @floatFromInt(rl.getScreenHeight())) -
+        const page_height = @as(f32, @floatFromInt(desktop.height())) -
             page_layout.process_row_height;
         const max_height = @max(detail_min_height, page_height - timeline_min_height - 1);
         app.detail_pane_height = std.math.clamp(
@@ -841,10 +838,10 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
         .height = @max(0, box.height - header_height - 1),
     };
 
-    rl.drawRectangleRec(.init(box.x, box.y, box.width, header_height), toRaylibColor(panel_raised));
-    rl.drawRectangleRec(
+    graphics.rectangle(.init(box.x, box.y, box.width, header_height), toColor(panel_raised));
+    graphics.rectangle(
         .init(box.x, box.y - 1, box.width, 2),
-        toRaylibColor(if (app.detail_resize_dragging or over_resize_handle)
+        toColor(if (app.detail_resize_dragging or over_resize_handle)
             .{
                 92,
                 151,
@@ -864,7 +861,7 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
             .y = box.y + (header_height - header_title_size.y) / 2,
         },
         12,
-        toRaylibColor(muted),
+        toColor(muted),
     );
     const index = selected.?;
 
@@ -956,7 +953,7 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
     const over_content = pointInBox(mouse, content);
     const metadata_y = content.y + pad + leading_height - app.detail_scroll_px;
     const over_metadata = over_content and mouse.y >= metadata_y;
-    if (over_metadata and !over_track) rl.setMouseCursor(.ibeam);
+    if (over_metadata and !over_track) desktop.setCursor(.ibeam);
     const over_thumb = clay.BoundingBox{
         .x = track.x,
         .y = track.y + thumbOffset(thumb_travel, max_scroll, app.detail_scroll_px),
@@ -989,10 +986,10 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
         app.detail_scroll_px = std.math.clamp(app.detail_scroll_px - wheel * 48, 0, max_scroll);
     }
     if (over_content) {
-        if (rl.isKeyPressed(.page_up)) app.detail_scroll_px -= view_h;
-        if (rl.isKeyPressed(.page_down)) app.detail_scroll_px += view_h;
-        if (rl.isKeyPressed(.home)) app.detail_scroll_px = 0;
-        if (rl.isKeyPressed(.end)) app.detail_scroll_px = max_scroll;
+        if (desktop.keyPressed(.page_up)) app.detail_scroll_px -= view_h;
+        if (desktop.keyPressed(.page_down)) app.detail_scroll_px += view_h;
+        if (desktop.keyPressed(.home)) app.detail_scroll_px = 0;
+        if (desktop.keyPressed(.end)) app.detail_scroll_px = max_scroll;
     }
     app.detail_scroll_px = std.math.clamp(app.detail_scroll_px, 0, max_scroll);
 
@@ -1032,7 +1029,7 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
         }
     }
     if (app.detail_text_focused and ctrlHeld()) {
-        if (rl.isKeyPressed(.a) and app.detail_line_count > 0) {
+        if (desktop.keyPressed(.a) and app.detail_line_count > 0) {
             const last_line = app.detail_line_count - 1;
             app.detail_selection_anchor = .{ .line = 0, .byte = 0 };
             app.detail_selection_focus = .{
@@ -1040,15 +1037,10 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
                 .byte = app.detail_lines[last_line].text.len,
             };
         }
-        if (rl.isKeyPressed(.c)) copyTextSelection(app);
+        if (desktop.keyPressed(.c)) copyTextSelection(app);
     }
 
-    rl.beginScissorMode(
-        @intFromFloat(content.x),
-        @intFromFloat(content.y),
-        @intFromFloat(content.width),
-        @intFromFloat(content.height),
-    );
+    graphics.beginClip(.init(content.x, content.y, content.width, content.height));
     const selection = detailTextSelection(app);
     const graph_y = content.y + pad - app.detail_scroll_px;
     if (graph_y + detail_cpu_graph_height >= content.y and
@@ -1075,14 +1067,13 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
         text_y += line_h + detail_line_gap;
         if (text_y > content.y + content.height) break;
     }
-    rl.endScissorMode();
+    graphics.endClip();
 
     if (needs_scrollbar) {
-        rl.drawRectangleRounded(
+        graphics.roundedRectangle(
             .init(track.x, track.y, track.width, track.height),
             0.5,
-            4,
-            toRaylibColor(.{
+            toColor(.{
                 12,
                 18,
                 32,
@@ -1111,11 +1102,10 @@ pub fn render(app: *App, session: *const tracer.Session, input: Input) Allocator
                 255,
             };
         const thumb_y = track.y + thumbOffset(thumb_travel, max_scroll, app.detail_scroll_px);
-        rl.drawRectangleRounded(
+        graphics.roundedRectangle(
             .init(track.x, thumb_y, track.width, thumb_height),
             0.5,
-            4,
-            toRaylibColor(thumb_color),
+            toColor(thumb_color),
         );
     }
     drawDetailCloseButton(font, mouse, close_box);

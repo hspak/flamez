@@ -1,29 +1,28 @@
-//! Text glue over raylib fonts: measure/draw helpers that take plain slices
-//! (raylib wants NUL-terminated strings), plus duration labels shared by the
-//! header stats, timeline ticks, and process info blocks.
+//! Shared UTF-8 measurement, drawing, clipping, and duration labels.
 
 const std = @import("std");
-const rl = @import("raylib");
+const graphics = @import("graphics.zig");
+const Font = @import("Font.zig");
 
 pub const buffer_capacity = 8192;
 
 pub const ui_glyph_spacing: f32 = 0;
 
 pub const ClipOptions = struct {
-    font: rl.Font,
-    position: rl.Vector2,
+    font: *const Font,
+    position: graphics.Point,
     size: f32,
-    color: rl.Color,
+    color: graphics.Color,
     max_width: f32,
 };
 
 pub const ClipLineOptions = struct {
     x: *f32,
     right: f32,
-    font: rl.Font,
+    font: *const Font,
     y: f32,
     size: f32,
-    color: rl.Color,
+    color: graphics.Color,
 };
 
 /// Copies `text` and appends a sentinel. Asserts that `buffer` has at least
@@ -48,24 +47,20 @@ pub fn formatDuration(ns: u64, buffer: []u8) []const u8 {
     return std.fmt.bufPrint(buffer, "{d:.2} s", .{seconds}) catch "0 s";
 }
 
-/// Measures a plain slice through raylib's sentinel-based API.
-/// Asserts through `nullTerminate` that `value.len` is below `buffer_capacity`.
-pub fn measure(font: rl.Font, value: []const u8, size: f32) rl.Vector2 {
-    var buffer: [buffer_capacity]u8 = undefined;
-    return rl.measureTextEx(font, nullTerminate(value, &buffer), size, ui_glyph_spacing);
+/// Measures a UTF-8 slice with the same glyph metrics used for drawing.
+pub fn measure(font: *const Font, value: []const u8, size: f32) graphics.Point {
+    return font.measure(value, size, ui_glyph_spacing);
 }
 
-/// Draws a plain slice through raylib's sentinel-based API.
-/// Asserts through `nullTerminate` that `value.len` is below `buffer_capacity`.
+/// Draws a UTF-8 slice using the embedded font atlas.
 pub fn draw(
-    font: rl.Font,
+    font: *const Font,
     value: []const u8,
-    position: rl.Vector2,
+    position: graphics.Point,
     size: f32,
-    color: rl.Color,
+    color: graphics.Color,
 ) void {
-    var buffer: [buffer_capacity]u8 = undefined;
-    rl.drawTextEx(font, nullTerminate(value, &buffer), position, size, ui_glyph_spacing, color);
+    font.draw(value, position, size, ui_glyph_spacing, color);
 }
 
 /// Draws as much of `value` as fits and advances `options.x` by the visible width.
@@ -88,44 +83,9 @@ pub fn drawClipped(value: []const u8, options: ClipOptions) void {
 
 fn drawClippedWidth(value: []const u8, options: ClipOptions) f32 {
     if (options.max_width <= 4 or value.len == 0) return 0;
-    var buffer: [buffer_capacity]u8 = undefined;
-    const max_len: usize = @min(value.len, buffer.len - 1);
-    var low: usize = 0;
-    var high: usize = max_len;
-    var width: f32 = 0;
-    while (low < high) {
-        const length = low + (high - low + 1) / 2;
-        const measured = rl.measureTextEx(
-            options.font,
-            nullTerminate(value[0..length], &buffer),
-            options.size,
-            ui_glyph_spacing,
-        ).x;
-        if (measured <= options.max_width) {
-            low = length;
-            width = measured;
-        } else {
-            high = length - 1;
-        }
-    }
-    while (low > 0 and low < value.len and (value[low] & 0xc0) == 0x80) low -= 1;
-    if (low == 0) return 0;
-    const slice = value[0..low];
-    width = rl.measureTextEx(
-        options.font,
-        nullTerminate(slice, &buffer),
-        options.size,
-        ui_glyph_spacing,
-    ).x;
-    rl.drawTextEx(
-        options.font,
-        nullTerminate(slice, &buffer),
-        options.position,
-        options.size,
-        ui_glyph_spacing,
-        options.color,
-    );
-    return width;
+    const prefix = options.font.fit(value, options.size, options.max_width);
+    options.font.draw(value[0..prefix.len], options.position, options.size, ui_glyph_spacing, options.color);
+    return prefix.width;
 }
 
 test "formatDuration renders µs, ms, and s" {

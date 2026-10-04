@@ -7,7 +7,7 @@ ran. Red slices over that bar show intervals in which threads belonging to the
 process consumed CPU. Capture is platform-specific: Linux requires the eBPF
 backend, while macOS prefers exact Endpoint Security capture and otherwise
 uses a best-effort kqueue/libproc recovery backend. The UI is immediate-mode
-[Clay](https://github.com/nicbarker/clay) layout rendered by raylib.
+[Clay](https://github.com/nicbarker/clay) layout rendered by SDL3.
 
 This document describes the runtime, persistence, replay, and analysis
 architecture. For usage, see [README.md](README.md). For the eBPF load/attach
@@ -21,7 +21,7 @@ derived analysis output live under [`schema/`](schema/).
 ```
 src/cli.zig → src/main.zig
                   ├── live capture → Collector → Session + Process model
-                  │                                  ├── Clay/raylib GUI
+                  │                                  ├── Clay/SDL3 GUI
                   │                                  └── session_file.write
                   ├── import → session_file.read → finished Session → GUI
                   └── analyze → session_file.read → analysis_file.write
@@ -223,7 +223,7 @@ The raw tracepoint choice, event and map schemas, trust checks, capabilities,
 loss behavior, and Linux-version constraints are specified in
 [EBPF.md](EBPF.md).
 
-### `src/main.zig` — interaction, Clay layout, raylib rendering
+### `src/main.zig` — interaction, Clay layout, SDL3 rendering
 
 The UI is split between two rendering strategies:
 
@@ -231,15 +231,15 @@ The UI is split between two rendering strategies:
    and selected-process pane).
    Each frame `createLayout()` declares the whole tree declaratively; Clay
    computes boxes and returns `RenderCommand`s which `renderClay()` plays back
-   onto raylib (rectangles, borders, text, scissors).
-   Text measurement is delegated to raylib through the
+   onto SDL3 (rectangles, borders, text, scissors).
+   Text measurement uses the embedded FreeType atlas metrics through the
    `setMeasureTextFunction` callback so layout matches what is drawn. Normal
    chrome uses Inter, while the footer's live metrics use Roboto Mono so digit
    updates retain stable glyph widths.
 2. **Hand-drawn timeline** (the flamegraph itself). The layout reserves a
    `TimelineViewport` placeholder element; after `clay.endLayout()`,
    `renderTimeline()` fetches its computed `BoundingBox` via
-   `clay.getElementData` and draws directly with raylib inside a scissor rect:
+   `clay.getElementData` and draws directly with SDL3 inside a scissor rect:
    one-row header with five duration ticks, alternating row shading, normalized
    lifetime bars, and red self-CPU slices along the bottom of each bar. Red
    means CPU activity, not an error. Hover metadata describes the process;
@@ -333,7 +333,7 @@ diagnostics for malformed input.
 Named-path writes use an atomic temporary file and support either exclusive
 installation for automatic GUI names or replacement for explicit output.
 Validation and metadata-table preparation complete before the writer emits its
-first byte. The reader and writer are independent of raylib and the platform
+first byte. The reader and writer are independent of SDL3 and the platform
 collector, so imports and round-trip tests require neither a window nor
 capture privileges.
 
@@ -551,19 +551,20 @@ fields and privacy contract.
 ## Frame-by-frame data flow
 
 ```
-per live frame (vsync, main thread; completed captures drop to a low idle rate):
-  1. read mouse/wheel/keys            (raylib)
-  2. feed Clay pointer + scroll state
-  3. session.update(&collector) when capturing
+per loop (main thread; completed captures skip unchanged draws):
+  1. service automation and pump ordered SDL3 events
+  2. session.update(&collector) when capturing
        ├─ advance elapsed_ns
        ├─ collector.pollEvents() → N × consumeEvent()
        ├─ if cpu_sample_period_ns elapsed: one CPU snapshot array
        └─ process_ops.waitNowait(root) → exit_code/signal or still-running
-  4. format counters/status into ViewText (stack)
+  3. wait if unchanged/minimized or before the next frame-start deadline
+  4. feed Clay input; format counters/status into ViewText (stack)
   5. createLayout() → clay.endLayout() → render commands
-  6. renderClay(commands)              (raylib)
-  7. renderTimeline(bounding box)      (raylib, direct draws; time-culled
+  6. renderClay(commands)              (SDL3)
+  7. renderTimeline(bounding box)      (SDL3, direct draws; time-culled
      slices, pixel-aggregated CPU, packed members range-queried)
+  8. render details, capture screenshots if requested, present, consume input edges
 ```
 
 Exact lifecycle events accumulate in a backend-owned queue and are drained at
@@ -629,7 +630,9 @@ an orderly boundary exists.
   uses exact eBPF lifecycle capture. macOS uses best-effort kqueue/libproc
   capture when the runtime or signature cannot activate Endpoint Security.
 - **Dependencies** (`build.zig.zon`): `zclay` (Clay Zig bindings) and
-  `raylib-zig` built with the Wayland GLFW backend to avoid X11 fallback.
+  optional local Zrct instrumentation. System SDL3 (3.4+), FreeType and libpng
+  are linked through pkg-config, or from an explicit `-Dgui-prefix` target tree.
+  Linux defaults to Wayland; SDL owns backend selection and native app identity.
 - **eBPF build graph**: on Linux the build graph always:
   - compiles `src/flamez.bpf.c` with `clang -target bpf` and installs it to
     `share/flamez/flamez.bpf.o`;
@@ -646,15 +649,16 @@ an orderly boundary exists.
   Raw tracepoints do not read tracingfs IDs, so no DAC capability is granted.
   The dev
   artifact `zig-out/bin/flamez` intentionally stays unprivileged.
-- **macOS build graph**: Clay, raylib, the application, and the complete test root
+- **macOS build graph**: Clay, the application, and the complete test root
   target Apple silicon (`aarch64-macos`); `src/macos_shim.c` and
   `src/macos_es_shim.c` are compiled only into macOS artifacts. The pinned
   framework package supplies Apple SDK headers and libraries for cross-builds.
-  `-Dmacos-sdk` selects a complete SDK for Flamez and raylib; native builds
+  `-Dmacos-sdk` selects a complete SDK for Flamez; native builds
   currently select the installed SDK. The selected SDK also supplies Zig's
   libc header configuration, so availability checks use that SDK's version.
-  `zig build test-compile -Dtarget=aarch64-macos` validates the complete graph
-  without trying to execute a cross-built binary.
+  `zig build test-compile -Dtarget=aarch64-macos` also needs target SDL3,
+  FreeType, and libpng development files; the Linux migration did not validate
+  the native Cocoa/Metal path. See [MACOS_SDL.md](MACOS_SDL.md).
   `-Dmacos-require-endpoint-security=true` changes automatic selection to
   fail-closed exact capture for signed macOS 27 validation; it does not grant
   the restricted entitlement in `macos.entitlements`.
@@ -677,5 +681,5 @@ the renderer:
 - optional compression, binary containers, or external trace-format converters
   around the canonical session model, justified by measurements;
 - optional per-thread views (CPU is currently aggregated by TGID);
-- alternate frontends: `Session` has no raylib dependency and can drive any
+- alternate frontends: `Session` has no SDL3 dependency and can drive any
   renderer, headless dump, or TUI.

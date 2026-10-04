@@ -1,12 +1,13 @@
 //! Builds styled process information for the hover tooltip and detail pane.
 
 const std = @import("std");
-const rl = @import("raylib");
+const graphics = @import("graphics.zig");
+const Font = @import("Font.zig");
 const tracer = @import("tracer.zig");
 const text = @import("text.zig");
 const theme = @import("theme.zig");
 
-const toRaylibColor = theme.toRaylibColor;
+const toColor = theme.toColor;
 const ink = theme.ink;
 const muted = theme.muted;
 
@@ -28,7 +29,7 @@ const LineStyles = struct {
 pub const TooltipLine = struct {
     text: []const u8,
     size: f32,
-    color: rl.Color,
+    color: graphics.Color,
     bold: ?TextSpan = null,
     accent: ?TextSpan = null,
     /// Copying joins wrapped continuations and preserves only logical row breaks.
@@ -49,7 +50,7 @@ fn spanWithin(span: ?TextSpan, offset: usize, len: usize) ?TextSpan {
 /// Caller-backed builder for process-detail lines. It never allocates; text
 /// and line storage must outlive every slice returned through `lines`.
 pub const TooltipBuilder = struct {
-    font: rl.Font,
+    font: *const Font,
     inner_w: f32,
     /// Caller-owned scratch space; `intern` stops accepting text once full.
     store: []u8,
@@ -76,7 +77,7 @@ pub const TooltipBuilder = struct {
         return self.intern(value);
     }
 
-    fn add(self: *TooltipBuilder, value: []const u8, size: f32, color: rl.Color) void {
+    fn add(self: *TooltipBuilder, value: []const u8, size: f32, color: graphics.Color) void {
         if (self.line_count >= self.lines.len) {
             self.overflowed = true;
             return;
@@ -95,7 +96,7 @@ pub const TooltipBuilder = struct {
         comptime fmt: []const u8,
         args: anytype,
         size: f32,
-        color: rl.Color,
+        color: graphics.Color,
     ) void {
         if (self.line_count >= self.lines.len) {
             self.overflowed = true;
@@ -110,7 +111,7 @@ pub const TooltipBuilder = struct {
         self.line_count += 1;
     }
 
-    fn addWrapped(self: *TooltipBuilder, value: []const u8, size: f32, color: rl.Color) void {
+    fn addWrapped(self: *TooltipBuilder, value: []const u8, size: f32, color: graphics.Color) void {
         self.addWrappedStyled(value, size, color, .{});
     }
 
@@ -118,7 +119,7 @@ pub const TooltipBuilder = struct {
         self: *TooltipBuilder,
         value: []const u8,
         size: f32,
-        color: rl.Color,
+        color: graphics.Color,
         styles: LineStyles,
     ) void {
         if (self.line_count >= self.lines.len) {
@@ -147,7 +148,7 @@ pub const TooltipBuilder = struct {
         self: *TooltipBuilder,
         value: []const u8,
         size: f32,
-        color: rl.Color,
+        color: graphics.Color,
         styles: LineStyles,
     ) void {
         if (self.line_count >= self.lines.len) {
@@ -177,13 +178,13 @@ pub const TooltipBuilder = struct {
 
 /// Upper bound on bytes worth measuring for one wrapped line. Glyphs are at
 /// least 1px wide at the sizes Flamez uses, so prefixes longer than `max_width`
-/// cannot fit and must not be walked by `measureTextEx`.
+/// cannot fit and must not be walked by the font measurer.
 pub fn wrapProbeLimit(input_len: usize, max_width: f32) usize {
     const pixel_bound = @as(usize, @intFromFloat(@floor(@max(max_width, 1)))) + 1;
     return @min(input_len, @min(pixel_bound, text.buffer_capacity - 1));
 }
 
-fn wrapPrefix(font: rl.Font, input: []const u8, size: f32, max_width: f32) usize {
+fn wrapPrefix(font: *const Font, input: []const u8, size: f32, max_width: f32) usize {
     if (input.len == 0) return 0;
     const measurable_len = wrapProbeLimit(input.len, max_width);
     if (measurable_len == input.len and
@@ -221,7 +222,7 @@ fn addArguments(
     metadata: []const u8,
     arg_count: usize,
     size: f32,
-    color: rl.Color,
+    color: graphics.Color,
 ) void {
     if (tip.line_count >= tip.lines.len) {
         tip.overflowed = true;
@@ -388,7 +389,7 @@ fn addExecFields(
         tip.addWrappedStyled(
             cwd_line,
             size,
-            toRaylibColor(ink),
+            toColor(ink),
             .{
                 .bold = .{ .start = 0, .end = "Directory".len },
             },
@@ -399,7 +400,7 @@ fn addExecFields(
     // itself includes argv[0] so it can be copied and run as shown.
     const arg_count = exec.args_count -| 1;
     if (exec.args_count > 0) {
-        addArguments(tip, exec, metadata, arg_count, size, toRaylibColor(ink));
+        addArguments(tip, exec, metadata, arg_count, size, toColor(ink));
     }
 }
 
@@ -429,7 +430,7 @@ fn addExecHeader(
     tip.addWrappedStyled(
         header,
         size,
-        toRaylibColor(muted),
+        toColor(muted),
         .{
             .bold = .{ .start = 0, .end = label.len },
         },
@@ -445,7 +446,7 @@ fn addExecHistory(
     tip.addWrappedStyled(
         "EXECUTION HISTORY",
         sizes.title,
-        toRaylibColor(ink),
+        toColor(ink),
         .{ .bold = .{ .start = 0, .end = "EXECUTION HISTORY".len } },
     );
     var exec_ordinal: usize = 1;
@@ -488,14 +489,14 @@ pub fn build(
                 process.depth,
             },
             sizes.body,
-            toRaylibColor(muted),
+            toColor(muted),
         );
     } else {
         tip.addFmt(
             "PID  {d}  ·  PPID  —  ·  DEPTH  {d}",
             .{ process.pid, process.depth },
             sizes.body,
-            toRaylibColor(muted),
+            toColor(muted),
         );
     }
     if (process.origin != .observed or
@@ -519,13 +520,13 @@ pub fn build(
                 if (session.isIncomplete()) "  ·  SESSION INCOMPLETE" else "",
             },
             sizes.body,
-            toRaylibColor(theme.danger),
+            toColor(theme.danger),
         );
     }
     var timing_buf: [160]u8 = undefined;
     const timing = formatTimingLine(process, session.timelineNs(), &timing_buf);
     const timing_index = tip.line_count;
-    tip.add(timing, sizes.body, toRaylibColor(muted));
+    tip.add(timing, sizes.body, toColor(muted));
     if (tip.line_count > timing_index) layout.timing_line = timing_index;
 
     if (options.include_exec_history) {
@@ -548,15 +549,15 @@ test "TooltipBuilder interns text into caller storage" {
         .lines = &lines,
     };
 
-    tip.addFmt("pid {d}", .{42}, 12, rl.Color.white);
-    tip.add("cwd", 11, rl.Color.white);
+    tip.addFmt("pid {d}", .{42}, 12, graphics.Color.white);
+    tip.add("cwd", 11, graphics.Color.white);
 
     try testing.expectEqual(@as(usize, 2), tip.line_count);
     try testing.expectEqualStrings("pid 42", tip.lines[0].text);
     try testing.expectEqualStrings("cwd", tip.lines[1].text);
 
     tip.store_len = store.len;
-    tip.add("dropped", 12, rl.Color.white);
+    tip.add("dropped", 12, graphics.Color.white);
     try testing.expectEqual(@as(usize, 2), tip.line_count);
     try testing.expect(tip.overflowed);
 }

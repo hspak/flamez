@@ -4,7 +4,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 
 const clay = @import("zclay");
-const rl = @import("raylib");
+const desktop = @import("desktop.zig");
 const App = @import("App.zig");
 const theme = @import("theme.zig");
 const text = @import("text.zig");
@@ -57,7 +57,10 @@ pub const ViewText = struct {
 pub fn makeViewText(session: *const tracer.Session) ViewText {
     var view_text = ViewText{};
     if (comptime build_options.fps_counter) {
-        const fps = std.fmt.bufPrint(&view_text.fps, "{d} FPS", .{rl.getFPS()}) catch "0 FPS";
+        const fps = (if (desktop.idle)
+            std.fmt.bufPrint(&view_text.fps, "Idle", .{})
+        else
+            std.fmt.bufPrint(&view_text.fps, "{d} FPS", .{desktop.fps()})) catch "0 FPS";
         view_text.fps_len = fps.len;
     }
     const incomplete = session.isIncomplete();
@@ -146,7 +149,7 @@ pub fn create(
     session: *const tracer.Session,
     view_text: *const ViewText,
 ) []clay.RenderCommand {
-    const compact = rl.getScreenWidth() < 900;
+    const compact = desktop.width() < 900;
     clay.beginLayout();
     clay.UI()(.{
         .id = .ID("Page"),
@@ -417,4 +420,15 @@ test "footer status owns static and formatted text" {
         const view = makeViewText(&session);
         try testing.expectEqualStrings(case.expected, view.statusSlice());
     }
+}
+
+test "FPS diagnostic reports intentional idle instead of low throughput" {
+    if (comptime !build_options.fps_counter) return error.SkipZigTest;
+    var session = tracer.Session.init(std.testing.allocator, std.testing.io);
+    defer session.deinit();
+    const was_idle = desktop.idle;
+    desktop.idle = true;
+    defer desktop.idle = was_idle;
+    const view_text = makeViewText(&session);
+    try std.testing.expectEqualStrings("Idle", view_text.fpsSlice());
 }

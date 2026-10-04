@@ -57,6 +57,8 @@ const Recording = struct {
     phase_ns: [phase_count]u64 = [_]u64{0} ** phase_count,
     frame_hist: Histogram = .{},
     second_hist: Histogram = .{},
+    cadence_hist: Histogram = .{},
+    last_frame_start_ns: ?u64 = null,
     last_log_ns: u64 = 0,
     frames: u32 = 0,
     rebuilds: u32 = 0,
@@ -105,12 +107,28 @@ pub fn beginSession(io: std.Io) void {
     recording.slice_count = 0;
     recording.coalesced_slices = 0;
     recording.new_slices = 0;
+    recording.cadence_hist = .{};
+    recording.last_frame_start_ns = null;
     recording.frame_hist = .{};
     recording.second_hist = .{};
     recording.current_phase = null;
     recording.phase_started = null;
     recording.frame_started = null;
     @memset(&recording.phase_ns, 0);
+}
+
+/// Records active frame-start spacing independently of rendering duration and idle waits.
+pub fn noteFrameStart(ticks_ns: u64, active: bool) void {
+    if (comptime !enabled) return;
+    if (active) {
+        if (recording.last_frame_start_ns) |previous| recording.cadence_hist.add(ticks_ns -| previous);
+        recording.last_frame_start_ns = ticks_ns;
+    } else noteIdle();
+}
+
+pub fn noteIdle() void {
+    if (comptime !enabled) return;
+    recording.last_frame_start_ns = null;
 }
 
 pub fn beginFrame() void {
@@ -234,7 +252,8 @@ pub fn sessionSummary() void {
     leave();
     log.info(
         "session frames={d} recent_p50={d}us recent_p95={d}us recent_p99={d}us " ++
-            "max={d}us procs={d} slices={d} meta={d}B new_slices={d} coalesced={d}",
+            "max={d}us procs={d} slices={d} meta={d}B new_slices={d} coalesced={d} " ++
+            "cadence_n={d} cadence_recent_p50={d}us cadence_recent_p95={d}us cadence_max={d}us",
         .{
             recording.frame_hist.count,
             recording.frame_hist.percentile(0.50) / 1000,
@@ -246,6 +265,10 @@ pub fn sessionSummary() void {
             recording.metadata_bytes,
             recording.new_slices,
             recording.coalesced_slices,
+            recording.cadence_hist.count,
+            recording.cadence_hist.percentile(0.50) / 1000,
+            recording.cadence_hist.percentile(0.95) / 1000,
+            recording.cadence_hist.max_ns / 1000,
         },
     );
 }
@@ -344,4 +367,17 @@ test "telemetry counts received samples and actual CPU slice growth" {
     } } });
     try testing.expectEqual(@as(u64, 1), recording.ring_events);
     try testing.expectEqual(@as(u64, 4), recording.cpu_samples);
+}
+
+test "telemetry cadence excludes idle gaps and diagnostic frames" {
+    if (comptime !enabled) return error.SkipZigTest;
+    beginSession(std.testing.io);
+    noteFrameStart(0, true);
+    noteFrameStart(8_333_333, true);
+    noteIdle();
+    noteFrameStart(1_000_000_000, false);
+    noteFrameStart(2_000_000_000, true);
+    noteFrameStart(2_008_333_333, true);
+    try std.testing.expectEqual(@as(u64, 2), recording.cadence_hist.count);
+    try std.testing.expectEqual(@as(u64, 8_333_333), recording.cadence_hist.max_ns);
 }
