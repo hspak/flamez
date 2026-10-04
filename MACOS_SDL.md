@@ -107,8 +107,41 @@ Embedded Inter, Roboto Mono, Clay and zclay notices install in
 `share/flamez/licenses` on every platform. The specific Roboto Mono file embedded
 from Clay declares Apache 2.0 in its font metadata; its notice is retained.
 
-Build an archive on a Mac before invoking the publishing script on the Linux
-release host:
+Run the release script on the Arch Linux release host with an Apple-silicon SSH
+builder, following the same isolated-checkout workflow as Zimbr:
+
+```sh
+./release.sh 0.2.0 --macos-host user@mac --check
+./release.sh 0.2.0 --macos-host user@mac
+```
+
+Use the intended version from `build.zig.zon` and commit/push the source first.
+`--check` performs the preparation, builds and checks without tagging, publishing
+or editing the AUR/tap checkouts. It saves packages and prepared recipes under
+`zig-out/release`. It can still install missing build dependencies. Failed runs
+retain their temporary directory for inspection.
+
+The Mac needs working non-interactive SSH authentication, a selected Xcode/Command
+Line Tools SDK (`xcode-select --install` for initial setup), and Apple-silicon
+[Homebrew](https://docs.brew.sh/Installation) at `/opt/homebrew`. The script checks
+these prerequisites, installs missing `sdl3`, `freetype`, `libpng` and `pkgconf`
+formulas, and upgrades SDL if it is older than 3.4. It reuses Zig 0.16.0 from the
+Mac checkout's `.tools/zig-aarch64-macos-0.16.0`, its release cache, or `PATH`;
+otherwise it downloads that version using the checksum in the official
+[Zig download index](https://ziglang.org/download/index.json). Downloaded Zig lives
+under `~/Library/Caches/flamez-release`.
+
+`FLAMEZ_MACOS_HOST` is equivalent to `--macos-host`. `FLAMEZ_MACOS_REPO` defaults
+to `code/flamez` relative to the Mac user's home. An existing checkout supplies
+cached objects/tools; the build fetches the exact release commit into a temporary
+checkout without modifying the existing working tree. If no checkout exists,
+the helper clones from GitHub. Native Zig tests and package validation run on
+the Mac before the archive is streamed back and verified on Linux.
+
+`--minimum-macos MAJOR.0` (or `FLAMEZ_MINIMUM_MACOS`) sets the advertised minimum.
+The default is the Mac's current major release; every linked library must support
+that minimum. `--macos-archive PATH` or `FLAMEZ_MACOS_ARCHIVE` can reuse a previously
+validated archive instead of SSH. To prepare one manually:
 
 ```sh
 python3 tools/package_macos.py --version 0.2.0 --minimum-macos 27.0 \
@@ -126,14 +159,22 @@ The libraries installed for this validation have a macOS 27.0 minimum. Claiming
 Ventura support requires separately built and validated libraries supporting
 13.0; changing the executable target alone is insufficient.
 
-`release.sh` now requires `FLAMEZ_MACOS_ARCHIVE` and verifies its version, checksum
-and clean source commit before publication. It sets the Homebrew formula's macOS
-requirement from the archive and adds `sdl3`, `freetype` and `libpng` dependencies.
-It rejects an unmigrated AUR recipe (missing GUI dependencies/pkgconf or obsolete
-`-Dmsaa`). The external AUR/tap checkouts are not present here. No tag, formula,
-package repository or release has been published. Developer ID signing,
-notarization and restricted Endpoint Security entitlements remain separate from
-this local ad-hoc package validation.
+`release.sh` verifies the archive's version, checksum and clean source commit
+before publication. It prepares the Homebrew formula's macOS requirement and
+`sdl3`, `freetype` and `libpng` dependencies from the archive. It also migrates the
+AUR recipe in a temporary directory: adds SDL/font/Vulkan loader and build
+dependencies, removes obsolete `-Dmsaa`, embeds the release version and installs
+the font/Clay licenses. `makepkg --syncdeps` installs missing Linux dependencies
+(sudo access may be needed), then builds the package and runs its checks before
+tagging. The published recipe pins the downloaded GitHub source archive checksum.
+
+The Linux host needs Zig 0.16.0, Arch's `base-devel`/`makepkg`, Git, Python 3,
+Ruby, curl, file, OpenSSH and the usual GNU core utilities. Publishing additionally
+requires authenticated `gh` and writable Git origins. The clean, synchronized
+AUR and Homebrew checkouts default to `../../aur/flamez` and `../homebrew-tap`;
+override them with `FLAMEZ_AUR_DIR` and `FLAMEZ_TAP_DIR`.
+Developer ID signing, notarization, desktop GUI validation and restricted
+Endpoint Security entitlements remain separate from this ad-hoc package workflow.
 
 ## Remaining physical and signed validation
 
